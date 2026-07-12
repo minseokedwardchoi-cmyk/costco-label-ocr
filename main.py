@@ -1,0 +1,376 @@
+"""
+코스트코 제품 라벨 자동 OCR -> 구글 시트 저장 시스템 (Azure Read API 버전)
+========================================================================
+
+Microsoft Azure AI Vision의 Read API를 사용합니다.
+Azure Read API는 무료 티어(F0)에서 월 5,000건까지 완전 무료로 제공되므로
+월 1,500장 규모에는 비용이 전혀 들지 않습니다.
+(무료 티어는 분당 20건 속도 제한이 있어 1,500장 처리에 약 75~90분이 걸립니다.
+ 사람 개입 없이 알아서 끝나는 배치 작업이므로 문제 없습니다.)
+
+동작 방식
+---------
+1. Google Drive 폴더에서 이미지 전체를 조회한다 (페이지네이션 처리).
+2. 구글 시트에 이미 기록된 파일ID 목록을 읽어, 아직 처리하지 않은 이미지만 추린다
+   (GitHub Actions처럼 실행 환경이 매번 새로 시작되는 곳에서도 구글 시트 자체가
+   "이미 처리한 파일" 목록의 기준이 되므로 로컬 상태 파일이 필요 없다).
+3. 각 이미지를 Azure Read API로 OCR 처리한다 (단어별 신뢰도 점수 포함).
+4. OCR 결과 텍스트에서 "한글표시사항" 항목들을 정규식으로 파싱한다.
+5. 신뢰도가 낮은 단어가 일정 비율 이상이면 "검토필요" 플래그를 남긴다
+   (비닐 포장재 반사/글레어 등으로 인식이 애매한 사진을 자동으로 걸러내기 위함).
+6. 결과를 Google Sheets에 새 행으로 추가한다.
+7. 동시 처리(멀티스레드)로 여러 장을 병렬로 돌리되, Azure 무료 티어의
+   분당 20건 제한을 넘지 않도록 속도를 자동 조절한다.
+8. 일시적 오류는 자동 재시도한다 (사람 개입 없이 완주하는 것이 목표).
+
+설정값은 전부 환경변수로 받는다 (README.md 참고). 로컬에서 실행할 때는
+`.env` 파일에 값을 채우고 `python-dotenv`가 자동으로 로드한다.
+GitHub Actions에서는 리포지토리 Secrets 값이 환경변수로 주입된다.
+"""
+
+import io
+import os
+import re
+import sys
+import time
+import threading
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import requests
+from dotenv import load_dotenv
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+import gspread
+
+load_dotenv()
+
+# ============ CONFIG (환경변수로 설정, README.md 참고) ============
+SERVICE_ACCOUNT_FILE = os.environ.get("SERVICE_ACCOUNT_FILE", "service_account.json")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+
+DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID")
+SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID")
+SHEET_NAME = os.environ.get("SHEET_NAME", "시트1")
+
+AZURE_VISION_ENDPOINT = os.environ.get("AZURE_VISION_ENDPOINT")
+AZURE_VISION_KEY = os.environ.get("AZURE_VISION_KEY")
+
+# Azure F0(무료 티어) 제한: 분당 20건. 여유를 두고 18건/분으로 제한.
+AZURE_MAX_CALLS_PER_MINUTE = int(os.environ.get("AZURE_MAX_CALLS_PER_MINUTE", "18"))
+CONCURRENT_WORKERS = int(os.environ.get("CONCURRENT_WORKERS", "4"))
+CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", "0.65"))
+LOW_CONFIDENCE_WORD_RATIO = float(os.environ.get("LOW_CONFIDENCE_WORD_RATIO", "0.15"))
+# =========================================================
+
+SCOPES = [
+    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/spreadsheets",
+]
+
+FIELD_LABELS = [
+    "제품명",
+    "식품유형",
+    "내용량",
+    "수입원 및 소재지",
+    "원산지 및 제조회사",
+    "소비기한",
+    "원재료명",
+    "보관방법",
+    "반품 및 교환장소",
+    "포장재질",
+]
+
+# 파일ID를 맨 앞에 둔다: 구글 시트 자체가 "이미 처리한 파일" 목록의 기준이 되므로
+# 파일명이 중복되더라도(예: IMG_0001.jpg가 여러 장) 고유한 Drive 파일ID로 정확히 식별한다.
+COLUMN_ORDER = [
+    "파일ID",
+    "파일명",
+    "처리일시",
+] + FIELD_LABELS + [
+    "알레르기정보",
+    "바코드",
+    "검토필요",
+    "원문텍스트",
+]
+
+
+def require_config():
+    missing = [
+        name
+        for name in ["DRIVE_FOLDER_ID", "SPREADSHEET_ID", "AZURE_VISION_ENDPOINT", "AZURE_VISION_KEY"]
+        if not globals()[name]
+    ]
+    if not GOOGLE_SERVICE_ACCOUNT_JSON and not os.path.exists(SERVICE_ACCOUNT_FILE):
+        missing.append("GOOGLE_SERVICE_ACCOUNT_JSON (또는 service_account.json 파일)")
+    if missing:
+        print("다음 환경변수/파일이 설정되지 않았습니다. README.md를 참고해 설정해주세요:")
+        for name in missing:
+            print(f"  - {name}")
+        sys.exit(1)
+
+
+# ---------------- 속도 제한기 (분당 N건) ----------------
+class RateLimiter:
+    def __init__(self, max_calls_per_minute):
+        self.max_calls = max_calls_per_minute
+        self.calls = deque()
+        self.lock = threading.Lock()
+
+    def wait(self):
+        with self.lock:
+            now = time.time()
+            while self.calls and now - self.calls[0] > 60:
+                self.calls.popleft()
+            if len(self.calls) >= self.max_calls:
+                sleep_time = 60 - (now - self.calls[0]) + 0.1
+            else:
+                sleep_time = 0
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+            self.calls.append(time.time())
+
+
+rate_limiter = RateLimiter(AZURE_MAX_CALLS_PER_MINUTE)
+
+
+# ---------------- 인증 / 클라이언트 ----------------
+def get_credentials():
+    if GOOGLE_SERVICE_ACCOUNT_JSON:
+        import json
+        info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+        return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+    return service_account.Credentials.from_service_account_file(
+        SERVICE_ACCOUNT_FILE, scopes=SCOPES
+    )
+
+
+def load_processed_ids(sheet):
+    """구글 시트의 '파일ID' 열(1번 컬럼)에 이미 기록된 값들을 처리 완료 목록으로 삼는다."""
+    ids = sheet.col_values(1)[1:]  # 헤더 제외
+    return set(ids)
+
+
+# ---------------- Drive: 전체 이미지 조회 (페이지네이션 포함) ----------------
+def list_all_images(drive_service):
+    query = (
+        f"'{DRIVE_FOLDER_ID}' in parents and "
+        "(mimeType = 'image/jpeg' or mimeType = 'image/png') and trashed = false"
+    )
+    files = []
+    page_token = None
+    while True:
+        results = drive_service.files().list(
+            q=query,
+            fields="nextPageToken, files(id, name, mimeType)",
+            pageSize=1000,
+            pageToken=page_token,
+        ).execute()
+        files.extend(results.get("files", []))
+        page_token = results.get("nextPageToken")
+        if not page_token:
+            break
+    return files
+
+
+def download_image(drive_service, file_id):
+    request = drive_service.files().get_media(fileId=file_id)
+    buf = io.BytesIO()
+    downloader = MediaIoBaseDownload(buf, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    return buf.getvalue()
+
+
+# ---------------- Azure Read API OCR (재시도 포함) ----------------
+def ocr_image_azure(image_bytes, max_retries=4):
+    """
+    Azure Read API 호출. 비동기 방식(제출 -> 폴링)이라 두 단계로 이뤄진다.
+    반환값: (전체 텍스트, 단어별 신뢰도 리스트)
+    """
+    submit_url = f"{AZURE_VISION_ENDPOINT.rstrip('/')}/vision/v3.2/read/analyze"
+    headers = {
+        "Ocp-Apim-Subscription-Key": AZURE_VISION_KEY,
+        "Content-Type": "application/octet-stream",
+    }
+
+    for attempt in range(max_retries):
+        try:
+            rate_limiter.wait()
+            resp = requests.post(submit_url, headers=headers, data=image_bytes, timeout=30)
+
+            if resp.status_code == 429:  # 속도 제한 초과 -> 대기 후 재시도
+                wait_s = int(resp.headers.get("Retry-After", "10"))
+                time.sleep(wait_s)
+                continue
+
+            resp.raise_for_status()
+            operation_url = resp.headers["Operation-Location"]
+
+            # 폴링: 결과가 나올 때까지 대기
+            for _ in range(30):
+                time.sleep(1.5)
+                poll = requests.get(
+                    operation_url,
+                    headers={"Ocp-Apim-Subscription-Key": AZURE_VISION_KEY},
+                    timeout=30,
+                )
+                poll.raise_for_status()
+                result = poll.json()
+                if result.get("status") == "succeeded":
+                    return _extract_text_and_confidence(result)
+                if result.get("status") == "failed":
+                    raise RuntimeError("Azure OCR 작업 실패")
+            raise RuntimeError("Azure OCR 결과 대기 시간 초과")
+
+        except requests.exceptions.RequestException:
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(2 ** attempt)  # 지수 백오프
+
+    raise RuntimeError("Azure OCR 재시도 횟수 초과")
+
+
+def _extract_text_and_confidence(result):
+    lines_text = []
+    confidences = []
+    for page in result.get("analyzeResult", {}).get("readResults", []):
+        for line in page.get("lines", []):
+            lines_text.append(line.get("text", ""))
+            for word in line.get("words", []):
+                conf = word.get("confidence")
+                if conf is not None:
+                    confidences.append(conf)
+    full_text = "\n".join(lines_text)
+    return full_text, confidences
+
+
+def needs_review(confidences):
+    if not confidences:
+        return True  # 텍스트를 아예 못 읽었으면 당연히 검토 필요
+    low_count = sum(1 for c in confidences if c < CONFIDENCE_THRESHOLD)
+    ratio = low_count / len(confidences)
+    return ratio >= LOW_CONFIDENCE_WORD_RATIO
+
+
+# ---------------- 항목 파싱 ----------------
+def parse_fields(text: str) -> dict:
+    cleaned = re.sub(r"[•●○]", "\n•", text)
+    cleaned = cleaned.replace("\n", " ")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+    result = {label: "" for label in FIELD_LABELS}
+
+    escaped_labels = [re.escape(l) for l in FIELD_LABELS]
+    pattern = r"(" + "|".join(escaped_labels) + r")\s*[:：]"
+    matches = list(re.finditer(pattern, cleaned))
+
+    for i, m in enumerate(matches):
+        label = m.group(1)
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(cleaned)
+        value = cleaned[start:end].strip(" •,")
+        result[label] = value
+
+    allergy_match = re.search(r"([가-힣,\s]{2,20}함유)", text)
+    result["알레르기정보"] = allergy_match.group(1).strip() if allergy_match else ""
+
+    barcode_match = re.search(r"\b(\d[\d\s]{9,15}\d)\b", text)
+    result["바코드"] = re.sub(r"\s+", "", barcode_match.group(1)) if barcode_match else ""
+
+    return result
+
+
+# ---------------- 시트 저장 ----------------
+sheet_lock = threading.Lock()  # gspread 동시 append 충돌 방지
+
+
+def append_to_sheet(sheet, file_id, filename, fields, raw_text, review_flag):
+    row = [file_id, filename, time.strftime("%Y-%m-%d %H:%M:%S")]
+    row += [fields.get(label, "") for label in FIELD_LABELS]
+    row += [
+        fields.get("알레르기정보", ""),
+        fields.get("바코드", ""),
+        "⚠️ 검토필요" if review_flag else "",
+        raw_text,
+    ]
+    with sheet_lock:
+        sheet.append_row(row, value_input_option="USER_ENTERED")
+
+
+def ensure_header(sheet):
+    existing = sheet.row_values(1)
+    if not existing:
+        sheet.append_row(COLUMN_ORDER, value_input_option="USER_ENTERED")
+    elif existing != COLUMN_ORDER:
+        # 헤더가 예상과 다르더라도 기존 데이터를 지우지 않는다 (데이터 손실 방지).
+        # 새로 추가되는 행은 COLUMN_ORDER 순서 그대로 append 되므로, 헤더 행만 수동으로
+        # COLUMN_ORDER와 맞춰주면 된다.
+        print("경고: 시트 1행 헤더가 COLUMN_ORDER와 다릅니다. 데이터 보호를 위해 자동으로 지우지 않았으니, "
+              "헤더 행을 아래 순서로 직접 맞춰주세요:")
+        print("  " + " | ".join(COLUMN_ORDER))
+
+
+# ---------------- 파일 1건 처리 ----------------
+def process_one_file(drive_service, sheet, file_info):
+    name, file_id = file_info["name"], file_info["id"]
+    image_bytes = download_image(drive_service, file_id)
+    text, confidences = ocr_image_azure(image_bytes)
+    fields = parse_fields(text)
+    flag = needs_review(confidences)
+    append_to_sheet(sheet, file_id, name, fields, text, flag)
+    return name, fields.get("제품명", ""), flag
+
+
+# ---------------- 메인 실행 ----------------
+def run_once():
+    require_config()
+
+    creds = get_credentials()
+    drive_service = build("drive", "v3", credentials=creds)
+    gc = gspread.authorize(creds)
+    sheet = gc.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
+    ensure_header(sheet)
+
+    processed_ids = load_processed_ids(sheet)
+    all_files = list_all_images(drive_service)
+    new_files = [f for f in all_files if f["id"] not in processed_ids]
+
+    if not new_files:
+        print("처리할 새 이미지가 없습니다.")
+        return
+
+    print(f"신규 이미지 {len(new_files)}건 발견. 처리를 시작합니다...")
+    print(f"(Azure 무료 티어 속도 제한: 분당 {AZURE_MAX_CALLS_PER_MINUTE}건 -> "
+          f"예상 소요 시간 약 {len(new_files) / AZURE_MAX_CALLS_PER_MINUTE:.0f}분)")
+
+    success_count = 0
+    failed = []
+
+    with ThreadPoolExecutor(max_workers=CONCURRENT_WORKERS) as executor:
+        futures = {
+            executor.submit(process_one_file, drive_service, sheet, f): f
+            for f in new_files
+        }
+        for future in as_completed(futures):
+            f = futures[future]
+            try:
+                name, product, flag = future.result()
+                success_count += 1
+                flag_str = " [검토필요]" if flag else ""
+                print(f"  완료: {name} -> {product or '(제품명 인식 실패)'}{flag_str}")
+            except Exception as e:
+                failed.append((f["name"], str(e)))
+                print(f"  실패: {f['name']} -> {e}")
+
+    print(f"\n완료: {success_count}건 성공, {len(failed)}건 실패")
+    if failed:
+        print("실패 목록 (다음 실행 시 자동 재시도됩니다 - 시트에 기록되지 않은 파일ID는 신규로 취급됨):")
+        for name, err in failed:
+            print(f"  - {name}: {err}")
+
+
+if __name__ == "__main__":
+    run_once()

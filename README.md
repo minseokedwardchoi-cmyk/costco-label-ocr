@@ -1,1 +1,108 @@
-# costco-label-ocr
+# 코스트코 제품 라벨 자동 OCR → 구글 시트 시스템 (Azure Read API 버전)
+
+Google Drive 폴더에 제품 라벨(뒷면 표시사항) 사진을 대량(예: 월 1,500장) 업로드하면
+Azure AI Vision의 Read API로 무료 OCR을 돌려서, 항목별로 파싱한 뒤
+Google Sheets에 자동으로 정리해주는 시스템입니다. GitHub Actions로 매달 자동 실행되며,
+서버 운영 비용 없이 완전 무료로 동작합니다.
+
+## 왜 Azure Read API인가?
+
+- 무료 티어(F0): **월 5,000건까지 완전 무료**, 월 1,500장 사용에는 비용이 전혀 들지 않습니다.
+- 단, 무료 티어는 **분당 20건 속도 제한**이 있습니다. 1,500장 처리 시 약 75~90분 소요됩니다.
+  (사람이 지켜볼 필요 없는 배치 작업이므로 문제되지 않습니다.)
+- 유료로 전환하면 속도 제한이 크게 완화되지만, 지금은 무료 유지가 목표이므로 F0로 충분합니다.
+
+## 왜 GitHub Actions인가?
+
+- 서버를 따로 띄우지 않아도 **매달 정해진 날짜에 자동 실행**됩니다 (Private 저장소도 월 2,000분 무료 — 이 작업은 1회 약 90분이라 넉넉합니다).
+- 처리 이력은 로컬 파일이 아니라 **구글 시트 자체**(파일ID 열)를 기준으로 판단하므로,
+  매번 새로 뜨는 Actions 실행 환경에서도 중복 처리 없이 이어서 작동합니다.
+
+## 1. Azure 리소스 생성
+
+1. https://portal.azure.com 접속 (없으면 무료 계정 생성, 카드 등록 필요하나 F0는 과금 없음)
+2. "리소스 만들기" → "Azure AI Vision" 검색 → 만들기
+3. 가격 책정 계층(Pricing tier)에서 **F0 (무료)** 선택 (구독당 F0 리소스는 1개만 생성 가능)
+4. 생성 완료 후 리소스의 "키 및 엔드포인트" 메뉴에서 다음 두 값을 복사:
+   - `AZURE_VISION_ENDPOINT` (예: `https://your-resource.cognitiveservices.azure.com`)
+   - `AZURE_VISION_KEY`
+
+## 2. Google 쪽 설정
+
+1. [Google Cloud Console](https://console.cloud.google.com)에서 프로젝트 생성 후 **Drive API**, **Sheets API** 활성화
+2. "API 및 서비스 → 사용자 인증 정보 → 서비스 계정 만들기"로 서비스 계정 생성 → JSON 키 다운로드
+3. 결과를 저장할 Google Sheet를 하나 만들고, 다운로드한 JSON 안의 `client_email` 값을
+   해당 시트에 **편집자**로 공유. 마찬가지로 사진을 올릴 Drive 폴더에도 같은 이메일을 **뷰어 이상**으로 공유
+4. 시트 URL에서 `SPREADSHEET_ID`, Drive 폴더 URL에서 `DRIVE_FOLDER_ID` 확인
+   (`https://docs.google.com/spreadsheets/d/여기부분/edit`, `https://drive.google.com/drive/folders/여기부분`)
+
+## 3. 로컬에서 테스트 실행
+
+```bash
+pip install -r requirements.txt
+cp .env.example .env
+# .env 파일에 DRIVE_FOLDER_ID, SPREADSHEET_ID, AZURE_VISION_ENDPOINT, AZURE_VISION_KEY 채우기
+# 다운로드한 서비스 계정 JSON을 service_account.json 이름으로 이 폴더에 저장
+
+python main.py
+```
+
+## 4. GitHub Actions로 매달 자동 실행 설정
+
+저장소 **Settings → Secrets and variables → Actions → New repository secret**에서 아래 값을 등록하세요.
+
+| Secret 이름 | 값 |
+|---|---|
+| `DRIVE_FOLDER_ID` | Drive 폴더 ID |
+| `SPREADSHEET_ID` | 구글 시트 ID |
+| `SHEET_NAME` | 시트 탭 이름 (예: `시트1`) |
+| `AZURE_VISION_ENDPOINT` | Azure 엔드포인트 URL |
+| `AZURE_VISION_KEY` | Azure 키 |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | 서비스 계정 JSON 파일의 **내용 전체**를 그대로 복사해서 붙여넣기 |
+
+등록 후에는 `.github/workflows/monthly-ocr.yml`에 설정된 크론 일정(매월 2일 UTC 00:00, 한국시간 09:00)에
+자동으로 실행됩니다. 날짜/시간을 바꾸려면 워크플로 파일의 `cron` 값을 수정하세요.
+
+수동으로 바로 실행해보고 싶다면 저장소의 **Actions 탭 → 월간 코스트코 라벨 OCR 자동 실행 → Run workflow**를 누르면 됩니다.
+
+## 5. 동작 방식
+
+- Drive 폴더의 이미지를 전부 조회(페이지네이션 처리, 1,500장도 누락 없이 조회)하고,
+  구글 시트의 `파일ID` 열에 이미 기록된 파일은 건너뜁니다.
+- 신규 이미지만 병렬로 다운로드하고, Azure 속도 제한(분당 18건, 여유 있게 설정)에 맞춰
+  순차적으로 OCR을 호출합니다.
+- 일시적 오류(네트워크 문제, 429 속도 제한 등)는 자동 재시도됩니다. 재시도 후에도 실패한
+  파일은 시트에 기록되지 않으므로 다음 실행 때 자동으로 다시 시도됩니다.
+
+## 6. "검토필요" 컬럼이란?
+
+Azure Read API는 인식한 단어마다 신뢰도 점수(0~1)를 함께 반환합니다.
+이 스크립트는 한 이미지 안에서 **저신뢰도 단어 비율이 15% 이상**이면
+(`CONFIDENCE_THRESHOLD`, `LOW_CONFIDENCE_WORD_RATIO` 환경변수로 조정 가능)
+해당 행에 "⚠️ 검토필요" 표시를 자동으로 남깁니다.
+
+→ 비닐 포장재의 빛 반사, 흐릿한 사진 등으로 인식이 애매했던 사진들만
+   시트에서 필터링해서 사람이 빠르게 확인하면 되므로, 1,500장을 전부
+   눈으로 검수할 필요 없이 **의심되는 몇 십 장만** 확인하면 됩니다.
+
+## 7. 시트 컬럼 구조
+
+`파일ID`, `파일명`, `처리일시`, `제품명`, `식품유형`, `내용량`, `수입원 및 소재지`,
+`원산지 및 제조회사`, `소비기한`, `원재료명`, `보관방법`, `반품 및 교환장소`, `포장재질`,
+`알레르기정보`, `바코드`, `검토필요`, `원문텍스트`
+
+`파일ID`는 중복 처리 방지를 위한 식별자이며, `원문텍스트`에는 항목 파싱과 무관하게
+OCR로 읽은 전체 텍스트가 그대로 남아있어 파싱이 잘못된 경우 원문 대조가 가능합니다.
+
+## 8. 정확도 향상 팁
+
+- `parse_fields()` 안의 정규식은 라벨 문구(`제품명:`, `원재료명:` 등)를 앵커로 삼습니다.
+  실제 OCR 결과를 몇 개 돌려보고 라벨 문구가 다르게 인식되는 경우(예: 오타, 띄어쓰기 차이)
+  가 있으면 `FIELD_LABELS` 리스트나 정규식을 조정하세요.
+- 사진 촬영 시 빛 반사를 피하는 것이 어떤 OCR 엔진보다 정확도에 큰 영향을 줍니다:
+  정면보다 살짝 비스듬히, 확산광(자연광)에서, 플래시 직사 없이 촬영하는 것을 권장합니다.
+
+## 9. 헤더가 예상과 다를 때
+
+시트 1행의 헤더가 위 컬럼 순서와 다르면, 실행 시 경고만 출력하고 **기존 데이터는 지우지 않습니다**.
+이 경우 시트 1행을 위 컬럼 순서에 맞게 직접 수정해주세요.
