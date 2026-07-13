@@ -98,8 +98,23 @@ LABEL_ALIASES = {
     "포장재질": ["포장재질", "재질"],
 }
 
+# 사진 두 종류를 같은 Drive 폴더/시트에서 같이 처리한다:
+#   1) 제품 뒷면 표시사항 라벨 -> FIELD_LABELS
+#   2) 코스트코 매대 가격표 (상품코드/가격 등) -> PRICE_TAG_FIELDS
+# 텍스트에 "단가"라는 단어가 있으면 가격표로 판단한다 (가격표에만 나오는 고정 문구).
+PRICE_TAG_FIELDS = [
+    "상품코드",
+    "제품명(한국어)",
+    "제품명(영어)",
+    "중량",
+    "단가",
+    "가격",
+]
+
 # 파일ID를 맨 앞에 둔다: 구글 시트 자체가 "이미 처리한 파일" 목록의 기준이 되므로
 # 파일명이 중복되더라도(예: IMG_0001.jpg가 여러 장) 고유한 Drive 파일ID로 정확히 식별한다.
+# PRICE_TAG_FIELDS는 맨 뒤에 붙인다: 기존 컬럼 순서를 그대로 유지해야, 이미 쌓인 데이터 행이
+# 밀리지 않고 헤더 행만 안전하게 갱신할 수 있다 (ensure_header 참고).
 COLUMN_ORDER = [
     "파일ID",
     "파일명",
@@ -109,7 +124,7 @@ COLUMN_ORDER = [
     "바코드",
     "검토필요",
     "원문텍스트",
-]
+] + PRICE_TAG_FIELDS
 
 
 def require_config():
@@ -275,8 +290,8 @@ def _norm(s: str) -> str:
     return re.sub(r"\s+", "", s)
 
 
-# ---------------- 항목 파싱 ----------------
-def parse_fields(text: str) -> dict:
+# ---------------- 항목 파싱: 제품 뒷면 표시사항 라벨 ----------------
+def parse_product_label_fields(text: str) -> dict:
     """
     실제 라벨 사진은 "제품명: 값"처럼 콜론이 붙어있는 경우도 있지만,
     "제품명"이 콜론 없이 한 줄에 단독으로 찍히고 값은 다음 줄들에 이어지는
@@ -316,28 +331,98 @@ def parse_fields(text: str) -> dict:
             continue
         result[field] = f"{result[field]} / {value}" if result[field] else value
 
-    allergy_match = re.search(r"([가-힣,\s]{2,20}함유)", text)
-    result["알레르기정보"] = allergy_match.group(1).strip() if allergy_match else ""
+    return result
 
-    barcode_match = re.search(r"\b(\d[\d\s]{9,15}\d)\b", text)
-    result["바코드"] = re.sub(r"\s+", "", barcode_match.group(1)) if barcode_match else ""
+
+# ---------------- 항목 파싱: 코스트코 매대 가격표 ----------------
+def parse_price_tag_fields(text: str) -> dict:
+    """
+    가격표 레이아웃(위에서 아래 순서): 상품코드(숫자만 있는 줄) -> 한글 제품명
+    (여러 줄) -> 중량("50G X 12" 같은 단위 포함 줄) -> 영문 제품명(대문자 줄)
+    -> "단가 / 10G" 같은 헤더 줄 + 소단위 가격 -> 실제 판매가(가장 큰 금액).
+    """
+    result = {f: "" for f in PRICE_TAG_FIELDS}
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+
+    code_idx = None
+    for i, line in enumerate(lines):
+        if re.fullmatch(r"\d{4,8}", line):
+            result["상품코드"] = line
+            code_idx = i
+            break
+
+    weight_pattern = re.compile(r"\d+(\.\d+)?\s*(g|ml|kg|l)\b", re.IGNORECASE)
+    weight_idx = None
+    for i, line in enumerate(lines):
+        if code_idx is not None and i <= code_idx:
+            continue
+        if weight_pattern.search(line):
+            result["중량"] = line
+            weight_idx = i
+            break
+
+    if code_idx is not None:
+        end = weight_idx if weight_idx is not None else len(lines)
+        korean_lines = [l for l in lines[code_idx + 1:end] if re.search(r"[가-힣]", l)]
+        result["제품명(한국어)"] = " ".join(korean_lines).strip()
+
+    if weight_idx is not None:
+        for line in lines[weight_idx + 1:]:
+            if re.fullmatch(r"[A-Z0-9 .,'&\-]{4,}", line) and re.search(r"[A-Z]", line):
+                result["제품명(영어)"] = line
+                break
+
+    danga_idx = next((i for i, line in enumerate(lines) if "단가" in line), None)
+    if danga_idx is not None:
+        for line in lines[danga_idx:danga_idx + 3]:
+            m = re.search(r"[\d,]{2,}\s*원", line)
+            if m:
+                result["단가"] = m.group(0)
+                break
+
+    all_prices = [m.group(0) for m in re.finditer(r"[\d,]{2,}\s*원", text)]
+    remaining_prices = [p for p in all_prices if p != result["단가"]]
+    if remaining_prices:
+        result["가격"] = max(remaining_prices, key=lambda p: int(re.sub(r"[^\d]", "", p) or "0"))
 
     return result
+
+
+def extract_fields(text: str) -> dict:
+    """가격표 사진에만 나오는 "단가"라는 고정 문구로 사진 종류를 판별해서 알맞은
+    파서로 넘긴다. 두 종류 모두 같은 시트에 쌓이며, 해당 없는 필드는 빈 칸으로 남는다."""
+    if "단가" in text:
+        fields = parse_price_tag_fields(text)
+    else:
+        fields = parse_product_label_fields(text)
+
+    allergy_match = re.search(r"([가-힣,\s]{2,20}함유)", text)
+    fields["알레르기정보"] = allergy_match.group(1).strip() if allergy_match else ""
+
+    barcode_match = re.search(r"\b(\d[\d\s]{9,15}\d)\b", text)
+    fields["바코드"] = re.sub(r"\s+", "", barcode_match.group(1)) if barcode_match else ""
+
+    return fields
 
 
 # ---------------- 시트 저장 ----------------
 sheet_lock = threading.Lock()  # gspread 동시 append 충돌 방지
 
 
-def append_to_sheet(sheet, file_id, filename, fields, raw_text, review_flag):
-    row = [file_id, filename, time.strftime("%Y-%m-%d %H:%M:%S")]
-    row += [fields.get(label, "") for label in FIELD_LABELS]
-    row += [
-        fields.get("알레르기정보", ""),
-        fields.get("바코드", ""),
-        "⚠️ 검토필요" if review_flag else "",
-        raw_text,
-    ]
+def build_row_dict(file_id, filename, fields, raw_text, review_flag):
+    row_dict = {
+        "파일ID": file_id,
+        "파일명": filename,
+        "처리일시": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "검토필요": "⚠️ 검토필요" if review_flag else "",
+        "원문텍스트": raw_text,
+    }
+    row_dict.update(fields)  # 제품 라벨 필드 또는 가격표 필드 + 알레르기정보/바코드
+    return row_dict
+
+
+def append_to_sheet(sheet, row_dict):
+    row = [row_dict.get(col, "") for col in COLUMN_ORDER]
     with sheet_lock:
         sheet.append_row(row, value_input_option="USER_ENTERED")
 
@@ -346,10 +431,18 @@ def ensure_header(sheet):
     existing = sheet.row_values(1)
     if not existing:
         sheet.append_row(COLUMN_ORDER, value_input_option="USER_ENTERED")
-    elif existing != COLUMN_ORDER:
-        # 헤더가 예상과 다르더라도 기존 데이터를 지우지 않는다 (데이터 손실 방지).
-        # 새로 추가되는 행은 COLUMN_ORDER 순서 그대로 append 되므로, 헤더 행만 수동으로
-        # COLUMN_ORDER와 맞춰주면 된다.
+    elif existing == COLUMN_ORDER:
+        return
+    elif COLUMN_ORDER[: len(existing)] == existing:
+        # 기존 헤더가 새 COLUMN_ORDER의 앞부분과 정확히 일치한다 = 컬럼이 맨 뒤에
+        # 추가되기만 한 안전한 확장이다. 기존 데이터 행은 전혀 밀리지 않으므로
+        # 헤더 행만 새 컬럼명을 포함하도록 갱신한다.
+        added = COLUMN_ORDER[len(existing):]
+        sheet.update(values=[COLUMN_ORDER], range_name="A1")
+        print(f"시트 헤더에 새 컬럼 {len(added)}개를 추가했습니다: {', '.join(added)}")
+    else:
+        # 컬럼 순서가 바뀌었거나 삭제된 경우 - 자동으로 지우면 기존 데이터가 밀릴 수
+        # 있으므로 건드리지 않는다. 헤더 행을 수동으로 맞춰주세요.
         print("경고: 시트 1행 헤더가 COLUMN_ORDER와 다릅니다. 데이터 보호를 위해 자동으로 지우지 않았으니, "
               "헤더 행을 아래 순서로 직접 맞춰주세요:")
         print("  " + " | ".join(COLUMN_ORDER))
@@ -374,10 +467,12 @@ def process_one_file(creds, sheet, file_info):
     drive_service = get_thread_drive_service(creds)
     image_bytes = download_image(drive_service, file_id)
     text, confidences = ocr_image_azure(image_bytes)
-    fields = parse_fields(text)
+    fields = extract_fields(text)
     flag = needs_review(confidences)
-    append_to_sheet(sheet, file_id, name, fields, text, flag)
-    return name, fields.get("제품명", ""), flag
+    row_dict = build_row_dict(file_id, name, fields, text, flag)
+    append_to_sheet(sheet, row_dict)
+    product_name = fields.get("제품명") or fields.get("제품명(한국어)") or ""
+    return name, product_name, flag
 
 
 # ---------------- 메인 실행 ----------------
