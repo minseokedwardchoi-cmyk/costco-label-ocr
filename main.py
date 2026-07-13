@@ -343,6 +343,27 @@ def is_price_tag(text: str) -> bool:
     return has_code and has_price
 
 
+def split_price_tag_cards(text: str):
+    """한 사진에 상품 가격표 카드가 여러 개 찍혀있을 수 있다. 상품코드로 보이는
+    줄과 가격으로 보이는 줄이 각각 2개 이상이면 카드가 여러 개 있다고 보고,
+    각 상품코드 줄을 기준으로 텍스트를 나눈다 (다음 상품코드 줄 직전까지가 한
+    카드). 카드가 1개뿐이면(대부분의 경우) 원래 텍스트를 그대로 돌려준다.
+    반환값: (조각 텍스트 리스트, 여러 장 감지 여부)
+    """
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    code_indices = [i for i, l in enumerate(lines) if re.fullmatch(r"\d{4,8}", l)]
+    price_count = sum(1 for l in lines if re.match(r"^\d{1,3}(?:,\d{3})+\s*\S{0,2}$", l))
+
+    if len(code_indices) < 2 or price_count < 2:
+        return [text], False
+
+    segments = []
+    for idx, code_i in enumerate(code_indices):
+        end = code_indices[idx + 1] if idx + 1 < len(code_indices) else len(lines)
+        segments.append("\n".join(lines[code_i:end]))
+    return segments, True
+
+
 # ---------------- 항목 파싱: 코스트코 매대 가격표 ----------------
 def parse_price_tag_fields(text: str) -> dict:
     """
@@ -450,22 +471,32 @@ def extract_fields(text: str) -> dict:
 sheet_lock = threading.Lock()  # gspread 동시 append 충돌 방지
 
 
-def build_row_dict(file_id, filename, fields, raw_text, review_flag):
+def build_row_dict(file_id, filename, fields, raw_text, review_note):
     row_dict = {
         "파일ID": file_id,
         "파일명": filename,
         "처리일시": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "검토필요": "⚠️ 검토필요" if review_flag else "",
+        "검토필요": review_note,
         "원문텍스트": raw_text,
     }
     row_dict.update(fields)  # 제품 라벨 필드 또는 가격표 필드 + 알레르기정보/바코드
     return row_dict
 
 
-def append_to_sheet(sheet, row_dict):
-    row = [row_dict.get(col, "") for col in COLUMN_ORDER]
+def review_note(low_confidence: bool, multi_card: bool) -> str:
+    if multi_card and low_confidence:
+        return "⚠️ 검토필요 (카드 여러 개 감지 + 저신뢰도)"
+    if multi_card:
+        return "⚠️ 검토필요 (카드 여러 개 감지됨)"
+    if low_confidence:
+        return "⚠️ 검토필요"
+    return ""
+
+
+def append_rows_to_sheet(sheet, row_dicts):
+    rows = [[row_dict.get(col, "") for col in COLUMN_ORDER] for row_dict in row_dicts]
     with sheet_lock:
-        sheet.append_row(row, value_input_option="USER_ENTERED")
+        sheet.append_rows(rows, value_input_option="USER_ENTERED")
 
 
 def ensure_header(sheet):
@@ -508,12 +539,24 @@ def process_one_file(creds, sheet, file_info):
     drive_service = get_thread_drive_service(creds)
     image_bytes = download_image(drive_service, file_id)
     text, confidences = ocr_image_azure(image_bytes)
-    fields = extract_fields(text)
-    flag = needs_review(confidences)
-    row_dict = build_row_dict(file_id, name, fields, text, flag)
-    append_to_sheet(sheet, row_dict)
-    product_name = fields.get("제품명") or fields.get("제품명(한국어)") or ""
-    return name, product_name, flag
+    low_confidence = needs_review(confidences)
+
+    if is_price_tag(text):
+        segments, multi_card = split_price_tag_cards(text)
+    else:
+        segments, multi_card = [text], False
+
+    row_dicts = []
+    product_names = []
+    for seg_text in segments:
+        fields = extract_fields(seg_text)
+        note = review_note(low_confidence, multi_card)
+        row_dicts.append(build_row_dict(file_id, name, fields, seg_text, note))
+        product_names.append(fields.get("제품명") or fields.get("제품명(한국어)") or "")
+
+    append_rows_to_sheet(sheet, row_dicts)
+    product_summary = " / ".join(p for p in product_names if p)
+    return name, product_summary, low_confidence or multi_card
 
 
 # ---------------- 메인 실행 ----------------
