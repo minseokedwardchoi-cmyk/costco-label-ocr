@@ -101,12 +101,11 @@ LABEL_ALIASES = {
 # 사진 두 종류를 같은 Drive 폴더/시트에서 같이 처리한다:
 #   1) 제품 뒷면 표시사항 라벨 -> FIELD_LABELS
 #   2) 코스트코 매대 가격표 (상품코드/가격 등) -> PRICE_TAG_FIELDS
-# 텍스트에 "단가"라는 단어가 있으면 가격표로 판단한다 (가격표에만 나오는 고정 문구).
+# 가격표는 핵심 5개 필드만 컬럼으로 뽑는다. 그 외 정보(중량 등)는 원문텍스트에만 남는다.
 PRICE_TAG_FIELDS = [
     "상품코드",
     "제품명(한국어)",
     "제품명(영어)",
-    "중량",
     "단가",
     "가격",
 ]
@@ -334,12 +333,24 @@ def parse_product_label_fields(text: str) -> dict:
     return result
 
 
+def is_price_tag(text: str) -> bool:
+    """가격표는 "단가"가 안 찍혀있는 경우도 많다 (특히 비식품). 대신 코스트코
+    가격표라면 항상 있는 두 가지 구조적 특징 - 단독으로 찍힌 상품코드(4~8자리 숫자)와
+    콤마가 있는 판매가 - 로 판별한다."""
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    has_code = any(re.fullmatch(r"\d{4,8}", l) for l in lines)
+    has_price = any(re.match(r"^\d{1,3}(?:,\d{3})+\s*\S{0,2}$", l) for l in lines)
+    return has_code and has_price
+
+
 # ---------------- 항목 파싱: 코스트코 매대 가격표 ----------------
 def parse_price_tag_fields(text: str) -> dict:
     """
     가격표 레이아웃(위에서 아래 순서): 상품코드(숫자만 있는 줄) -> 한글 제품명
-    (여러 줄) -> 중량("50G X 12" 같은 단위 포함 줄) -> 영문 제품명(대문자 줄)
-    -> "단가 / 10G" 같은 헤더 줄 + 소단위 가격 -> 실제 판매가(가장 큰 금액).
+    (여러 줄) -> [중량 등 부가정보] -> 영문 제품명(대문자 줄) -> [단가] -> 판매가.
+    중량/단가는 사진마다 있을 수도 없을 수도 있어서(특히 비식품), 있으면 참고용
+    경계로만 쓰고 핵심 5개 필드(상품코드/제품명 2종/단가/가격)만 컬럼에 남긴다.
+    나머지 정보는 원문텍스트 컬럼에서 그대로 확인할 수 있다.
     """
     result = {f: "" for f in PRICE_TAG_FIELDS}
     lines = [l.strip() for l in text.split("\n") if l.strip()]
@@ -357,25 +368,33 @@ def parse_price_tag_fields(text: str) -> dict:
         if code_idx is not None and i <= code_idx:
             continue
         if weight_pattern.search(line):
-            result["중량"] = line
             weight_idx = i
             break
 
+    danga_idx = next((i for i, line in enumerate(lines) if "단가" in line), None)
+
+    english_idx = None
+    for i, line in enumerate(lines):
+        if code_idx is not None and i <= code_idx:
+            continue
+        if weight_pattern.search(line):
+            continue  # "50G X 12"처럼 대문자 단위가 섞인 중량 줄은 영어 제품명이 아니다
+        if re.fullmatch(r"[A-Z0-9 .,'&\-]{4,}", line) and re.search(r"[A-Z]{2,}", line):
+            english_idx = i
+            result["제품명(영어)"] = line
+            break
+
     if code_idx is not None:
-        end = weight_idx if weight_idx is not None else len(lines)
+        # 한글 제품명은 상품코드 다음 줄부터, 중량/영문명/단가 중 가장 먼저 나오는
+        # 줄 전까지로 본다 (셋 다 없으면 끝까지).
+        boundary_candidates = [i for i in (weight_idx, english_idx, danga_idx) if i is not None]
+        end = min(boundary_candidates) if boundary_candidates else len(lines)
         korean_lines = [l for l in lines[code_idx + 1:end] if re.search(r"[가-힣]", l)]
         result["제품명(한국어)"] = " ".join(korean_lines).strip()
-
-    if weight_idx is not None:
-        for line in lines[weight_idx + 1:]:
-            if re.fullmatch(r"[A-Z0-9 .,'&\-]{4,}", line) and re.search(r"[A-Z]", line):
-                result["제품명(영어)"] = line
-                break
 
     # "단가 / 10G"처럼 기준 단위가 함께 찍혀있으므로, 가격만 뽑으면 몇 g당 가격인지
     # 알 수 없다. "217원" 대신 "217원/10g" 형태로 단위까지 같이 기록한다
     # (기준 단위는 상품마다 다르므로 사진에서 그대로 읽어와야 정확하다).
-    danga_idx = next((i for i, line in enumerate(lines) if "단가" in line), None)
     danga_price = ""
     if danga_idx is not None:
         unit_match = re.search(r"(\d+)\s*(g|ml|kg|l)\b", lines[danga_idx], re.IGNORECASE)
@@ -411,9 +430,9 @@ def parse_price_tag_fields(text: str) -> dict:
 
 
 def extract_fields(text: str) -> dict:
-    """가격표 사진에만 나오는 "단가"라는 고정 문구로 사진 종류를 판별해서 알맞은
-    파서로 넘긴다. 두 종류 모두 같은 시트에 쌓이며, 해당 없는 필드는 빈 칸으로 남는다."""
-    if "단가" in text:
+    """사진 종류를 구조적 특징으로 판별해서 알맞은 파서로 넘긴다. 두 종류 모두
+    같은 시트에 쌓이며, 해당 없는 필드는 빈 칸으로 남는다."""
+    if is_price_tag(text):
         fields = parse_price_tag_fields(text)
     else:
         fields = parse_product_label_fields(text)
