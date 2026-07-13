@@ -388,10 +388,24 @@ def parse_price_tag_fields(text: str) -> dict:
         if danga_price:
             result["단가"] = f"{danga_price}/{unit}" if unit else danga_price
 
-    all_prices = [m.group(0) for m in re.finditer(r"[\d,]{2,}\s*원", text)]
-    remaining_prices = [p for p in all_prices if p != danga_price]
-    if remaining_prices:
-        result["가격"] = max(remaining_prices, key=lambda p: int(re.sub(r"[^\d]", "", p) or "0"))
+    # 가격은 "12,990원"처럼 천단위 콤마가 있는 큰 금액이다. Azure OCR이 "원" 글자를
+    # 가끔 다른 문자(예: "z")로 잘못 읽는 경우가 있어("7,990z"), "원" 글자 자체보다
+    # 콤마 포함 숫자 형태를 우선 신뢰한다. 단가는 보통 콤마 없는 2~3자리 숫자라서
+    # ("217원", "89원") 이 방식으로도 서로 헷갈리지 않는다.
+    price_line_pattern = re.compile(r"^(\d{1,3}(?:,\d{3})+)\s*\S{0,2}$")
+    for line in lines:
+        m = price_line_pattern.match(line)
+        if m:
+            result["가격"] = f"{m.group(1)}원"
+            break
+
+    if not result["가격"]:
+        # 콤마 없는 가격도 드물게 있을 수 있으니, "원" 글자가 정상적으로 인식된
+        # 나머지 금액 중에서 찾는 것으로 대비한다.
+        all_prices = [m.group(0) for m in re.finditer(r"[\d,]{2,}\s*원", text)]
+        remaining_prices = [p for p in all_prices if p != danga_price]
+        if remaining_prices:
+            result["가격"] = max(remaining_prices, key=lambda p: int(re.sub(r"[^\d]", "", p) or "0"))
 
     return result
 
