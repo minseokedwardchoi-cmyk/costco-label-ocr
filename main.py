@@ -43,6 +43,10 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 import gspread
+from PIL import Image
+import pillow_heif
+
+pillow_heif.register_heif_opener()  # PIL이 HEIC/HEIF 파일도 열 수 있도록 등록 (아이폰 기본 사진 포맷)
 
 load_dotenv()
 
@@ -183,10 +187,13 @@ def load_processed_ids(sheet):
 
 
 # ---------------- Drive: 전체 이미지 조회 (페이지네이션 포함) ----------------
+HEIC_MIME_TYPES = ("image/heic", "image/heif")
+
 def list_all_images(drive_service):
     query = (
         f"'{DRIVE_FOLDER_ID}' in parents and "
-        "(mimeType = 'image/jpeg' or mimeType = 'image/png') and trashed = false"
+        "(mimeType = 'image/jpeg' or mimeType = 'image/png' "
+        "or mimeType = 'image/heic' or mimeType = 'image/heif') and trashed = false"
     )
     files = []
     page_token = None
@@ -212,6 +219,21 @@ def download_image(drive_service, file_id):
     while not done:
         _, done = downloader.next_chunk()
     return buf.getvalue()
+
+
+def convert_heic_to_jpeg(image_bytes: bytes) -> bytes:
+    """Azure Read API는 HEIC/HEIF를 지원하지 않으므로(아이폰 기본 사진 포맷),
+    OCR에 보내기 전에 JPEG로 변환한다."""
+    image = Image.open(io.BytesIO(image_bytes))
+    out = io.BytesIO()
+    image.convert("RGB").save(out, format="JPEG", quality=92)
+    return out.getvalue()
+
+
+def is_heic(file_info: dict) -> bool:
+    if file_info.get("mimeType") in HEIC_MIME_TYPES:
+        return True
+    return file_info.get("name", "").lower().endswith((".heic", ".heif"))
 
 
 # ---------------- Azure Read API OCR (재시도 포함) ----------------
@@ -538,6 +560,8 @@ def process_one_file(creds, sheet, file_info):
     name, file_id = file_info["name"], file_info["id"]
     drive_service = get_thread_drive_service(creds)
     image_bytes = download_image(drive_service, file_id)
+    if is_heic(file_info):
+        image_bytes = convert_heic_to_jpeg(image_bytes)
     text, confidences = ocr_image_azure(image_bytes)
     low_confidence = needs_review(confidences)
 
