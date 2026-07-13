@@ -372,16 +372,24 @@ def parse_price_tag_fields(text: str) -> dict:
                 result["제품명(영어)"] = line
                 break
 
+    # "단가 / 10G"처럼 기준 단위가 함께 찍혀있으므로, 가격만 뽑으면 몇 g당 가격인지
+    # 알 수 없다. "217원" 대신 "217원/10g" 형태로 단위까지 같이 기록한다
+    # (기준 단위는 상품마다 다르므로 사진에서 그대로 읽어와야 정확하다).
     danga_idx = next((i for i, line in enumerate(lines) if "단가" in line), None)
+    danga_price = ""
     if danga_idx is not None:
+        unit_match = re.search(r"(\d+)\s*(g|ml|kg|l)\b", lines[danga_idx], re.IGNORECASE)
+        unit = f"{unit_match.group(1)}{unit_match.group(2).lower()}" if unit_match else ""
         for line in lines[danga_idx:danga_idx + 3]:
             m = re.search(r"[\d,]{2,}\s*원", line)
             if m:
-                result["단가"] = m.group(0)
+                danga_price = m.group(0)
                 break
+        if danga_price:
+            result["단가"] = f"{danga_price}/{unit}" if unit else danga_price
 
     all_prices = [m.group(0) for m in re.finditer(r"[\d,]{2,}\s*원", text)]
-    remaining_prices = [p for p in all_prices if p != result["단가"]]
+    remaining_prices = [p for p in all_prices if p != danga_price]
     if remaining_prices:
         result["가격"] = max(remaining_prices, key=lambda p: int(re.sub(r"[^\d]", "", p) or "0"))
 
