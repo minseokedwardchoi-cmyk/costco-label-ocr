@@ -82,6 +82,22 @@ FIELD_LABELS = [
     "포장재질",
 ]
 
+# 실제 라벨 사진에는 FIELD_LABELS와 문구가 완전히 똑같지 않은 경우가 많다
+# (예: "수입원 및 소재지" 대신 "수입업소", "원산지 및 제조회사"가 "원산지"/"제조회사"로
+# 따로 찍히는 경우 등). 표준 필드 하나에 여러 이형(異形) 라벨을 매핑해서 인식률을 높인다.
+LABEL_ALIASES = {
+    "제품명": ["제품명"],
+    "식품유형": ["식품유형", "식품의 유형"],
+    "내용량": ["내용량"],
+    "수입원 및 소재지": ["수입원 및 소재지", "수입업소", "수입원", "수입판매원", "수입자"],
+    "원산지 및 제조회사": ["원산지 및 제조회사", "원산지", "제조회사", "제조원", "제조사"],
+    "소비기한": ["소비기한", "유통기한"],
+    "원재료명": ["원재료명", "원재료"],
+    "보관방법": ["보관방법"],
+    "반품 및 교환장소": ["반품 및 교환장소", "반품/교환장소", "교환장소"],
+    "포장재질": ["포장재질", "재질"],
+}
+
 # 파일ID를 맨 앞에 둔다: 구글 시트 자체가 "이미 처리한 파일" 목록의 기준이 되므로
 # 파일명이 중복되더라도(예: IMG_0001.jpg가 여러 장) 고유한 Drive 파일ID로 정확히 식별한다.
 COLUMN_ORDER = [
@@ -255,24 +271,50 @@ def needs_review(confidences):
     return ratio >= LOW_CONFIDENCE_WORD_RATIO
 
 
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", "", s)
+
+
 # ---------------- 항목 파싱 ----------------
 def parse_fields(text: str) -> dict:
-    cleaned = re.sub(r"[•●○]", "\n•", text)
-    cleaned = cleaned.replace("\n", " ")
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-
+    """
+    실제 라벨 사진은 "제품명: 값"처럼 콜론이 붙어있는 경우도 있지만,
+    "제품명"이 콜론 없이 한 줄에 단독으로 찍히고 값은 다음 줄들에 이어지는
+    경우가 더 흔하다. 그래서 줄 단위로 훑으면서, 한 줄이 (콜론 유무와 상관없이)
+    라벨 이형 중 하나와 일치하면 그 줄을 헤더로 보고, 다음 헤더가 나오기 전까지의
+    줄들을 값으로 묶는다. 같은 표준 필드에 여러 헤더가 매칭되면(예: "원산지"와
+    "제조회사"가 둘 다 "원산지 및 제조회사"로 매핑) " / "로 이어붙인다.
+    """
     result = {label: "" for label in FIELD_LABELS}
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
 
-    escaped_labels = [re.escape(l) for l in FIELD_LABELS]
-    pattern = r"(" + "|".join(escaped_labels) + r")\s*[:：]"
-    matches = list(re.finditer(pattern, cleaned))
+    headers = []  # [(줄 인덱스, 표준필드명, 같은 줄에 붙어있던 값 또는 None)]
+    for i, line in enumerate(lines):
+        matched = None
+        for field, aliases in LABEL_ALIASES.items():
+            for alias in aliases:
+                inline = re.match(rf"^{re.escape(alias)}\s*[:：]\s*(.+)$", line)
+                if inline:
+                    matched = (field, inline.group(1).strip())
+                    break
+                if _norm(line) == _norm(alias):
+                    matched = (field, None)
+                    break
+            if matched:
+                break
+        if matched:
+            headers.append((i, matched[0], matched[1]))
 
-    for i, m in enumerate(matches):
-        label = m.group(1)
-        start = m.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(cleaned)
-        value = cleaned[start:end].strip(" •,")
-        result[label] = value
+    for idx, (line_i, field, inline_value) in enumerate(headers):
+        if inline_value:
+            value = inline_value
+        else:
+            start = line_i + 1
+            end = headers[idx + 1][0] if idx + 1 < len(headers) else len(lines)
+            value = " ".join(lines[start:end]).strip(" •,")
+        if not value:
+            continue
+        result[field] = f"{result[field]} / {value}" if result[field] else value
 
     allergy_match = re.search(r"([가-힣,\s]{2,20}함유)", text)
     result["알레르기정보"] = allergy_match.group(1).strip() if allergy_match else ""
@@ -314,8 +356,22 @@ def ensure_header(sheet):
 
 
 # ---------------- 파일 1건 처리 ----------------
-def process_one_file(drive_service, sheet, file_info):
+# googleapiclient의 service 객체(내부 httplib2 클라이언트)는 스레드 세이프하지 않다.
+# 여러 스레드가 하나의 service 객체를 공유해서 동시에 요청을 보내면 연결이 깨져
+# SSL 오류나 심하면 메모리 손상(crash)까지 발생한다. 스레드마다 별도 service 객체를
+# 만들어 쓰도록 스레드 로컬로 캐싱한다.
+_thread_local = threading.local()
+
+
+def get_thread_drive_service(creds):
+    if not hasattr(_thread_local, "drive_service"):
+        _thread_local.drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
+    return _thread_local.drive_service
+
+
+def process_one_file(creds, sheet, file_info):
     name, file_id = file_info["name"], file_info["id"]
+    drive_service = get_thread_drive_service(creds)
     image_bytes = download_image(drive_service, file_id)
     text, confidences = ocr_image_azure(image_bytes)
     fields = parse_fields(text)
@@ -329,7 +385,7 @@ def run_once():
     require_config()
 
     creds = get_credentials()
-    drive_service = build("drive", "v3", credentials=creds)
+    drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
     gc = gspread.authorize(creds)
     sheet = gc.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
     ensure_header(sheet)
@@ -351,7 +407,7 @@ def run_once():
 
     with ThreadPoolExecutor(max_workers=CONCURRENT_WORKERS) as executor:
         futures = {
-            executor.submit(process_one_file, drive_service, sheet, f): f
+            executor.submit(process_one_file, creds, sheet, f): f
             for f in new_files
         }
         for future in as_completed(futures):
