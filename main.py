@@ -288,6 +288,22 @@ PRICE_LINE_PATTERN = re.compile(r"^(\d{1,3}(?:,\d{3})+)\s*\S{0,2}$")
 DISCOUNT_LINE_PATTERN = re.compile(r"^-[\d,]+\s*원?$")
 
 
+# 코드 바로 다음에 진짜 제품명이 아니라 "14.970", "15,990+"처럼 순수 숫자/기호
+# 파편(가격·단가 잔여물, 배경에 겹친 다른 태그의 조각)이 섞여 나오는 경우가
+# 있다. 그런 파편은 글자가 하나도 없는 토큰이므로, 제품명 문자열을 공백 기준
+# 토큰으로 나눠 "글자가 전혀 없는 토큰" 비율이 얼마나 되는지로 깨끗함 정도를
+# 매긴다 (0=전부 파편, 1=파편 없음).
+_JUNK_TOKEN_RE = re.compile(r"^[\d.,+%=]+$")
+
+
+def _name_cleanliness(name: str) -> float:
+    tokens = name.split()
+    if not tokens:
+        return 0.0
+    junk = sum(1 for t in tokens if _JUNK_TOKEN_RE.match(t))
+    return 1 - (junk / len(tokens))
+
+
 # ---------------- 항목 파싱: 상품코드 / 한국어 제품명 / 가격 ----------------
 def parse_price_fields(text: str) -> dict:
     """
@@ -295,11 +311,16 @@ def parse_price_fields(text: str) -> dict:
     문제가 없지만, 배경 진열대의 다른 가격표가 흐릿하게 같이 찍히면 그 상품코드
     (또는 우연히 숫자 4~8자리처럼 보이는 잡음)까지 함께 잡혀서 코드가 여러 개
     나올 수 있다. 이 경우 각 코드부터 다음 코드 직전까지를 한 구간으로 나눠
-    따로 파싱해보고, 그 구간 안에서 제품명·가격이 실제로 같이 발견된 구간만
-    후보로 남긴다 - 배경 잡음 코드 구간은 대개 이름/가격 중 하나 이상이
-    비어있어서 자연히 걸러진다. 후보가 여러 개 남으면(사진에 실제로 여러
-    상품이 찍힌 경우) 가장 먼저 나온 구간 - 보통 사진이 겨냥한 목표 가격표 -
-    을 채택한다.
+    따로 파싱해보고, 다음 기준으로 가장 그럴듯한 구간 하나를 채택한다:
+      1) 그 구간 안에서 제품명·가격이 실제로 같이 발견됐는지 (둘 다 있는 구간이
+         우선) - 배경 잡음 코드 구간은 대개 둘 중 하나 이상이 비어있어서 여기서
+         걸러진다.
+      2) 위 기준이 동점이면(사진에 진짜 상품이 여러 개 찍힌 경우), 추출된
+         제품명이 얼마나 "깨끗한"(숫자/기호 파편이 아니라 실제 단어로 이뤄진)
+         텍스트인지를 본다 - 상품코드 바로 뒤에 가격·단가 잔여물 같은 숫자
+         파편이 섞여 들어간 구간은 이 기준으로 걸러진다.
+      3) 그래도 동점이면 가장 먼저 나온 구간(대개 사진이 겨냥한 목표 가격표)을
+         채택한다.
     """
     lines = [l.strip() for l in text.split("\n") if l.strip()]
     code_indices = [i for i, l in enumerate(lines) if re.fullmatch(r"\d{4,8}", l)]
@@ -307,14 +328,14 @@ def parse_price_fields(text: str) -> dict:
     if len(code_indices) <= 1:
         return _parse_fields_from_lines(lines)
 
-    best_fields, best_score = None, -1
+    best_fields, best_score = None, None
     for idx, code_i in enumerate(code_indices):
         end = code_indices[idx + 1] if idx + 1 < len(code_indices) else len(lines)
         segment_fields = _parse_fields_from_lines(lines[code_i:end])
-        score = (1 if segment_fields.get("제품명(한국어)") else 0) + (
-            1 if segment_fields.get("가격") else 0
-        )
-        if score > best_score:
+        name = segment_fields.get("제품명(한국어)") or ""
+        base = (1 if name else 0) + (1 if segment_fields.get("가격") else 0)
+        score = (base, _name_cleanliness(name))
+        if best_score is None or score > best_score:
             best_score, best_fields = score, segment_fields
     return best_fields
 
