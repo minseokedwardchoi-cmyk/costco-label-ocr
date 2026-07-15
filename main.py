@@ -541,10 +541,19 @@ def process_one_file(creds, sheet, file_info):
     product_names = []
     for seg_text in segments:
         fields = parse_price_fields(seg_text)
+        # 여러 장 감지 시에만 적용: 상품코드만 읽히고 제품명/가격이 둘 다 빈
+        # 조각은 실제 카드가 아니라, 배경에 흐릿하게 걸친 다른 가격표의
+        # 파편(예: 초점 밖 진열대에 있는 옆 상품)일 가능성이 높다. 분리 안 된
+        # 단일 사진의 경우는 걸러내지 않는다 - 그래야 진짜 파싱 실패는 다음
+        # 실행에서도 계속 재시도된다(파일ID가 시트에 안 남아야 재시도 대상으로
+        # 잡히므로).
+        if multi_card and not fields.get("제품명(한국어)") and not fields.get("가격"):
+            continue
         row_dicts.append(build_row_dict(file_id, name, fields, seg_text))
         product_names.append(fields.get("제품명(한국어)") or "")
 
-    append_rows_to_sheet(sheet, row_dicts)
+    if row_dicts:
+        append_rows_to_sheet(sheet, row_dicts)
     product_summary = " / ".join(p for p in product_names if p)
     return name, product_summary, low_confidence or multi_card
 
