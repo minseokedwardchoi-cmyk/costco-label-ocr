@@ -439,9 +439,21 @@ def parse_price_tag_fields(text: str) -> dict:
     for i, line in enumerate(lines):
         if code_idx is not None and i <= code_idx:
             continue
-        if WEIGHT_PATTERN.search(line):
-            continue  # "50G X 12"처럼 대문자 단위가 섞인 중량 줄은 영어 제품명이 아니다
-        if re.fullmatch(r"[A-Z0-9 .,'&\-]{4,}", line) and re.search(r"[A-Z]{2,}", line):
+        # "TROLLI ALL IN ONE 1.2KG"처럼 실제 영어 제품명 끝에 중량이 같이 붙어
+        # 나오는 경우가 있어서, 중량 패턴이 포함된 줄을 통째로 걸러내면 안 된다.
+        # 대신 아래 "대문자 연속 2글자 + 2단어 이상" 조건만으로 순수 중량 단독
+        # 줄("50G X 12", "1.2KG" 등)은 이미 충분히 걸러진다 - 그런 줄은 단어가
+        # 1개뿐이거나 대문자가 서로 떨어져 있어서 조건을 통과하지 못한다.
+        #
+        # 브랜드명이 "RICOLA", "MIKAKUTO"처럼 대문자 한 단어로 단독 줄에 찍히는
+        # 경우가 많아서, 대문자 2글자 이상이라는 조건만으로는 브랜드명 줄을 영어
+        # 제품명으로 잘못 채택하기 쉽다. 실제 영어 제품명은 "RICOLA LEMON MINT
+        # DROPS"처럼 항상 두 단어 이상이므로, 최소 단어 수를 조건에 추가한다.
+        if (
+            re.fullmatch(r"[A-Z0-9 .,'&\-]{4,}", line)
+            and re.search(r"[A-Z]{2,}", line)
+            and len(line.split()) >= 2
+        ):
             english_idx = i
             result["제품명(영어)"] = line
             break
@@ -450,9 +462,12 @@ def parse_price_tag_fields(text: str) -> dict:
         # 한글 제품명은 상품코드 다음 줄부터, 중량/영문명/단가 중 가장 먼저 나오는
         # 줄 전까지로 본다 (셋 다 없으면 끝까지). 식품은 보통 중량이 경계가 되고,
         # 비식품은 중량이 없으니 영문명이 바로 경계가 된다.
+        # 이 구간에는 "RICOLA"처럼 한글이 아닌 브랜드명 줄이 섞여 있을 수 있는데,
+        # 실제로는 한글 제품명의 일부이므로("RICOLA 레몬민트 허브캔디") 한글 포함
+        # 여부로 거르지 않고 구간 안의 모든 줄을 그대로 합친다.
         boundary_candidates = [i for i in (weight_idx, english_idx, danga_idx) if i is not None]
         end = min(boundary_candidates) if boundary_candidates else len(lines)
-        korean_lines = [l for l in lines[code_idx + 1:end] if re.search(r"[가-힣]", l)]
+        korean_lines = lines[code_idx + 1:end]
         result["제품명(한국어)"] = " ".join(korean_lines).strip()
 
     # "단가 / 10G"처럼 기준 단위가 함께 찍혀있으므로, 가격만 뽑으면 몇 g당 가격인지
@@ -557,21 +572,50 @@ def review_note(low_confidence: bool, multi_card: bool) -> str:
 def append_rows_to_sheet(sheet, row_dicts):
     rows = [[row_dict.get(col, "") for col in COLUMN_ORDER] for row_dict in row_dicts]
     with sheet_lock:
-        sheet.append_rows(rows, value_input_option="USER_ENTERED")
+        # table_range를 A1로 명시하지 않으면 gspread가 시트 전체를 스캔해서
+        # "표"의 위치를 스스로 추측하는데, 헤더와 실제로 append하는 행의 폭이
+        # 어긋나 있으면(예: 헤더 마이그레이션이 덜 된 상태) 이 자동 추측이 틀어져서
+        # 다음 행이 점점 더 오른쪽 컬럼에서 시작되는 식으로 계속 밀릴 수 있다.
+        # A1로 고정해서 항상 A열 기준으로만 이어붙이게 만든다.
+        sheet.append_rows(rows, value_input_option="USER_ENTERED", table_range="A1")
+
+
+def _find_missing_columns(existing, column_order):
+    """existing의 모든 컬럼이 column_order 안에 같은 상대 순서로 들어있으면
+    (즉 existing이 column_order의 부분수열이면) [(끼워넣을 위치, 컬럼명), ...]을
+    돌려준다 (맨 뒤에 추가되는 경우도 포함). 순서가 바뀌었거나 컬럼이 삭제된
+    경우처럼 단순 "부분수열 + 추가"로 설명 안 되면 None을 돌려준다."""
+    missing = []
+    ei = 0
+    for ci, col in enumerate(column_order):
+        if ei < len(existing) and existing[ei] == col:
+            ei += 1
+        else:
+            missing.append((ci, col))
+    if ei != len(existing):
+        return None
+    return missing
 
 
 def ensure_header(sheet):
     existing = sheet.row_values(1)
     if not existing:
         sheet.append_row(COLUMN_ORDER, value_input_option="USER_ENTERED")
-    elif existing == COLUMN_ORDER:
         return
-    elif COLUMN_ORDER[: len(existing)] == existing:
-        # 기존 헤더가 새 COLUMN_ORDER의 앞부분과 정확히 일치한다 = 컬럼이 맨 뒤에
-        # 추가되기만 한 안전한 확장이다. 기존 데이터 행은 전혀 밀리지 않으므로
-        # 헤더 행만 새 컬럼명을 포함하도록 갱신한다.
-        added = COLUMN_ORDER[len(existing):]
+    if existing == COLUMN_ORDER:
+        return
+
+    missing = _find_missing_columns(existing, COLUMN_ORDER)
+    if missing is not None:
+        # 기존 헤더의 컬럼들이 COLUMN_ORDER 안에 전부 같은 순서로 들어있고,
+        # 새 컬럼만 몇 개 늘어난 상황이다 (맨 뒤에 추가됐든, 중간에 끼어들었든).
+        # 새 컬럼이 들어갈 자리에 빈 열을 실제로 끼워넣어서 기존 데이터 행이
+        # 절대 안 밀리게 만든다 (뒤 인덱스부터 끼워야 앞쪽 인덱스가 안 틀어짐).
+        for col_idx, _name in sorted(missing, key=lambda x: -x[0]):
+            if col_idx < len(existing):
+                sheet.insert_cols([[]], col=col_idx + 1)
         sheet.update(values=[COLUMN_ORDER], range_name="A1")
+        added = [name for _, name in missing]
         print(f"시트 헤더에 새 컬럼 {len(added)}개를 추가했습니다: {', '.join(added)}")
     else:
         # 컬럼 순서가 바뀌었거나 삭제된 경우 - 자동으로 지우면 기존 데이터가 밀릴 수
