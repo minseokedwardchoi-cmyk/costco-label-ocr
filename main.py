@@ -335,19 +335,26 @@ def parse_price_fields(text: str) -> dict:
     danga_idx = next((i for i, line in enumerate(lines) if "단가" in line), None)
 
     english_idx = None
+    seen_korean_line = False
     for i, line in enumerate(lines):
         if code_idx is not None and i <= code_idx:
+            continue
+        if re.search(r"[가-힣]", line):
+            seen_korean_line = True
+        # "NATIONAL GEOGRAPHIC", "RICOLA", "MIKAKUTO"처럼 브랜드명이 코드 바로
+        # 다음 줄에 대문자로 찍히는 경우가 많다. 단어 수 조건("2단어 이상")만으로는
+        # "NATIONAL GEOGRAPHIC"처럼 두 단어짜리 브랜드명을 못 걸러서 진짜 영어
+        # 제품명(예: "NG WATERPROOF BAG 2PK")보다 먼저 잘못 채택돼버린다.
+        # 실제 레이아웃은 항상 "코드 -> (브랜드명) -> 한글 제품명 -> 영어 제품명"
+        # 순서이므로, 한글이 포함된 줄을 최소 한 번은 지나친 뒤부터만 영어 제품명
+        # 후보로 인정한다 - 이러면 단어 수와 상관없이 브랜드명 줄이 걸러진다.
+        if not seen_korean_line:
             continue
         # "TROLLI ALL IN ONE 1.2KG"처럼 실제 영어 제품명 끝에 중량이 같이 붙어
         # 나오는 경우가 있어서, 중량 패턴이 포함된 줄을 통째로 걸러내면 안 된다.
         # 대신 아래 "대문자 연속 2글자 + 2단어 이상" 조건만으로 순수 중량 단독
         # 줄("50G X 12", "1.2KG" 등)은 이미 충분히 걸러진다 - 그런 줄은 단어가
         # 1개뿐이거나 대문자가 서로 떨어져 있어서 조건을 통과하지 못한다.
-        #
-        # 브랜드명이 "RICOLA", "MIKAKUTO"처럼 대문자 한 단어로 단독 줄에 찍히는
-        # 경우가 많아서, 대문자 2글자 이상이라는 조건만으로는 브랜드명 줄을 영어
-        # 제품명으로 잘못 채택하기 쉽다. 실제 영어 제품명은 "RICOLA LEMON MINT
-        # DROPS"처럼 항상 두 단어 이상이므로, 최소 단어 수를 조건에 추가한다.
         if (
             re.fullmatch(r"[A-Z0-9 .,'&\-]{4,}", line)
             and re.search(r"[A-Z]{2,}", line)
