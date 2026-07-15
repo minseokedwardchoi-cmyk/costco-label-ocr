@@ -2,9 +2,11 @@
 
 Google Drive 폴더에 제품 라벨(뒷면 표시사항) 사진을 대량(예: 월 1,500장) 업로드하면
 Azure AI Vision의 Read API로 무료 OCR을 돌려서, 항목별로 파싱한 뒤
-Google Sheets에 자동으로 정리해주는 시스템입니다. GitHub Actions가 **15분마다 자동으로
-실행**되며 새 사진이 있으면 바로 처리하므로, 수동으로 실행 버튼을 누를 필요가 없습니다.
-서버 운영 비용 없이 완전 무료로 동작합니다.
+Google Sheets에 자동으로 정리해주는 시스템입니다. **대시보드의 "업데이트" 버튼을
+누르면 그 시점에 실행**됩니다 (GitHub Actions의 `workflow_dispatch` API를 대시보드
+백엔드가 호출하는 방식 - 연동 방법은 `DASHBOARD_INTEGRATION.md` 참고). 언제 사진이
+올라올지 알 수 없는 상황에서 굳이 주기적으로 폴링할 필요가 없어서, 필요한 시점에만
+실행되도록 했습니다. 서버 운영 비용 없이 완전 무료로 동작합니다.
 
 ## 왜 Azure Read API인가?
 
@@ -15,13 +17,13 @@ Google Sheets에 자동으로 정리해주는 시스템입니다. GitHub Actions
 
 ## 왜 GitHub Actions인가?
 
-- 서버를 따로 띄우지 않아도 **15분마다 자동으로 깨어나 새 사진이 있는지 확인**합니다
+- 서버를 따로 띄우지 않아도 **REST API 호출 한 번으로 실행을 트리거**할 수 있습니다
   (Private 저장소도 월 2,000분 무료 — 새 파일이 없으면 몇 초 만에 끝나는 실행이라 크게
   소모되지 않습니다. 사진을 한꺼번에 많이 올린 달에는 OCR 처리에 수십~90분 정도 쓰입니다).
 - 처리 이력은 로컬 파일이 아니라 **구글 시트 자체**(파일ID 열)를 기준으로 판단하므로,
   매번 새로 뜨는 Actions 실행 환경에서도 중복 처리 없이 이어서 작동합니다.
-- 워크플로에 `concurrency` 설정이 있어서, 이전 실행이 아직 진행 중이면(대량 업로드 직후
-  OCR이 오래 걸리는 경우) 다음 15분 주기가 겹쳐 시작되지 않고 대기합니다 — 중복 처리 방지.
+- 워크플로에 `concurrency` 설정이 있어서, 이전 실행이 아직 진행 중일 때(대량 업로드
+  직후 OCR이 오래 걸리는 경우) 버튼이 또 눌려도 두 실행이 겹치지 않고 순서대로 돕니다.
 
 ## 1. Azure 리소스 생성
 
@@ -52,7 +54,7 @@ cp .env.example .env
 python main.py
 ```
 
-## 4. GitHub Actions로 자동 실행 설정
+## 4. GitHub Actions 실행 설정
 
 저장소 **Settings → Secrets and variables → Actions → New repository secret**에서 아래 값을 등록하세요.
 
@@ -65,10 +67,13 @@ python main.py
 | `AZURE_VISION_KEY` | Azure 키 |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | 서비스 계정 JSON 파일의 **내용 전체**를 그대로 복사해서 붙여넣기 |
 
-등록 후에는 `.github/workflows/auto-ocr.yml`에 설정된 크론 일정(**15분마다**)에 맞춰 자동으로
-실행됩니다. Drive 폴더에 사진을 올리면 별도로 버튼을 누르지 않아도 최대 15분 안에 처리됩니다.
-간격을 바꾸고 싶으면 워크플로 파일의 `cron` 값을 수정하세요 (예: `*/5 * * * *`는 5분마다).
-지금 바로 확인해보고 싶다면 저장소의 **Actions 탭 → 코스트코 라벨 OCR 자동 실행 (15분 주기) → Run workflow**를 누르면 됩니다.
+등록 후에는 `.github/workflows/auto-ocr.yml`의 `workflow_dispatch` 트리거로 실행됩니다.
+자동 스케줄(크론)은 없고, 아래 두 방법 중 하나로 실행을 트리거합니다:
+
+- **대시보드 "업데이트" 버튼**: 대시보드 백엔드가 GitHub REST API를 호출 (연동 방법은
+  `DASHBOARD_INTEGRATION.md` 참고)
+- **수동 확인용**: 저장소의 **Actions 탭 → 코스트코 라벨 OCR 실행 (대시보드 트리거 / 수동 실행)
+  → Run workflow**
 
 ## 5. 동작 방식
 
