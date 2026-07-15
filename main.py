@@ -629,7 +629,15 @@ def run_once():
     creds = get_credentials()
     drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
     gc = gspread.authorize(creds)
-    sheet = gc.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
+    spreadsheet = gc.open_by_key(SPREADSHEET_ID)
+    try:
+        sheet = spreadsheet.worksheet(SHEET_NAME)
+    except gspread.exceptions.WorksheetNotFound:
+        # SHEET_NAME이 가리키는 탭이 없으면(수동으로 이름을 바꿨거나 지운 경우 등)
+        # 매 실행마다 에러로 죽는 대신, 그 이름으로 새 탭을 만들어서 계속 진행한다.
+        print(f"경고: 시트 탭 '{SHEET_NAME}'을 찾을 수 없어서 새로 만듭니다. "
+              "기존에 다른 이름의 탭에 데이터가 있었다면 그 데이터는 이 탭에 없으니 확인해주세요.")
+        sheet = spreadsheet.add_worksheet(title=SHEET_NAME, rows=1000, cols=26)
     ensure_header(sheet)
 
     processed_ids = load_processed_ids(sheet)
