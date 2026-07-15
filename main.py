@@ -272,27 +272,6 @@ def needs_review(confidences):
     return ratio >= LOW_CONFIDENCE_WORD_RATIO
 
 
-def split_price_tag_cards(text: str):
-    """한 사진에 상품 가격표 카드가 여러 개 찍혀있을 수 있다. 상품코드로 보이는
-    줄과 가격으로 보이는 줄이 각각 2개 이상이면 카드가 여러 개 있다고 보고,
-    각 상품코드 줄을 기준으로 텍스트를 나눈다 (다음 상품코드 줄 직전까지가 한
-    카드). 카드가 1개뿐이면(대부분의 경우) 원래 텍스트를 그대로 돌려준다.
-    반환값: (조각 텍스트 리스트, 여러 장 감지 여부)
-    """
-    lines = [l.strip() for l in text.split("\n") if l.strip()]
-    code_indices = [i for i, l in enumerate(lines) if re.fullmatch(r"\d{4,8}", l)]
-    price_count = sum(1 for l in lines if re.match(r"^\d{1,3}(?:,\d{3})+\s*\S{0,2}$", l))
-
-    if len(code_indices) < 2 or price_count < 2:
-        return [text], False
-
-    segments = []
-    for idx, code_i in enumerate(code_indices):
-        end = code_indices[idx + 1] if idx + 1 < len(code_indices) else len(lines)
-        segments.append("\n".join(lines[code_i:end]))
-    return segments, True
-
-
 # 진짜 중량("50G X 12", "1.2kgx1개", "900g포장")과 "SML194G"(모델 코드),
 # "2gari"(제품명 일부) 같은 우연의 일치를 구분해야 한다:
 #   - 앞쪽: (?<![A-Za-z0-9]) - 숫자 바로 앞에 글자/숫자가 없어야 한다.
@@ -533,29 +512,15 @@ def process_one_file(creds, sheet, file_info):
     text, confidences = ocr_image_azure(image_bytes)
     low_confidence = needs_review(confidences)
 
-    # 상품코드/가격 패턴이 2개 이상씩 없으면 카드가 1개뿐이라고 보고 전체
-    # 텍스트를 그대로 돌려주므로, 가격표가 아닌 사진에도 안전하게 쓸 수 있다.
-    segments, multi_card = split_price_tag_cards(text)
-
-    row_dicts = []
-    product_names = []
-    for seg_text in segments:
-        fields = parse_price_fields(seg_text)
-        # 여러 장 감지 시에만 적용: 상품코드만 읽히고 제품명/가격이 둘 다 빈
-        # 조각은 실제 카드가 아니라, 배경에 흐릿하게 걸친 다른 가격표의
-        # 파편(예: 초점 밖 진열대에 있는 옆 상품)일 가능성이 높다. 분리 안 된
-        # 단일 사진의 경우는 걸러내지 않는다 - 그래야 진짜 파싱 실패는 다음
-        # 실행에서도 계속 재시도된다(파일ID가 시트에 안 남아야 재시도 대상으로
-        # 잡히므로).
-        if multi_card and not fields.get("제품명(한국어)") and not fields.get("가격"):
-            continue
-        row_dicts.append(build_row_dict(file_id, name, fields, seg_text))
-        product_names.append(fields.get("제품명(한국어)") or "")
-
-    if row_dicts:
-        append_rows_to_sheet(sheet, row_dicts)
-    product_summary = " / ".join(p for p in product_names if p)
-    return name, product_summary, low_confidence or multi_card
+    # 배경에 다른 가격표가 같이 찍혀도(예: 초점 밖 진열대의 옆 상품) 사진 한
+    # 장당 항상 메인 상품 하나만 뽑는다. parse_price_fields()가 텍스트에서
+    # 처음 나오는 상품코드/가격을 기준으로 삼으므로, 사진을 찍을 때 목표
+    # 가격표가 가장 먼저(주로 가장 위, 가장 크게) 나오는 한 자연스럽게
+    # 메인 상품이 선택된다.
+    fields = parse_price_fields(text)
+    row_dict = build_row_dict(file_id, name, fields, text)
+    append_rows_to_sheet(sheet, [row_dict])
+    return name, fields.get("제품명(한국어)") or "", low_confidence
 
 
 # ---------------- 메인 실행 ----------------
