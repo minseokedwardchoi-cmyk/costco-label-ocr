@@ -56,11 +56,7 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
 
 DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID")
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID")
-# 사진 종류별로 시트 탭을 분리한다: 표시사항 라벨 / 가격표-식품 / 가격표-비식품
-# (컬럼 구성이 서로 달라서 한 시트에 몰아넣으면 빈 칸이 너무 많아짐)
-SHEET_NAME_LABEL = os.environ.get("SHEET_NAME_LABEL", os.environ.get("SHEET_NAME", "표시사항라벨"))
-SHEET_NAME_FOOD = os.environ.get("SHEET_NAME_FOOD", "가격표-식품")
-SHEET_NAME_NONFOOD = os.environ.get("SHEET_NAME_NONFOOD", "가격표-비식품")
+SHEET_NAME = os.environ.get("SHEET_NAME", "시트1")
 
 AZURE_VISION_ENDPOINT = os.environ.get("AZURE_VISION_ENDPOINT")
 AZURE_VISION_KEY = os.environ.get("AZURE_VISION_KEY")
@@ -106,12 +102,11 @@ LABEL_ALIASES = {
     "포장재질": ["포장재질", "재질"],
 }
 
-# 사진은 세 종류를 처리한다:
-#   1) 제품 뒷면 표시사항 라벨 -> FIELD_LABELS -> "표시사항라벨" 시트
-#   2) 코스트코 매대 가격표 - 식품(중량 표기 있음) -> FOOD_PRICE_COLUMNS -> "가격표-식품" 시트
-#   3) 코스트코 매대 가격표 - 비식품(중량 없음) -> NONFOOD_PRICE_COLUMNS -> "가격표-비식품" 시트
-# parse_price_tag_fields()는 항상 중량까지 포함한 전체 필드를 계산해두고, 어느 시트에
-# 쓸지에 따라 컬럼 목록만 다르게 골라 쓴다 (식품/비식품 판별 자체도 중량 유무로 한다).
+# 사진 두 종류를 같은 시트에서 같이 처리한다:
+#   1) 제품 뒷면 표시사항 라벨 -> FIELD_LABELS
+#   2) 코스트코 매대 가격표 (상품코드/제품명/중량/단가/가격) -> PRICE_TAG_FIELDS
+# 중량은 식품에만 있는 게 아니라 비식품에도 찍혀있는 경우가 있어서(예: 세제 용량),
+# 식품/비식품을 나누는 기준으로 쓰지 않는다 - 그냥 있으면 채우고 없으면 빈 칸으로 둔다.
 PRICE_TAG_FIELDS = [
     "상품코드",
     "제품명(한국어)",
@@ -123,7 +118,9 @@ PRICE_TAG_FIELDS = [
 
 # 파일ID를 맨 앞에 둔다: 구글 시트 자체가 "이미 처리한 파일" 목록의 기준이 되므로
 # 파일명이 중복되더라도(예: IMG_0001.jpg가 여러 장) 고유한 Drive 파일ID로 정확히 식별한다.
-COLUMN_ORDER_LABEL = [
+# PRICE_TAG_FIELDS는 맨 뒤에 붙인다: 기존 컬럼 순서를 그대로 유지해야, 이미 쌓인 데이터 행이
+# 밀리지 않고 헤더 행만 안전하게 갱신할 수 있다 (ensure_header 참고).
+COLUMN_ORDER = [
     "파일ID",
     "파일명",
     "처리일시",
@@ -132,34 +129,7 @@ COLUMN_ORDER_LABEL = [
     "바코드",
     "검토필요",
     "원문텍스트",
-]
-
-COLUMN_ORDER_FOOD = [
-    "파일ID",
-    "파일명",
-    "처리일시",
-    "상품코드",
-    "제품명(한국어)",
-    "중량",
-    "제품명(영어)",
-    "단가",
-    "가격",
-    "검토필요",
-    "원문텍스트",
-]
-
-COLUMN_ORDER_NONFOOD = [
-    "파일ID",
-    "파일명",
-    "처리일시",
-    "상품코드",
-    "제품명(한국어)",
-    "제품명(영어)",
-    "단가",
-    "가격",
-    "검토필요",
-    "원문텍스트",
-]
+] + PRICE_TAG_FIELDS
 
 
 def require_config():
@@ -212,14 +182,10 @@ def get_credentials():
     )
 
 
-def load_processed_ids(sheets):
-    """세 시트(표시사항라벨/가격표-식품/가격표-비식품) 각각의 '파일ID' 열(1번 컬럼)에
-    이미 기록된 값을 전부 합쳐서 처리 완료 목록으로 삼는다. 한 파일이 여러 카드로
-    나뉘어 여러 시트에 걸쳐 기록됐을 수도 있으므로 세 시트를 모두 확인해야 한다."""
-    ids = set()
-    for sheet in sheets:
-        ids.update(sheet.col_values(1)[1:])  # 헤더 제외
-    return ids
+def load_processed_ids(sheet):
+    """구글 시트의 '파일ID' 열(1번 컬럼)에 이미 기록된 값들을 처리 완료 목록으로 삼는다."""
+    ids = sheet.col_values(1)[1:]  # 헤더 제외
+    return set(ids)
 
 
 # ---------------- Drive: 전체 이미지 조회 (페이지네이션 포함) ----------------
@@ -435,7 +401,7 @@ def split_price_tag_cards(text: str):
     return segments, True
 
 
-WEIGHT_PATTERN = re.compile(r"\d+(\.\d+)?\s*(g|ml|kg|l)\b", re.IGNORECASE)
+WEIGHT_PATTERN = re.compile(r"\d+(\.\d+)?\s*(g|ml|kg|l|m)\b", re.IGNORECASE)
 PRICE_LINE_PATTERN = re.compile(r"^(\d{1,3}(?:,\d{3})+)\s*\S{0,2}$")
 DISCOUNT_LINE_PATTERN = re.compile(r"^-[\d,]+\s*원?$")
 
@@ -495,7 +461,7 @@ def parse_price_tag_fields(text: str) -> dict:
     danga_price = ""
     danga_price_line_idx = None  # 가격 탐색에서 이 줄은 다시 쓰지 않도록 인덱스로 기억
     if danga_idx is not None:
-        unit_match = re.search(r"(\d+)\s*(g|ml|kg|l)\b", lines[danga_idx], re.IGNORECASE)
+        unit_match = re.search(r"(\d+)\s*(g|ml|kg|l|m)\b", lines[danga_idx], re.IGNORECASE)
         unit = f"{unit_match.group(1)}{unit_match.group(2).lower()}" if unit_match else ""
         for offset, line in enumerate(lines[danga_idx:danga_idx + 3]):
             m = re.search(r"[\d,]{2,}\s*원", line)
@@ -545,9 +511,13 @@ def parse_price_tag_fields(text: str) -> dict:
     return result
 
 
-def extract_label_fields(text: str) -> dict:
-    """표시사항 라벨 사진 전용: 필드 파싱에 더해 알레르기정보/바코드까지 뽑는다."""
-    fields = parse_product_label_fields(text)
+def extract_fields(text: str) -> dict:
+    """사진 종류를 구조적 특징으로 판별해서 알맞은 파서로 넘긴다. 두 종류 모두
+    같은 시트에 쌓이며, 해당 없는 필드는 빈 칸으로 남는다."""
+    if is_price_tag(text):
+        fields = parse_price_tag_fields(text)
+    else:
+        fields = parse_product_label_fields(text)
 
     allergy_match = re.search(r"([가-힣,\s]{2,20}함유)", text)
     fields["알레르기정보"] = allergy_match.group(1).strip() if allergy_match else ""
@@ -556,15 +526,6 @@ def extract_label_fields(text: str) -> dict:
     fields["바코드"] = re.sub(r"\s+", "", barcode_match.group(1)) if barcode_match else ""
 
     return fields
-
-
-def classify_segment(text: str) -> str:
-    """세그먼트(사진 전체 또는 카드 1개 분량 텍스트)의 종류를 판별한다.
-    반환값: "food_price" | "nonfood_price" | "label" """
-    if not is_price_tag(text):
-        return "label"
-    lines = [l.strip() for l in text.split("\n") if l.strip()]
-    return "food_price" if any(WEIGHT_PATTERN.search(l) for l in lines) else "nonfood_price"
 
 
 # ---------------- 시트 저장 ----------------
@@ -593,39 +554,31 @@ def review_note(low_confidence: bool, multi_card: bool) -> str:
     return ""
 
 
-def append_rows_to_sheet(sheet, row_dicts, column_order):
-    rows = [[row_dict.get(col, "") for col in column_order] for row_dict in row_dicts]
+def append_rows_to_sheet(sheet, row_dicts):
+    rows = [[row_dict.get(col, "") for col in COLUMN_ORDER] for row_dict in row_dicts]
     with sheet_lock:
         sheet.append_rows(rows, value_input_option="USER_ENTERED")
 
 
-def ensure_header(sheet, column_order):
+def ensure_header(sheet):
     existing = sheet.row_values(1)
     if not existing:
-        sheet.append_row(column_order, value_input_option="USER_ENTERED")
-    elif existing == column_order:
+        sheet.append_row(COLUMN_ORDER, value_input_option="USER_ENTERED")
+    elif existing == COLUMN_ORDER:
         return
-    elif column_order[: len(existing)] == existing:
-        # 기존 헤더가 새 컬럼 목록의 앞부분과 정확히 일치한다 = 컬럼이 맨 뒤에
+    elif COLUMN_ORDER[: len(existing)] == existing:
+        # 기존 헤더가 새 COLUMN_ORDER의 앞부분과 정확히 일치한다 = 컬럼이 맨 뒤에
         # 추가되기만 한 안전한 확장이다. 기존 데이터 행은 전혀 밀리지 않으므로
         # 헤더 행만 새 컬럼명을 포함하도록 갱신한다.
-        added = column_order[len(existing):]
-        sheet.update(values=[column_order], range_name="A1")
-        print(f"[{sheet.title}] 시트 헤더에 새 컬럼 {len(added)}개를 추가했습니다: {', '.join(added)}")
+        added = COLUMN_ORDER[len(existing):]
+        sheet.update(values=[COLUMN_ORDER], range_name="A1")
+        print(f"시트 헤더에 새 컬럼 {len(added)}개를 추가했습니다: {', '.join(added)}")
     else:
         # 컬럼 순서가 바뀌었거나 삭제된 경우 - 자동으로 지우면 기존 데이터가 밀릴 수
         # 있으므로 건드리지 않는다. 헤더 행을 수동으로 맞춰주세요.
-        print(f"경고: [{sheet.title}] 시트 1행 헤더가 예상 컬럼 목록과 다릅니다. 데이터 보호를 위해 "
-              "자동으로 지우지 않았으니, 헤더 행을 아래 순서로 직접 맞춰주세요:")
-        print("  " + " | ".join(column_order))
-
-
-def open_or_create_worksheet(spreadsheet, title):
-    try:
-        return spreadsheet.worksheet(title)
-    except gspread.exceptions.WorksheetNotFound:
-        print(f"시트 탭 '{title}'이 없어서 새로 만듭니다.")
-        return spreadsheet.add_worksheet(title=title, rows=1000, cols=26)
+        print("경고: 시트 1행 헤더가 COLUMN_ORDER와 다릅니다. 데이터 보호를 위해 자동으로 지우지 않았으니, "
+              "헤더 행을 아래 순서로 직접 맞춰주세요:")
+        print("  " + " | ".join(COLUMN_ORDER))
 
 
 # ---------------- 파일 1건 처리 ----------------
@@ -642,8 +595,7 @@ def get_thread_drive_service(creds):
     return _thread_local.drive_service
 
 
-def process_one_file(creds, sheets, file_info):
-    """sheets: {"label": ws, "food": ws, "nonfood": ws}"""
+def process_one_file(creds, sheet, file_info):
     name, file_id = file_info["name"], file_info["id"]
     drive_service = get_thread_drive_service(creds)
     image_bytes = download_image(drive_service, file_id)
@@ -657,22 +609,15 @@ def process_one_file(creds, sheets, file_info):
     else:
         segments, multi_card = [text], False
 
-    rows_by_type = {"label": [], "food_price": [], "nonfood_price": []}
+    row_dicts = []
     product_names = []
     for seg_text in segments:
-        seg_type = classify_segment(seg_text)
-        fields = extract_label_fields(seg_text) if seg_type == "label" else parse_price_tag_fields(seg_text)
+        fields = extract_fields(seg_text)
         note = review_note(low_confidence, multi_card)
-        rows_by_type[seg_type].append(build_row_dict(file_id, name, fields, seg_text, note))
+        row_dicts.append(build_row_dict(file_id, name, fields, seg_text, note))
         product_names.append(fields.get("제품명") or fields.get("제품명(한국어)") or "")
 
-    if rows_by_type["label"]:
-        append_rows_to_sheet(sheets["label"], rows_by_type["label"], COLUMN_ORDER_LABEL)
-    if rows_by_type["food_price"]:
-        append_rows_to_sheet(sheets["food"], rows_by_type["food_price"], COLUMN_ORDER_FOOD)
-    if rows_by_type["nonfood_price"]:
-        append_rows_to_sheet(sheets["nonfood"], rows_by_type["nonfood_price"], COLUMN_ORDER_NONFOOD)
-
+    append_rows_to_sheet(sheet, row_dicts)
     product_summary = " / ".join(p for p in product_names if p)
     return name, product_summary, low_confidence or multi_card
 
@@ -684,18 +629,10 @@ def run_once():
     creds = get_credentials()
     drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
     gc = gspread.authorize(creds)
-    spreadsheet = gc.open_by_key(SPREADSHEET_ID)
+    sheet = gc.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
+    ensure_header(sheet)
 
-    sheets = {
-        "label": open_or_create_worksheet(spreadsheet, SHEET_NAME_LABEL),
-        "food": open_or_create_worksheet(spreadsheet, SHEET_NAME_FOOD),
-        "nonfood": open_or_create_worksheet(spreadsheet, SHEET_NAME_NONFOOD),
-    }
-    ensure_header(sheets["label"], COLUMN_ORDER_LABEL)
-    ensure_header(sheets["food"], COLUMN_ORDER_FOOD)
-    ensure_header(sheets["nonfood"], COLUMN_ORDER_NONFOOD)
-
-    processed_ids = load_processed_ids(sheets.values())
+    processed_ids = load_processed_ids(sheet)
     all_files = list_all_images(drive_service)
     new_files = [f for f in all_files if f["id"] not in processed_ids]
 
@@ -712,7 +649,7 @@ def run_once():
 
     with ThreadPoolExecutor(max_workers=CONCURRENT_WORKERS) as executor:
         futures = {
-            executor.submit(process_one_file, creds, sheets, f): f
+            executor.submit(process_one_file, creds, sheet, f): f
             for f in new_files
         }
         for future in as_completed(futures):
