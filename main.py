@@ -291,16 +291,45 @@ DISCOUNT_LINE_PATTERN = re.compile(r"^-[\d,]+\s*원?$")
 # ---------------- 항목 파싱: 상품코드 / 한국어 제품명 / 가격 ----------------
 def parse_price_fields(text: str) -> dict:
     """
+    사진 한 장당 항상 한 상품만 뽑는다. 대부분은 상품코드로 보이는 줄이 하나뿐이라
+    문제가 없지만, 배경 진열대의 다른 가격표가 흐릿하게 같이 찍히면 그 상품코드
+    (또는 우연히 숫자 4~8자리처럼 보이는 잡음)까지 함께 잡혀서 코드가 여러 개
+    나올 수 있다. 이 경우 각 코드부터 다음 코드 직전까지를 한 구간으로 나눠
+    따로 파싱해보고, 그 구간 안에서 제품명·가격이 실제로 같이 발견된 구간만
+    후보로 남긴다 - 배경 잡음 코드 구간은 대개 이름/가격 중 하나 이상이
+    비어있어서 자연히 걸러진다. 후보가 여러 개 남으면(사진에 실제로 여러
+    상품이 찍힌 경우) 가장 먼저 나온 구간 - 보통 사진이 겨냥한 목표 가격표 -
+    을 채택한다.
+    """
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    code_indices = [i for i, l in enumerate(lines) if re.fullmatch(r"\d{4,8}", l)]
+
+    if len(code_indices) <= 1:
+        return _parse_fields_from_lines(lines)
+
+    best_fields, best_score = None, -1
+    for idx, code_i in enumerate(code_indices):
+        end = code_indices[idx + 1] if idx + 1 < len(code_indices) else len(lines)
+        segment_fields = _parse_fields_from_lines(lines[code_i:end])
+        score = (1 if segment_fields.get("제품명(한국어)") else 0) + (
+            1 if segment_fields.get("가격") else 0
+        )
+        if score > best_score:
+            best_score, best_fields = score, segment_fields
+    return best_fields
+
+
+def _parse_fields_from_lines(lines: list) -> dict:
+    """
     가격표 레이아웃(위에서 아래 순서): 상품코드(숫자만 있는 줄) -> 한글 제품명
     (2~3줄) -> [식품이면 중량 1줄] -> 영문 제품명(대문자 1줄) -> [단가] -> 판매가.
     시트에 남기는 건 상품코드/제품명(한국어)/가격 3개뿐이지만, 중량·영문
     제품명·단가 줄은 한국어 제품명이 어디서 끝나는지, 가격 후보 중 뭘 걸러야
     하는지 판단하는 경계로는 여전히 필요해서 내부적으로만 찾는다.
-    (text는 이미 ocr_image_azure 단계에서 bounding box 기준으로 재정렬되어 있어서
+    (lines는 이미 ocr_image_azure 단계에서 bounding box 기준으로 재정렬되어 있어서
     실제 시각적 순서와 거의 일치한다 - 아래 로직은 이 순서를 그대로 신뢰한다.)
     """
     result = {f: "" for f in PRICE_FIELDS}
-    lines = [l.strip() for l in text.split("\n") if l.strip()]
 
     code_idx = None
     for i, line in enumerate(lines):
@@ -410,7 +439,7 @@ def parse_price_fields(text: str) -> dict:
     if not result["가격"]:
         # 콤마 없는 가격도 드물게 있을 수 있으니, "원" 글자가 정상적으로 인식된
         # 나머지 금액 중에서 찾는 것으로 대비한다.
-        all_prices = [m.group(0) for m in re.finditer(r"[\d,]{2,}\s*원", text)]
+        all_prices = [m.group(0) for m in re.finditer(r"[\d,]{2,}\s*원", "\n".join(lines))]
         remaining_prices = [p for p in all_prices if p != danga_price]
         if remaining_prices:
             result["가격"] = max(remaining_prices, key=lambda p: int(re.sub(r"[^\d]", "", p) or "0"))
