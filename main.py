@@ -69,9 +69,17 @@ LOW_CONFIDENCE_WORD_RATIO = float(os.environ.get("LOW_CONFIDENCE_WORD_RATIO", "0
 # =========================================================
 
 SCOPES = [
-    "https://www.googleapis.com/auth/drive.readonly",
+    # 처리 완료된 사진을 '처리완료' 폴더로 이동하려면 쓰기 권한이 필요해서
+    # drive.readonly 대신 전체 drive 스코프를 쓴다 (서비스 계정이 Drive 폴더에
+    # 최소 편집자 권한으로 공유되어 있어야 이동이 성공한다).
+    "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/spreadsheets",
 ]
+
+# 처리 완료된 사진을 옮겨두는 하위 폴더 이름. 삭제하지 않고 이동만 하므로
+# 나중에 재검증이 필요하면 그대로 다시 볼 수 있고, 신규 업로드 폴더
+# (DRIVE_FOLDER_ID)는 다음 실행의 조회 대상에서 계속 가벼운 상태로 유지된다.
+ARCHIVE_FOLDER_NAME = "처리완료"
 
 # 핵심 컬럼: 식품/비식품 가릴 것 없이 모든 SKU에 공통으로 채워지는 것들.
 CORE_PRICE_FIELDS = ["상품코드", "제품명(한국어)", "가격"]
@@ -161,6 +169,38 @@ def list_all_images(drive_service):
         if not page_token:
             break
     return files
+
+
+def get_or_create_archive_folder(drive_service, parent_id):
+    """'처리완료' 하위 폴더를 찾아서 id를 돌려주고, 없으면 새로 만든다.
+    여러 스레드가 동시에 만들려고 하면 중복 폴더가 생길 수 있으므로,
+    스레드 풀을 시작하기 전에 메인 스레드에서 한 번만 호출한다."""
+    query = (
+        f"'{parent_id}' in parents and name = '{ARCHIVE_FOLDER_NAME}' "
+        "and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    )
+    results = drive_service.files().list(q=query, fields="files(id)", pageSize=1).execute()
+    existing = results.get("files", [])
+    if existing:
+        return existing[0]["id"]
+    folder = drive_service.files().create(
+        body={
+            "name": ARCHIVE_FOLDER_NAME,
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": [parent_id],
+        },
+        fields="id",
+    ).execute()
+    return folder["id"]
+
+
+def archive_file(drive_service, file_id, archive_folder_id):
+    drive_service.files().update(
+        fileId=file_id,
+        addParents=archive_folder_id,
+        removeParents=DRIVE_FOLDER_ID,
+        fields="id, parents",
+    ).execute()
 
 
 def download_image(drive_service, file_id):
@@ -553,7 +593,7 @@ def get_thread_drive_service(creds):
     return _thread_local.drive_service
 
 
-def process_one_file(creds, sheet, file_info):
+def process_one_file(creds, sheet, file_info, archive_folder_id):
     name, file_id = file_info["name"], file_info["id"]
     drive_service = get_thread_drive_service(creds)
     image_bytes = download_image(drive_service, file_id)
@@ -570,6 +610,16 @@ def process_one_file(creds, sheet, file_info):
     fields = parse_price_fields(text)
     row_dict = build_row_dict(file_id, name, fields, text)
     append_rows_to_sheet(sheet, [row_dict])
+
+    # 시트 기록이 끝난 뒤에 사진을 '처리완료' 폴더로 옮긴다. 이동이 실패해도
+    # 시트 기록(=파일ID 기준 중복 처리 방지)은 이미 끝났으므로 데이터 유실은
+    # 아니다 - 그 사진만 원래 폴더에 계속 남아있을 뿐이라 실행을 실패로
+    # 처리하지 않고 경고만 남긴다.
+    try:
+        archive_file(drive_service, file_id, archive_folder_id)
+    except Exception as e:
+        print(f"  경고: '{name}' 보관 폴더 이동 실패 (시트 기록은 완료됨): {e}")
+
     return name, fields.get("제품명(한국어)") or "", low_confidence
 
 
@@ -603,12 +653,14 @@ def run_once():
     print(f"(Azure 무료 티어 속도 제한: 분당 {AZURE_MAX_CALLS_PER_MINUTE}건 -> "
           f"예상 소요 시간 약 {len(new_files) / AZURE_MAX_CALLS_PER_MINUTE:.0f}분)")
 
+    archive_folder_id = get_or_create_archive_folder(drive_service, DRIVE_FOLDER_ID)
+
     success_count = 0
     failed = []
 
     with ThreadPoolExecutor(max_workers=CONCURRENT_WORKERS) as executor:
         futures = {
-            executor.submit(process_one_file, creds, sheet, f): f
+            executor.submit(process_one_file, creds, sheet, f, archive_folder_id): f
             for f in new_files
         }
         for future in as_completed(futures):
