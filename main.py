@@ -347,7 +347,7 @@ _TRAILING_QUANTITY_RE = re.compile(r"^[\sx×X*]*\d*\s*(개|포|입|병|팩|ea|EA
 # 있다 (트레이더스뿐 아니라 코스트코 화면 캡처류에서도 나온다). 두 파서 모두
 # 이 패턴을 단가 보조 신호로 쓴다.
 UNIT_PRICE_PATTERN = re.compile(
-    r"(\d+(?:\.\d+)?\s*(?:g|ml|kg|l|m))\s*당\s*([\d,]+)\s*원", re.IGNORECASE
+    r"(\d+(?:\.\d+)?\s*(?:g|ml|kg|l|m)?)\s*당\s*([\d,]+)\s*원", re.IGNORECASE
 )
 
 
@@ -650,12 +650,27 @@ def parse_traders_fields(text: str) -> dict:
 
     # 가격: 상품코드(바코드) 줄 이후에 나오는 첫 콤마 형식 금액을 우선 신뢰한다
     # (코스트코와 마찬가지로 가격은 보통 코드/바코드 다음, 맨 아래에 나온다).
-    search_lines = lines[code_idx + 1:] if code_idx is not None else lines
-    for line in search_lines:
-        m = PRICE_LINE_PATTERN.match(line)
-        if m:
-            result["가격"] = f"{m.group(1)}원"
-            break
+    # "신세계포인트 적립 할인", "-2,000"처럼 할인 표시가 있으면 그 이후에 나오는
+    # 가격(할인 후 최종가)은 절대 선택하지 않는다 - 코스트코 파서와 동일한 규칙으로
+    # 항상 정가만 "가격"으로 채택한다.
+    def find_price(candidate_lines):
+        for line in candidate_lines:
+            m = PRICE_LINE_PATTERN.match(line)
+            if m:
+                return f"{m.group(1)}원"
+        return ""
+
+    start = code_idx + 1 if code_idx is not None else 0
+    search_lines = lines[start:]
+    discount_idx = next(
+        (i for i, l in enumerate(lines) if i >= start and ("할인" in l or DISCOUNT_LINE_PATTERN.match(l))),
+        None,
+    )
+    if discount_idx is not None:
+        result["가격"] = find_price(lines[start:discount_idx]) or find_price(search_lines)
+    else:
+        result["가격"] = find_price(search_lines)
+
     if not result["가격"]:
         all_prices = [m.group(0) for m in re.finditer(r"[\d,]{2,}\s*원", text)]
         if all_prices:
