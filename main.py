@@ -413,6 +413,18 @@ def _parse_fields_from_lines(lines: list) -> dict:
 
     danga_idx = next((i for i, line in enumerate(lines) if "단가" in line), None)
 
+    # 건강기능식품류 라벨은 "코드 -> 한글명 -> 정가 -> 영문명 -> 할인정보 -> 단가"처럼
+    # 가격이 영문명보다 먼저 나오는 경우가 있다. 가격처럼 보이는 줄(콤마 포함 금액)이
+    # 중량/영문명/단가보다 먼저 나오면 그것도 한글 제품명의 경계로 잡아야, 가격이
+    # 한글 제품명에 잘못 딸려 들어가는 걸 막을 수 있다.
+    price_boundary_idx = None
+    for i, line in enumerate(lines):
+        if code_idx is not None and i <= code_idx:
+            continue
+        if PRICE_LINE_PATTERN.match(line):
+            price_boundary_idx = i
+            break
+
     english_idx = None
     seen_korean_line = False
     for i, line in enumerate(lines):
@@ -444,13 +456,15 @@ def _parse_fields_from_lines(lines: list) -> dict:
             break
 
     if code_idx is not None:
-        # 한글 제품명은 상품코드 다음 줄부터, 중량/영문명/단가 중 가장 먼저 나오는
-        # 줄 전까지로 본다 (셋 다 없으면 끝까지). 식품은 보통 중량이 경계가 되고,
+        # 한글 제품명은 상품코드 다음 줄부터, 중량/영문명/단가/가격 중 가장 먼저
+        # 나오는 줄 전까지로 본다 (넷 다 없으면 끝까지). 식품은 보통 중량이 경계가 되고,
         # 비식품은 중량이 없으니 영문명이 바로 경계가 된다.
         # 이 구간에는 "RICOLA"처럼 한글이 아닌 브랜드명 줄이 섞여 있을 수 있는데,
         # 실제로는 한글 제품명의 일부이므로("RICOLA 레몬민트 허브캔디") 한글 포함
         # 여부로 거르지 않고 구간 안의 모든 줄을 그대로 합친다.
-        boundary_candidates = [i for i in (weight_idx, english_idx, danga_idx) if i is not None]
+        boundary_candidates = [
+            i for i in (weight_idx, english_idx, danga_idx, price_boundary_idx) if i is not None
+        ]
         end = min(boundary_candidates) if boundary_candidates else len(lines)
         korean_lines = lines[code_idx + 1:end]
         result["제품명(한국어)"] = " ".join(korean_lines).strip()
@@ -517,9 +531,19 @@ def _parse_fields_from_lines(lines: list) -> dict:
 # 이 위치 차이로 형식을 판별한다 - 자릿수만으로는 8자리에서 겹칠 수 있어서
 # "맨 앞 줄이 코드냐"가 더 안정적인 기준이다.
 def detect_retailer(text: str) -> str:
+    """
+    코스트코 상품코드(4~8자리)와 트레이더스 바코드 번호(9~14자리)는 자릿수가
+    겹치지 않는다. 등급 표시("한국파기등급") 같은 잡음 줄이 진짜 코드 위에
+    끼어들면 "맨 첫 줄"만으로는 오판별하므로(잡음 줄이 코드가 아니니 트레이더스로
+    잘못 판정됨), parse_price_fields()의 코드 탐색과 마찬가지로 텍스트 전체에서
+    가장 먼저 나오는 "단독 숫자 줄"을 기준으로 삼는다 - 그 줄의 자릿수로 판별.
+    """
     lines = [l.strip() for l in text.split("\n") if l.strip()]
-    if lines and re.fullmatch(r"\d{4,8}", lines[0]):
-        return "costco"
+    for line in lines:
+        if re.fullmatch(r"\d{4,8}", line):
+            return "costco"
+        if re.fullmatch(r"\d{9,14}", line):
+            return "traders"
     return "traders"
 
 
