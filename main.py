@@ -659,8 +659,13 @@ def parse_traders_fields(text: str) -> dict:
             code_idx = i
             break
 
-    # 가격: 상품코드(바코드) 줄 이후에 나오는 첫 콤마 형식 금액을 우선 신뢰한다
-    # (코스트코와 마찬가지로 가격은 보통 코드/바코드 다음, 맨 아래에 나온다).
+    # 가격: 콤마 형식(예: "15,380")의 독립된 줄을 카드 전체에서 찾는다. 큰 판매가
+    # 숫자는 폰트가 커서 바운딩박스 top-Y가 바코드 번호 줄보다 위로 잡히는 경우가
+    # 많아, 인쇄상으로는 코드 아래 있어도 OCR 줄 순서에서는 코드보다 먼저 나올 수
+    # 있다 - "코드 다음 줄부터"로만 찾으면 이런 카드에서 가격을 통째로 놓쳐서
+    # 아래 "원" 문자 기반 폴백이 대신 "10g당 154원"의 154를 가격으로 잘못 채택하게
+    # 된다. 단가는 "10g당 154원"처럼 콤마 없는 숫자라 PRICE_LINE_PATTERN(콤마
+    # 필수)에 애초에 안 걸리므로 카드 전체에서 찾아도 단가와 헷갈릴 일은 없다.
     # "신세계포인트 적립 할인", "-2,000"처럼 할인 표시가 있으면 그 이후에 나오는
     # 가격(할인 후 최종가)은 절대 선택하지 않는다 - 코스트코 파서와 동일한 규칙으로
     # 항상 정가만 "가격"으로 채택한다.
@@ -671,16 +676,14 @@ def parse_traders_fields(text: str) -> dict:
                 return f"{m.group(1)}원"
         return ""
 
-    start = code_idx + 1 if code_idx is not None else 0
-    search_lines = lines[start:]
     discount_idx = next(
-        (i for i, l in enumerate(lines) if i >= start and ("할인" in l or DISCOUNT_LINE_PATTERN.match(l))),
+        (i for i, l in enumerate(lines) if "할인" in l or DISCOUNT_LINE_PATTERN.match(l)),
         None,
     )
     if discount_idx is not None:
-        result["가격"] = find_price(lines[start:discount_idx]) or find_price(search_lines)
+        result["가격"] = find_price(lines[:discount_idx]) or find_price(lines)
     else:
-        result["가격"] = find_price(search_lines)
+        result["가격"] = find_price(lines)
 
     if not result["가격"]:
         all_prices = [m.group(0) for m in re.finditer(r"[\d,]{2,}\s*원", text)]
