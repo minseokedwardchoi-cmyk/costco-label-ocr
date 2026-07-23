@@ -6,3 +6,5 @@ smuckers
 nescaf gold
 nescaf caf
 nescaf clsico
+vanilla macaron
+assorted macaron
