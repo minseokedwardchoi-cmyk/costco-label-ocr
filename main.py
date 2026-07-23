@@ -513,11 +513,14 @@ def _parse_fields_from_lines(lines: list) -> dict:
     # "단가 / 10G"처럼 기준 단위가 함께 찍혀있으므로, 가격만 뽑으면 몇 g당 가격인지
     # 알 수 없다. "217원" 대신 "217원/10g" 형태로 단위까지 같이 기록한다
     # (기준 단위는 상품마다 다르므로 사진에서 그대로 읽어와야 정확하다).
+    # 단위가 "10g"처럼 숫자+무게단위가 아니라 "장"/"개"처럼 개수 단위 하나만
+    # 나오는 경우도 있다("단가 / 장", "단가 / 개") - "/" 뒤에 오는 토큰을
+    # 그대로 단위로 쓰면 둘 다 커버된다.
     danga_price = ""
     danga_price_line_idx = None  # 가격 탐색에서 이 줄은 다시 쓰지 않도록 인덱스로 기억
     if danga_idx is not None:
-        unit_match = re.search(r"(\d+)\s*(g|ml|kg|l|m)", lines[danga_idx], re.IGNORECASE)
-        unit = f"{unit_match.group(1)}{unit_match.group(2).lower()}" if unit_match else ""
+        unit_match = re.search(r"단가\s*/\s*(\S+)", lines[danga_idx])
+        unit = unit_match.group(1) if unit_match else ""
         for offset, line in enumerate(lines[danga_idx:danga_idx + 3]):
             m = re.search(r"[\d,]{2,}\s*원", line)
             if m:
