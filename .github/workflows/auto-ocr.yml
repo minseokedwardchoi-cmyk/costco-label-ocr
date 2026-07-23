@@ -1,9 +1,14 @@
 name: 코스트코 라벨 OCR 실행 (대시보드 트리거 / 수동 실행)
 
 on:
-  workflow_dispatch: {}  # 대시보드의 "업데이트" 버튼이 GitHub REST API로 이 트리거를 호출한다.
-                          # 연동 방법은 DASHBOARD_INTEGRATION.md 참고. Actions 탭에서
-                          # 사람이 수동으로 Run workflow를 눌러도 똑같이 동작한다.
+  workflow_dispatch:  # 대시보드의 "업데이트" 버튼이 GitHub REST API로 이 트리거를 호출한다.
+                       # 연동 방법은 DASHBOARD_INTEGRATION.md 참고. Actions 탭에서
+                       # 사람이 수동으로 Run workflow를 눌러도 똑같이 동작한다.
+    inputs:
+      folder_id:
+        description: "처리할 Drive 폴더 ID 임시 지정 (소량 테스트용). 비워두면 기본 폴더(DRIVE_FOLDER_ID 시크릿)를 그대로 씀"
+        required: false
+        default: ""
 
 # 대시보드 버튼을 짧은 시간에 여러 번 누르거나, 이전 실행이 아직 끝나기 전에
 # 다시 트리거되면(대량 업로드 직후 OCR이 오래 걸리는 경우) 같은 파일이 중복
@@ -28,7 +33,7 @@ jobs:
 
       - run: python main.py
         env:
-          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+          DRIVE_FOLDER_ID: ${{ github.event.inputs.folder_id || secrets.DRIVE_FOLDER_ID }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           SHEET_NAME: ${{ secrets.SHEET_NAME }}
           AZURE_VISION_ENDPOINT: ${{ secrets.AZURE_VISION_ENDPOINT }}

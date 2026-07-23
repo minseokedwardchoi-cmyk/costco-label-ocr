@@ -37,6 +37,14 @@ Content-Type: application/json
 {"ref": "main"}
 ```
 
+(선택) 특정 Drive 폴더만 테스트로 처리하고 싶으면 `inputs.folder_id`를 추가하세요:
+
+```json
+{"ref": "main", "inputs": {"folder_id": "<테스트용 Drive 폴더 ID>"}}
+```
+
+비워두거나 아예 안 보내면 평소처럼 기본 폴더(`DRIVE_FOLDER_ID` 시크릿)를 사용합니다.
+
 **성공하면 HTTP 204(No Content)**를 돌려줍니다 - 응답 본문은 없습니다.
 이 호출은 "실행을 큐에 넣는다"는 뜻이고, **OCR 처리가 끝날 때까지 기다려주지
 않습니다** (사진이 많으면 실제 처리에 몇 분~1시간 이상 걸릴 수 있음). 그래서
