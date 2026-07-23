@@ -1,5 +1,5 @@
 import csv, re, sys, os
-ART = re.compile(r'^\(?\d+\s*(pack|pk|cans?)\)?|^\(pack of|^wasabi peas$', re.I)
+ART = re.compile(r'^\(?\d+\s*(pack|pk|cans?)\)?|^\(?pack of|^wasabi peas$', re.I)
 manual=set()
 if os.path.exists('_exclude.txt'):
     for l in open('_exclude.txt',encoding='utf-8'):
