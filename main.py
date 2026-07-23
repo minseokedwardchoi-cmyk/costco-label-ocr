@@ -57,6 +57,9 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
 DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID")
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID")
 SHEET_NAME = os.environ.get("SHEET_NAME", "시트1")
+# 같은 Drive 폴더에 코스트코/트레이더스 가격표 사진이 섞여 올라온다. 형식을
+# 자동 판별해서(detect_retailer 참고) 각자의 시트 탭에 나눠 기록한다.
+TRADERS_SHEET_NAME = os.environ.get("TRADERS_SHEET_NAME", "트레이더스")
 
 AZURE_VISION_ENDPOINT = os.environ.get("AZURE_VISION_ENDPOINT")
 AZURE_VISION_KEY = os.environ.get("AZURE_VISION_KEY")
@@ -468,6 +471,76 @@ def _parse_fields_from_lines(lines: list) -> dict:
     return result
 
 
+# ---------------- 트레이더스 가격표 파싱 ----------------
+# 코스트코는 상품코드(4~8자리)가 텍스트 맨 앞에 오지만, 트레이더스는 맨 앞이
+# 제품명이고 상품코드(바코드 번호, 8~13자리)가 바코드 아래 한참 뒤에 나온다.
+# 이 위치 차이로 형식을 판별한다 - 자릿수만으로는 8자리에서 겹칠 수 있어서
+# "맨 앞 줄이 코드냐"가 더 안정적인 기준이다.
+def detect_retailer(text: str) -> str:
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    if lines and re.fullmatch(r"\d{4,8}", lines[0]):
+        return "costco"
+    return "traders"
+
+
+TRADERS_DANGA_PATTERN = re.compile(
+    r"(\d+(?:\.\d+)?\s*(?:g|ml|kg|l|m))\s*당\s*([\d,]+)\s*원", re.IGNORECASE
+)
+TRADERS_CODE_PATTERN = re.compile(r"\d{8,14}")
+
+
+def parse_traders_fields(text: str) -> dict:
+    """
+    트레이더스 가격표 레이아웃(코스트코와 반대 순서): 제품명(한국어, 맨 위) ->
+    [제품명(영어)] -> [단가, "100g당 899원"처럼 한 줄에 다 있음] -> 특징 문구 ->
+    바코드 -> 상품코드(바코드 번호) -> 판매가(맨 아래).
+    실사진으로 검증하며 계속 다듬어야 하는 초기 버전이다 - 코스트코 파서도
+    실사진 여러 장을 거치며 여러 번 고친 것과 같은 과정이 필요하다.
+    """
+    result = {f: "" for f in PRICE_FIELDS}
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    if not lines:
+        return result
+
+    result["제품명(한국어)"] = lines[0]
+
+    idx = 1
+    if (
+        idx < len(lines)
+        and re.fullmatch(r"[A-Z0-9 .,'&\-]{4,}", lines[idx])
+        and re.search(r"[A-Z]{2,}", lines[idx])
+    ):
+        result["제품명(영어)"] = lines[idx]
+        idx += 1
+
+    danga_match = TRADERS_DANGA_PATTERN.search(text)
+    if danga_match:
+        unit = danga_match.group(1).replace(" ", "")
+        result["단가"] = f"{danga_match.group(2)}원/{unit}"
+
+    code_idx = None
+    for i, line in enumerate(lines):
+        if TRADERS_CODE_PATTERN.fullmatch(line):
+            result["상품코드"] = line
+            code_idx = i
+            break
+
+    # 가격: 상품코드(바코드) 줄 이후에 나오는 첫 콤마 형식 금액을 우선 신뢰한다
+    # (코스트코와 마찬가지로 가격은 보통 코드/바코드 다음, 맨 아래에 나온다).
+    search_lines = lines[code_idx + 1:] if code_idx is not None else lines
+    for line in search_lines:
+        m = PRICE_LINE_PATTERN.match(line)
+        if m:
+            result["가격"] = f"{m.group(1)}원"
+            break
+    if not result["가격"]:
+        all_prices = [m.group(0) for m in re.finditer(r"[\d,]{2,}\s*원", text)]
+        if all_prices:
+            result["가격"] = max(all_prices, key=lambda p: int(re.sub(r"[^\d]", "", p) or "0"))
+
+    return result
+
+
 # ---------------- 시트 저장 ----------------
 sheet_lock = threading.Lock()  # gspread 동시 append 충돌 방지
 
@@ -553,7 +626,7 @@ def get_thread_drive_service(creds):
     return _thread_local.drive_service
 
 
-def process_one_file(creds, sheet, file_info):
+def process_one_file(creds, sheets, file_info):
     name, file_id = file_info["name"], file_info["id"]
     drive_service = get_thread_drive_service(creds)
     image_bytes = download_image(drive_service, file_id)
@@ -562,12 +635,17 @@ def process_one_file(creds, sheet, file_info):
     text, confidences = ocr_image_azure(image_bytes)
     low_confidence = needs_review(confidences)
 
-    # 배경에 다른 가격표가 같이 찍혀도(예: 초점 밖 진열대의 옆 상품) 사진 한
-    # 장당 항상 메인 상품 하나만 뽑는다. parse_price_fields()가 텍스트에서
-    # 처음 나오는 상품코드/가격을 기준으로 삼으므로, 사진을 찍을 때 목표
-    # 가격표가 가장 먼저(주로 가장 위, 가장 크게) 나오는 한 자연스럽게
-    # 메인 상품이 선택된다.
-    fields = parse_price_fields(text)
+    # 코스트코/트레이더스 사진이 같은 Drive 폴더에 섞여 올라오므로, 텍스트
+    # 구조를 보고 형식을 판별해 알맞은 파서와 시트로 보낸다 (detect_retailer
+    # 참고). 배경에 다른 가격표가 같이 찍혀도(예: 초점 밖 진열대의 옆 상품)
+    # 사진 한 장당 항상 메인 상품 하나만 뽑는다.
+    retailer = detect_retailer(text)
+    if retailer == "traders":
+        fields = parse_traders_fields(text)
+        sheet = sheets["traders"]
+    else:
+        fields = parse_price_fields(text)
+        sheet = sheets["costco"]
     row_dict = build_row_dict(file_id, name, fields, text)
     append_rows_to_sheet(sheet, [row_dict])
     return name, fields.get("제품명(한국어)") or "", low_confidence
@@ -581,17 +659,28 @@ def run_once():
     drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
     gc = gspread.authorize(creds)
     spreadsheet = gc.open_by_key(SPREADSHEET_ID)
-    try:
-        sheet = spreadsheet.worksheet(SHEET_NAME)
-    except gspread.exceptions.WorksheetNotFound:
-        # SHEET_NAME이 가리키는 탭이 없으면(수동으로 이름을 바꿨거나 지운 경우 등)
-        # 매 실행마다 에러로 죽는 대신, 그 이름으로 새 탭을 만들어서 계속 진행한다.
-        print(f"경고: 시트 탭 '{SHEET_NAME}'을 찾을 수 없어서 새로 만듭니다. "
-              "기존에 다른 이름의 탭에 데이터가 있었다면 그 데이터는 이 탭에 없으니 확인해주세요.")
-        sheet = spreadsheet.add_worksheet(title=SHEET_NAME, rows=1000, cols=26)
-    ensure_header(sheet)
 
-    processed_ids = load_processed_ids(sheet)
+    def open_or_create_sheet(sheet_name):
+        try:
+            return spreadsheet.worksheet(sheet_name)
+        except gspread.exceptions.WorksheetNotFound:
+            # 해당 이름의 탭이 없으면(수동으로 이름을 바꿨거나 아직 안 만든 경우 등)
+            # 매 실행마다 에러로 죽는 대신, 그 이름으로 새 탭을 만들어서 계속 진행한다.
+            print(f"경고: 시트 탭 '{sheet_name}'을 찾을 수 없어서 새로 만듭니다. "
+                  "기존에 다른 이름의 탭에 데이터가 있었다면 그 데이터는 이 탭에 없으니 확인해주세요.")
+            return spreadsheet.add_worksheet(title=sheet_name, rows=1000, cols=26)
+
+    sheets = {
+        "costco": open_or_create_sheet(SHEET_NAME),
+        "traders": open_or_create_sheet(TRADERS_SHEET_NAME),
+    }
+    for sheet in sheets.values():
+        ensure_header(sheet)
+
+    # 코스트코/트레이더스 어느 시트에 기록됐든 이미 처리한 파일이니, 두 시트의
+    # 파일ID를 합쳐서 "처리 완료" 목록으로 삼는다 - 안 그러면 한 시트에만 있는
+    # 파일이 다른 시트 기준으로는 계속 "신규"로 보여서 중복 처리될 수 있다.
+    processed_ids = load_processed_ids(sheets["costco"]) | load_processed_ids(sheets["traders"])
     all_files = list_all_images(drive_service)
     new_files = [f for f in all_files if f["id"] not in processed_ids]
 
@@ -608,7 +697,7 @@ def run_once():
 
     with ThreadPoolExecutor(max_workers=CONCURRENT_WORKERS) as executor:
         futures = {
-            executor.submit(process_one_file, creds, sheet, f): f
+            executor.submit(process_one_file, creds, sheets, f): f
             for f in new_files
         }
         for future in as_completed(futures):
