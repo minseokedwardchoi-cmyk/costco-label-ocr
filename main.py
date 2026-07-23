@@ -60,6 +60,10 @@ SHEET_NAME = os.environ.get("SHEET_NAME", "시트1")
 # 같은 Drive 폴더에 코스트코/트레이더스 가격표 사진이 섞여 올라온다. 형식을
 # 자동 판별해서(detect_retailer 참고) 각자의 시트 탭에 나눠 기록한다.
 TRADERS_SHEET_NAME = os.environ.get("TRADERS_SHEET_NAME", "트레이더스")
+# 코스트코/트레이더스 원본 시트는 그대로 두고, 같은 데이터를 제품군(예: 올리브유)
+# 단위로 정리해서 보여주는 별도 시트. 원본 시트가 진짜 원본이고 이 시트는 거기서
+# 파생된 정리본이라, 분류가 잘못돼도 원본 대조로 언제든 재정리할 수 있다.
+CATEGORY_SHEET_NAME = os.environ.get("CATEGORY_SHEET_NAME", "제품군정리")
 
 AZURE_VISION_ENDPOINT = os.environ.get("AZURE_VISION_ENDPOINT")
 AZURE_VISION_KEY = os.environ.get("AZURE_VISION_KEY")
@@ -605,6 +609,117 @@ def parse_traders_fields(text: str) -> dict:
     return result
 
 
+# ---------------- 제품군정리 시트 ----------------
+# 제품명(한국어)에 이 키워드 중 하나가 들어있으면 그 제품군으로 분류한다. 아직
+# 마주치지 못한 제품군은 자동으로 UNCATEGORIZED_LABEL로 들어가서 데이터가
+# 유실되진 않지만, 실제로 찍히는 상품 종류를 봐가며 이 목록을 계속 채워나가야
+# 분류율이 올라간다. 길이가 긴 키워드부터 먼저 시도해야 "유기농 엑스트라버진
+# 올리브유"가 "올리브유"보다 먼저 매칭되어 더 구체적인 이름으로 분류된다.
+CATEGORY_KEYWORDS = [
+    "선크림", "폴로티", "스트레치바지", "반팔티", "콜라겐", "비타민",
+    "허브캔디", "방수팩", "선글라스", "팝콘치킨", "레티놀",
+]
+UNCATEGORIZED_LABEL = "미분류"
+
+# 제품군 블록 하나는 "제목 행" + 아래 14개 항목 행으로 구성된다. 상품은 이
+# 항목들을 세로로 채운 열 하나로 표현되고(카드형), 같은 제품군의 상품들이
+# 옆으로(B, C, D...) 나란히 쌓인다. OCR 상품카드에는 이 중 상품명/규격·단량/
+# 판매가/상품코드/파일ID/원문텍스트만 있으므로 CATEGORY_FIELD_MAP에 있는
+# 행만 채우고 나머지(사진/소싱형태/매출(연)/단위단가/매출율/산도/원산지/
+# 셀링포인트)는 빈 칸으로 남긴다 - 수기로 채우거나 다른 소스에서 나중에
+# 채워 넣을 몫이다.
+CATEGORY_ROW_LABELS = [
+    "사진", "상품명", "소싱형태", "매출(연)", "규격/단량", "판매가",
+    "단위단가", "매출율", "산도", "원산지", "셀링포인트", "상품코드",
+    "파일ID", "원문텍스트",
+]
+CATEGORY_FIELD_MAP = {
+    "상품명": "제품명(한국어)",
+    "규격/단량": "중량",
+    "판매가": "가격",
+    "상품코드": "상품코드",
+    "파일ID": "파일ID",
+    "원문텍스트": "원문텍스트",
+}
+
+
+def detect_category(product_name: str) -> str:
+    for kw in sorted(CATEGORY_KEYWORDS, key=len, reverse=True):
+        if kw in product_name:
+            return kw
+    return UNCATEGORIZED_LABEL
+
+
+def _col_letter(col: int) -> str:
+    letters = ""
+    while col > 0:
+        col, rem = divmod(col - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
+
+
+def _scan_category_blocks(values: list):
+    """제품군정리 시트의 현재 내용(get_all_values() 결과)을 읽어서
+    {제품군명: {"title_row": 제목 행, "field_rows": {항목명: 행번호}, "next_col": 다음 빈 열}}
+    과, 새 제품군 블록을 추가할 때 쓸 다음 행 번호를 함께 돌려준다."""
+    blocks = {}
+    n_labels = len(CATEGORY_ROW_LABELS)
+    r = 0
+    while r < len(values):
+        col_a = values[r][0] if values[r] else ""
+        if col_a and col_a not in CATEGORY_ROW_LABELS:
+            title_row = r + 1  # 1-indexed 시트 행 번호
+            field_rows = {label: title_row + i for i, label in enumerate(CATEGORY_ROW_LABELS, start=1)}
+            name_row_idx = field_rows["상품명"] - 1  # 0-indexed
+            name_row_values = values[name_row_idx] if name_row_idx < len(values) else []
+            next_col = len(name_row_values) + 1 if name_row_values else 2
+            blocks[col_a] = {"title_row": title_row, "field_rows": field_rows, "next_col": next_col}
+            r += 1 + n_labels
+        else:
+            r += 1
+    next_new_row = len(values) + 3 if values else 1
+    return blocks, next_new_row
+
+
+def update_category_sheet(sheet, row_dicts: list):
+    """방금 처리된 상품들을 제품군 블록 형태로 정리해서 기록한다. 코스트코/
+    트레이더스 원본 시트는 건드리지 않는 별도 파생 시트라, 여기서 실수가
+    나도 원본 대조로 다시 정리할 수 있다. 여러 스레드가 동시에 열 번호를
+    계산하면 충돌하므로, OCR 병렬 처리가 다 끝난 뒤 이 함수 하나만 단일
+    스레드로 호출한다. 같은 상품코드가 다시 나와도 항상 새 열을 만든다."""
+    if not row_dicts:
+        return
+
+    values = sheet.get_all_values()
+    blocks, next_new_row = _scan_category_blocks(values)
+    updates = []
+
+    for row_dict in row_dicts:
+        category = detect_category(row_dict.get("제품명(한국어)") or "")
+        block = blocks.get(category)
+        if block is None:
+            title_row = next_new_row
+            field_rows = {label: title_row + i for i, label in enumerate(CATEGORY_ROW_LABELS, start=1)}
+            block = {"title_row": title_row, "field_rows": field_rows, "next_col": 2}
+            blocks[category] = block
+            next_new_row = title_row + 1 + len(CATEGORY_ROW_LABELS) + 2
+            updates.append({"range": f"A{title_row}", "values": [[category]]})
+            updates.append({
+                "range": f"A{title_row + 1}:A{title_row + len(CATEGORY_ROW_LABELS)}",
+                "values": [[label] for label in CATEGORY_ROW_LABELS],
+            })
+
+        col_letter = _col_letter(block["next_col"])
+        for label, source_key in CATEGORY_FIELD_MAP.items():
+            value = row_dict.get(source_key) or ""
+            row = block["field_rows"][label]
+            updates.append({"range": f"{col_letter}{row}", "values": [[value]]})
+        block["next_col"] += 1
+
+    if updates:
+        sheet.batch_update(updates, value_input_option="USER_ENTERED")
+
+
 # ---------------- 시트 저장 ----------------
 sheet_lock = threading.Lock()  # gspread 동시 append 충돌 방지
 
@@ -722,7 +837,7 @@ def process_one_file(creds, sheets, file_info, archive_folder_id):
     except Exception as e:
         print(f"  경고: '{name}' 보관 폴더 이동 실패 (시트 기록은 완료됨): {e}")
 
-    return name, fields.get("제품명(한국어)") or "", low_confidence
+    return name, fields.get("제품명(한국어)") or "", low_confidence, row_dict
 
 
 # ---------------- 메인 실행 ----------------
@@ -750,6 +865,9 @@ def run_once():
     }
     for sheet in sheets.values():
         ensure_header(sheet)
+    # 제품군정리는 코스트코/트레이더스 원본과 완전히 다른(블록형) 구조라
+    # COLUMN_ORDER 기반 ensure_header 대상이 아니다.
+    category_sheet = open_or_create_sheet(CATEGORY_SHEET_NAME)
 
     # 코스트코/트레이더스 어느 시트에 기록됐든 이미 처리한 파일이니, 두 시트의
     # 파일ID를 합쳐서 "처리 완료" 목록으로 삼는다 - 안 그러면 한 시트에만 있는
@@ -770,6 +888,7 @@ def run_once():
 
     success_count = 0
     failed = []
+    processed_row_dicts = []
 
     with ThreadPoolExecutor(max_workers=CONCURRENT_WORKERS) as executor:
         futures = {
@@ -779,13 +898,21 @@ def run_once():
         for future in as_completed(futures):
             f = futures[future]
             try:
-                name, product, flag = future.result()
+                name, product, flag, row_dict = future.result()
                 success_count += 1
+                processed_row_dicts.append(row_dict)
                 flag_str = " [검토필요]" if flag else ""
                 print(f"  완료: {name} -> {product or '(제품명 인식 실패)'}{flag_str}")
             except Exception as e:
                 failed.append((f["name"], str(e)))
                 print(f"  실패: {f['name']} -> {e}")
+
+    # 제품군 블록에 열 번호를 매기는 작업은 동시에 하면 충돌하므로, 병렬
+    # 처리가 다 끝난 뒤 단일 스레드로 한 번에 처리한다.
+    try:
+        update_category_sheet(category_sheet, processed_row_dicts)
+    except Exception as e:
+        print(f"경고: 제품군정리 시트 갱신 실패 (코스트코/트레이더스 원본 시트 기록은 정상 완료됨): {e}")
 
     print(f"\n완료: {success_count}건 성공, {len(failed)}건 실패")
     if failed:
