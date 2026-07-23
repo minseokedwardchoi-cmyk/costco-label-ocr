@@ -63,7 +63,10 @@ TRADERS_SHEET_NAME = os.environ.get("TRADERS_SHEET_NAME", "트레이더스")
 # 코스트코/트레이더스 원본 시트는 그대로 두고, 같은 데이터를 제품군(예: 올리브유)
 # 단위로 정리해서 보여주는 별도 시트. 원본 시트가 진짜 원본이고 이 시트는 거기서
 # 파생된 정리본이라, 분류가 잘못돼도 원본 대조로 언제든 재정리할 수 있다.
-CATEGORY_SHEET_NAME = os.environ.get("CATEGORY_SHEET_NAME", "제품군정리")
+# 코스트코/트레이더스는 상품 성격이 서로 달라서(예: 식품 위주 vs 생활용품 위주)
+# 제품군 블록도 원본 시트와 마찬가지로 리테일러별로 따로 둔다.
+CATEGORY_SHEET_NAME_COSTCO = os.environ.get("CATEGORY_SHEET_NAME_COSTCO", "제품군정리(코스트코)")
+CATEGORY_SHEET_NAME_TRADERS = os.environ.get("CATEGORY_SHEET_NAME_TRADERS", "제품군정리(트레이더스)")
 
 AZURE_VISION_ENDPOINT = os.environ.get("AZURE_VISION_ENDPOINT")
 AZURE_VISION_KEY = os.environ.get("AZURE_VISION_KEY")
@@ -334,6 +337,32 @@ WEIGHT_PATTERN = re.compile(r"(?<![A-Za-z0-9])\d+(\.\d+)?\s*(g|ml|kg|l|m)(?![a-w
 PRICE_LINE_PATTERN = re.compile(r"^(\d{1,3}(?:,\d{3})+)\s*\S{0,2}$")
 DISCOUNT_LINE_PATTERN = re.compile(r"^-[\d,]+\s*원?$")
 
+# 중량이 독립된 줄이 아니라 "오리온 오그래놀라 시나몬츄러스 440g* 3개"처럼
+# 제품명 끝에 그대로 붙어 나오는 경우가 많다. 중량 단위 뒤에 "* 3개", "x2개",
+# "포"처럼 짧은 수량 표시만 더 있고 그걸로 줄이 끝나면, 그 지점부터를 전부
+# 중량 쪽으로 떼어낸다.
+_TRAILING_QUANTITY_RE = re.compile(r"^[\sx×X*]*\d*\s*(개|포|입|병|팩|ea|EA|Ea)?\.?$")
+
+# "100g당 899원"처럼 "단가"라는 글자 없이 "N단위당 M원" 형태로만 찍히는 경우도
+# 있다 (트레이더스뿐 아니라 코스트코 화면 캡처류에서도 나온다). 두 파서 모두
+# 이 패턴을 단가 보조 신호로 쓴다.
+UNIT_PRICE_PATTERN = re.compile(
+    r"(\d+(?:\.\d+)?\s*(?:g|ml|kg|l|m))\s*당\s*([\d,]+)\s*원", re.IGNORECASE
+)
+
+
+def _split_trailing_weight(name: str) -> tuple:
+    """제품명 문자열 끝에 중량이 붙어있으면 (중량 뗀 제품명, 중량)을 돌려주고,
+    없으면 (원래 이름, "")을 그대로 돌려준다."""
+    matches = list(WEIGHT_PATTERN.finditer(name))
+    if not matches:
+        return name, ""
+    last = matches[-1]
+    rest = name[last.end():]
+    if _TRAILING_QUANTITY_RE.match(rest):
+        return name[:last.start()].strip(), name[last.start():].strip()
+    return name, ""
+
 
 # 코드 바로 다음에 진짜 제품명이 아니라 "14.970", "15,990+"처럼 순수 숫자/기호
 # 파편(가격·단가 잔여물, 배경에 겹친 다른 태그의 조각)이 섞여 나오는 경우가
@@ -410,7 +439,14 @@ def _parse_fields_from_lines(lines: list) -> dict:
     for i, line in enumerate(lines):
         if code_idx is not None and i <= code_idx:
             continue
-        if WEIGHT_PATTERN.search(line):
+        m = WEIGHT_PATTERN.search(line)
+        # 중량 앞에 다른 내용이 없어야("이 줄 자체가 중량 표기") 독립된 중량
+        # 줄로 인정한다. "오리온 오그래놀라 시나몬츄러스 440g* 3개"처럼 제품명과
+        # 한 줄에 붙어 나오면, 줄 전체를 중량으로 삼켜버리면 안 되므로 여기서는
+        # 건너뛰고 나중에 _split_trailing_weight()가 제품명 끝에서 따로 떼어낸다.
+        # "100g당 1,211원"처럼 단위당가격 표기도 "100g"으로 시작해서 이 조건에
+        # 걸리므로, UNIT_PRICE_PATTERN에 매칭되는 줄은 애초에 중량 후보에서 뺀다.
+        if m and not line[:m.start()].strip() and not UNIT_PRICE_PATTERN.search(line):
             result["중량"] = line
             weight_idx = i
             break
@@ -459,19 +495,20 @@ def _parse_fields_from_lines(lines: list) -> dict:
             result["제품명(영어)"] = line
             break
 
-    if code_idx is not None:
-        # 한글 제품명은 상품코드 다음 줄부터, 중량/영문명/단가/가격 중 가장 먼저
-        # 나오는 줄 전까지로 본다 (넷 다 없으면 끝까지). 식품은 보통 중량이 경계가 되고,
-        # 비식품은 중량이 없으니 영문명이 바로 경계가 된다.
-        # 이 구간에는 "RICOLA"처럼 한글이 아닌 브랜드명 줄이 섞여 있을 수 있는데,
-        # 실제로는 한글 제품명의 일부이므로("RICOLA 레몬민트 허브캔디") 한글 포함
-        # 여부로 거르지 않고 구간 안의 모든 줄을 그대로 합친다.
-        boundary_candidates = [
-            i for i in (weight_idx, english_idx, danga_idx, price_boundary_idx) if i is not None
-        ]
-        end = min(boundary_candidates) if boundary_candidates else len(lines)
-        korean_lines = lines[code_idx + 1:end]
-        result["제품명(한국어)"] = " ".join(korean_lines).strip()
+    # 한글 제품명은 상품코드 다음 줄부터(코드를 아예 못 찾았으면 맨 처음부터 -
+    # 예: 바코드 구역이 프레임에 없는 화면 캡처), 중량/영문명/단가/가격 중 가장
+    # 먼저 나오는 줄 전까지로 본다 (넷 다 없으면 끝까지). 식품은 보통 중량이
+    # 경계가 되고, 비식품은 중량이 없으니 영문명이 바로 경계가 된다.
+    # 이 구간에는 "RICOLA"처럼 한글이 아닌 브랜드명 줄이 섞여 있을 수 있는데,
+    # 실제로는 한글 제품명의 일부이므로("RICOLA 레몬민트 허브캔디") 한글 포함
+    # 여부로 거르지 않고 구간 안의 모든 줄을 그대로 합친다.
+    boundary_candidates = [
+        i for i in (weight_idx, english_idx, danga_idx, price_boundary_idx) if i is not None
+    ]
+    start = code_idx + 1 if code_idx is not None else 0
+    end = min(boundary_candidates) if boundary_candidates else len(lines)
+    korean_lines = lines[start:end]
+    result["제품명(한국어)"] = " ".join(korean_lines).strip()
 
     # "단가 / 10G"처럼 기준 단위가 함께 찍혀있으므로, 가격만 뽑으면 몇 g당 가격인지
     # 알 수 없다. "217원" 대신 "217원/10g" 형태로 단위까지 같이 기록한다
@@ -489,6 +526,13 @@ def _parse_fields_from_lines(lines: list) -> dict:
                 break
         if danga_price:
             result["단가"] = f"{danga_price}/{unit}" if unit else danga_price
+    if not result["단가"]:
+        # "단가"라는 글자 자체가 없어도 "100g당 1,211원"처럼 단위당 가격이
+        # 그대로 찍혀있는 경우가 있다.
+        unit_price_match = UNIT_PRICE_PATTERN.search("\n".join(lines))
+        if unit_price_match:
+            unit = unit_price_match.group(1).replace(" ", "")
+            result["단가"] = f"{unit_price_match.group(2)}원/{unit}"
 
     # 가격은 "12,990원"처럼 천단위 콤마가 있는 큰 금액이다. Azure OCR이 "원" 글자를
     # 가끔 다른 문자(예: "z")로 잘못 읽는 경우가 있어("7,990z"), "원" 글자 자체보다
@@ -526,6 +570,14 @@ def _parse_fields_from_lines(lines: list) -> dict:
         if remaining_prices:
             result["가격"] = max(remaining_prices, key=lambda p: int(re.sub(r"[^\d]", "", p) or "0"))
 
+    # 중량이 독립된 줄로 안 나오고 제품명 끝에 붙어 나온 경우("...440g* 3개")를
+    # 대비한 마지막 보정. 이미 독립된 줄에서 중량을 찾은 경우는 건드리지 않는다.
+    if not result["중량"] and result["제품명(한국어)"]:
+        cleaned_name, trailing_weight = _split_trailing_weight(result["제품명(한국어)"])
+        if trailing_weight:
+            result["제품명(한국어)"] = cleaned_name
+            result["중량"] = trailing_weight
+
     return result
 
 
@@ -541,6 +593,9 @@ def detect_retailer(text: str) -> str:
     끼어들면 "맨 첫 줄"만으로는 오판별하므로(잡음 줄이 코드가 아니니 트레이더스로
     잘못 판정됨), parse_price_fields()의 코드 탐색과 마찬가지로 텍스트 전체에서
     가장 먼저 나오는 "단독 숫자 줄"을 기준으로 삼는다 - 그 줄의 자릿수로 판별.
+    화면 캡처처럼 코드/바코드 구역 자체가 원문에 없어서 어느 쪽도 못 찾으면
+    코스트코로 기본 처리한다 - 코스트코 파서가 훨씬 많이 검증되어 있어서,
+    형식이 불확실할 때 더 안전한 쪽이다.
     """
     lines = [l.strip() for l in text.split("\n") if l.strip()]
     for line in lines:
@@ -548,12 +603,9 @@ def detect_retailer(text: str) -> str:
             return "costco"
         if re.fullmatch(r"\d{9,14}", line):
             return "traders"
-    return "traders"
+    return "costco"
 
 
-TRADERS_DANGA_PATTERN = re.compile(
-    r"(\d+(?:\.\d+)?\s*(?:g|ml|kg|l|m))\s*당\s*([\d,]+)\s*원", re.IGNORECASE
-)
 TRADERS_CODE_PATTERN = re.compile(r"\d{8,14}")
 
 
@@ -581,7 +633,7 @@ def parse_traders_fields(text: str) -> dict:
         result["제품명(영어)"] = lines[idx]
         idx += 1
 
-    danga_match = TRADERS_DANGA_PATTERN.search(text)
+    danga_match = UNIT_PRICE_PATTERN.search(text)
     if danga_match:
         unit = danga_match.group(1).replace(" ", "")
         result["단가"] = f"{danga_match.group(2)}원/{unit}"
@@ -606,6 +658,14 @@ def parse_traders_fields(text: str) -> dict:
         if all_prices:
             result["가격"] = max(all_prices, key=lambda p: int(re.sub(r"[^\d]", "", p) or "0"))
 
+    # 트레이더스 파서는 중량을 따로 찾는 로직이 없다 - 제품명 끝에 붙어 나온
+    # 경우("...1.5kg")만이라도 분리해서 채운다.
+    if not result["중량"] and result["제품명(한국어)"]:
+        cleaned_name, trailing_weight = _split_trailing_weight(result["제품명(한국어)"])
+        if trailing_weight:
+            result["제품명(한국어)"] = cleaned_name
+            result["중량"] = trailing_weight
+
     return result
 
 
@@ -624,8 +684,8 @@ UNCATEGORIZED_LABEL = "미분류"
 # 제품군 블록 하나는 "제목 행" + 아래 14개 항목 행으로 구성된다. 상품은 이
 # 항목들을 세로로 채운 열 하나로 표현되고(카드형), 같은 제품군의 상품들이
 # 옆으로(B, C, D...) 나란히 쌓인다. OCR 상품카드에는 이 중 상품명/규격·단량/
-# 판매가/상품코드/파일ID/원문텍스트만 있으므로 CATEGORY_FIELD_MAP에 있는
-# 행만 채우고 나머지(사진/소싱형태/매출(연)/단위단가/매출율/산도/원산지/
+# 판매가/단위단가/상품코드/파일ID/원문텍스트만 있으므로 CATEGORY_FIELD_MAP에
+# 있는 행만 채우고 나머지(사진/소싱형태/매출(연)/매출율/산도/원산지/
 # 셀링포인트)는 빈 칸으로 남긴다 - 수기로 채우거나 다른 소스에서 나중에
 # 채워 넣을 몫이다.
 CATEGORY_ROW_LABELS = [
@@ -637,6 +697,7 @@ CATEGORY_FIELD_MAP = {
     "상품명": "제품명(한국어)",
     "규격/단량": "중량",
     "판매가": "가격",
+    "단위단가": "단가",
     "상품코드": "상품코드",
     "파일ID": "파일ID",
     "원문텍스트": "원문텍스트",
@@ -837,7 +898,7 @@ def process_one_file(creds, sheets, file_info, archive_folder_id):
     except Exception as e:
         print(f"  경고: '{name}' 보관 폴더 이동 실패 (시트 기록은 완료됨): {e}")
 
-    return name, fields.get("제품명(한국어)") or "", low_confidence, row_dict
+    return name, fields.get("제품명(한국어)") or "", low_confidence, row_dict, retailer
 
 
 # ---------------- 메인 실행 ----------------
@@ -866,8 +927,12 @@ def run_once():
     for sheet in sheets.values():
         ensure_header(sheet)
     # 제품군정리는 코스트코/트레이더스 원본과 완전히 다른(블록형) 구조라
-    # COLUMN_ORDER 기반 ensure_header 대상이 아니다.
-    category_sheet = open_or_create_sheet(CATEGORY_SHEET_NAME)
+    # COLUMN_ORDER 기반 ensure_header 대상이 아니다. 원본 시트와 마찬가지로
+    # 리테일러별로 따로 둔다.
+    category_sheets = {
+        "costco": open_or_create_sheet(CATEGORY_SHEET_NAME_COSTCO),
+        "traders": open_or_create_sheet(CATEGORY_SHEET_NAME_TRADERS),
+    }
 
     # 코스트코/트레이더스 어느 시트에 기록됐든 이미 처리한 파일이니, 두 시트의
     # 파일ID를 합쳐서 "처리 완료" 목록으로 삼는다 - 안 그러면 한 시트에만 있는
@@ -888,7 +953,7 @@ def run_once():
 
     success_count = 0
     failed = []
-    processed_row_dicts = []
+    processed_row_dicts = {"costco": [], "traders": []}
 
     with ThreadPoolExecutor(max_workers=CONCURRENT_WORKERS) as executor:
         futures = {
@@ -898,9 +963,9 @@ def run_once():
         for future in as_completed(futures):
             f = futures[future]
             try:
-                name, product, flag, row_dict = future.result()
+                name, product, flag, row_dict, retailer = future.result()
                 success_count += 1
-                processed_row_dicts.append(row_dict)
+                processed_row_dicts[retailer].append(row_dict)
                 flag_str = " [검토필요]" if flag else ""
                 print(f"  완료: {name} -> {product or '(제품명 인식 실패)'}{flag_str}")
             except Exception as e:
@@ -909,10 +974,11 @@ def run_once():
 
     # 제품군 블록에 열 번호를 매기는 작업은 동시에 하면 충돌하므로, 병렬
     # 처리가 다 끝난 뒤 단일 스레드로 한 번에 처리한다.
-    try:
-        update_category_sheet(category_sheet, processed_row_dicts)
-    except Exception as e:
-        print(f"경고: 제품군정리 시트 갱신 실패 (코스트코/트레이더스 원본 시트 기록은 정상 완료됨): {e}")
+    for retailer, row_dicts in processed_row_dicts.items():
+        try:
+            update_category_sheet(category_sheets[retailer], row_dicts)
+        except Exception as e:
+            print(f"경고: {retailer} 제품군정리 시트 갱신 실패 (원본 시트 기록은 정상 완료됨): {e}")
 
     print(f"\n완료: {success_count}건 성공, {len(failed)}건 실패")
     if failed:
