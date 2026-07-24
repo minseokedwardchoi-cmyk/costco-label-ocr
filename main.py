@@ -71,6 +71,13 @@ TRADERS_SHEET_NAME = os.environ.get("TRADERS_SHEET_NAME", "트레이더스")
 CATEGORY_SHEET_NAME_COSTCO = os.environ.get("CATEGORY_SHEET_NAME_COSTCO", "제품군정리(코스트코)")
 CATEGORY_SHEET_NAME_TRADERS = os.environ.get("CATEGORY_SHEET_NAME_TRADERS", "제품군정리(트레이더스)")
 
+# 자사 상품 카탈로그(MCH1/MC/상품명) 기반 제품군 분류용. 거래처/공급사 이름까지
+# 들어있는 사외비 데이터라 이 공개 저장소에는 절대 커밋하지 않고, 서비스
+# 계정에 뷰어로 공유해둔 별도의 비공개 구글 시트에서 실행 시점에 읽어온다.
+# 값이 없으면 카탈로그 매칭 없이 CATEGORY_KEYWORDS 수동 목록만으로 분류한다.
+MC_CATALOG_SPREADSHEET_ID = os.environ.get("MC_CATALOG_SPREADSHEET_ID")
+MC_CATALOG_SHEET_NAME = os.environ.get("MC_CATALOG_SHEET_NAME", "시트5")
+
 AZURE_VISION_ENDPOINT = os.environ.get("AZURE_VISION_ENDPOINT")
 AZURE_VISION_KEY = os.environ.get("AZURE_VISION_KEY")
 
@@ -794,14 +801,21 @@ def parse_traders_fields(text: str) -> dict:
 
 
 # ---------------- 제품군정리 시트 ----------------
-# 제품명(한국어)에 이 키(왼쪽)가 들어있으면 매핑된 제품군(오른쪽)으로 분류한다.
-# 대부분은 키와 제품군 이름이 똑같지만("올리브유"->"올리브유"), "하리보
-# 골드베렌"처럼 제품명에 제품군을 나타내는 글자가 아예 없는 경우를 위해 브랜드/
-# 제품 종류 이름 -> 실제 제품군으로 매핑해두기도 한다("골드베렌"->"구미젤리").
-# 아직 마주치지 못한 제품군은 자동으로 UNCATEGORIZED_LABEL로 들어가서 데이터가
-# 유실되진 않지만, 실제로 찍히는 상품 종류를 봐가며 이 목록을 계속 채워나가야
-# 분류율이 올라간다. 길이가 긴 키부터 먼저 시도해야 "유기농 엑스트라버진
-# 올리브유"가 "올리브유"보다 먼저 매칭되어 더 구체적인 이름으로 분류된다.
+# 제품군 분류는 두 단계다: 1순위는 아래 match_category_from_catalog() - 자사
+# 카탈로그(MC_CATALOG_SPREADSHEET_ID)에 실제로 있는 상품과 겹치는지 확인하는,
+# 훨씬 정확하고 유지보수가 필요 없는 방식. 카탈로그에 없거나 카탈로그 설정
+# 자체가 안 돼있을 때만 2순위로 아래 CATEGORY_KEYWORDS(수동 목록)를 쓴다.
+# CATEGORY_KEYWORDS: 제품명(한국어)에 이 키(왼쪽)가 들어있으면 매핑된
+# 제품군(오른쪽)으로 분류한다. 대부분은 키와 제품군 이름이 똑같지만
+# ("올리브유"->"올리브유"), "하리보 골드베렌"처럼 제품명에 제품군을 나타내는
+# 글자가 아예 없는 경우를 위해 브랜드/제품 종류 이름 -> 실제 제품군으로
+# 매핑해두기도 한다("골드베렌"->"구미젤리") - 다만 이런 브랜드 항목들은
+# 대부분 카탈로그에 이미 있어서(예: 하리보 실제로 "젤리,푸딩"으로 카탈로그가
+# 잡아줌) 카탈로그가 설정돼있으면 거의 안 쓰일 것이다. 아직 마주치지 못한
+# 제품군은 자동으로 UNCATEGORIZED_LABEL로 들어가서 데이터가 유실되진 않지만,
+# 실제로 찍히는 상품 종류를 봐가며 이 목록을 계속 채워나가야 분류율이
+# 올라간다. 길이가 긴 키부터 먼저 시도해야 "유기농 엑스트라버진 올리브유"가
+# "올리브유"보다 먼저 매칭되어 더 구체적인 이름으로 분류된다.
 CATEGORY_KEYWORDS = {
     "선크림": "선크림", "폴로티": "폴로티", "스트레치바지": "스트레치바지",
     "반팔티": "반팔티", "콜라겐": "콜라겐", "비타민": "비타민",
@@ -843,7 +857,103 @@ CATEGORY_FIELD_MAP = {
 }
 
 
+# ---- 자사 카탈로그(MC) 기반 제품군 매칭 ----
+# 카탈로그 상품명과 OCR 상품명은 표기가 다 다르므로(예: 카탈로그의
+# "OO브랜드 아보카도 오일 1L"과 OCR의 "피에트로코리첼리 아보카도오일 1L(퓨어)")
+# 완전일치가 아니라 부분 문자열 겹침으로 찾는다. 단순히 "글자가 좀 겹친다"만으로
+# 매칭하면 "아보카도오일"과 "냉동 아보카도(원물)"처럼 전혀 다른 상품이
+# "아보카도"라는 흔한 단어 하나로 잘못 엮일 수 있다. 그래서:
+#   1. 가장 긴 겹치는 부분 문자열부터 확인한다(길수록 구체적이라 더 믿을 만함).
+#   2. 그 부분 문자열을 포함하는 카탈로그 항목들의 제품군(MC)이 한쪽으로
+#      확실히 쏠려 있을 때만(과반 이상, 최소 2건 이상 근거) 그 제품군을 쓴다.
+#      여러 제품군에 흩어져 있으면(비특이적인 단어라는 뜻) 억지로 맞추지 않고
+#      포기한다 - 틀리게 분류되는 것보다 미분류로 남는 게 낫다.
+_CATEGORY_INDEX_MIN_LEN = 4
+_CATEGORY_INDEX_MAX_LEN = 12
+_CATEGORY_MATCH_MIN_SUPPORT = 2  # 근거로 삼는 카탈로그 항목이 최소 이만큼은 있어야 함
+_CATEGORY_MATCH_MIN_CONFIDENCE = 0.6  # 그 중 최다 제품군의 비중이 이 이상이어야 함
+
+_category_index = None  # build_category_index()로 한 번 만들어서 재사용한다
+
+
+def _compact(s: str) -> str:
+    return re.sub(r"\s+", "", s or "")
+
+
+def build_category_index(catalog_rows) -> dict:
+    """catalog_rows: (제품군(MC), 상품명) 튜플의 목록. {길이: {부분문자열: {제품군: 등장횟수}}}
+    형태로 색인해서, match_category_from_catalog()가 빠르게 조회할 수 있게 한다."""
+    index = {length: {} for length in range(_CATEGORY_INDEX_MIN_LEN, _CATEGORY_INDEX_MAX_LEN + 1)}
+    for mc, name in catalog_rows:
+        if not mc or not name:
+            continue
+        compact = _compact(name)
+        for length in range(_CATEGORY_INDEX_MIN_LEN, min(_CATEGORY_INDEX_MAX_LEN, len(compact)) + 1):
+            bucket_by_len = index[length]
+            for i in range(len(compact) - length + 1):
+                sub = compact[i:i + length]
+                bucket = bucket_by_len.setdefault(sub, {})
+                bucket[mc] = bucket.get(mc, 0) + 1
+    return index
+
+
+def match_category_from_catalog(product_name: str, index) -> str:
+    if not index:
+        return ""
+    compact = _compact(product_name)
+    for length in range(min(_CATEGORY_INDEX_MAX_LEN, len(compact)), _CATEGORY_INDEX_MIN_LEN - 1, -1):
+        bucket = index.get(length)
+        if not bucket:
+            continue
+        votes = {}
+        for i in range(len(compact) - length + 1):
+            hit = bucket.get(compact[i:i + length])
+            if not hit:
+                continue
+            for mc, count in hit.items():
+                votes[mc] = votes.get(mc, 0) + count
+        if not votes:
+            continue
+        total = sum(votes.values())
+        if total < _CATEGORY_MATCH_MIN_SUPPORT:
+            continue
+        top_mc, top_count = max(votes.items(), key=lambda kv: kv[1])
+        if top_count / total >= _CATEGORY_MATCH_MIN_CONFIDENCE:
+            return top_mc
+    return ""
+
+
+def load_category_index(creds):
+    """MC_CATALOG_SPREADSHEET_ID가 설정돼있으면 그 비공개 시트를 읽어서
+    카탈로그 매칭 색인을 만든다. 설정 안 돼있으면(또는 읽기 실패하면) 조용히
+    건너뛰고 CATEGORY_KEYWORDS 수동 목록만으로 분류한다 - 이 색인은 어디까지나
+    분류 정확도를 높이는 보조 수단이라, 없어도 파이프라인 자체는 정상 동작해야
+    한다."""
+    global _category_index
+    if not MC_CATALOG_SPREADSHEET_ID:
+        print("MC_CATALOG_SPREADSHEET_ID 미설정 - 자사 카탈로그 매칭 없이 CATEGORY_KEYWORDS만 사용합니다.")
+        return
+    try:
+        gc = gspread.authorize(creds)
+        sheet = gc.open_by_key(MC_CATALOG_SPREADSHEET_ID).worksheet(MC_CATALOG_SHEET_NAME)
+        values = sheet.get_all_values()
+    except Exception as e:
+        print(f"경고: 자사 카탈로그 시트를 읽지 못해 카탈로그 매칭 없이 진행합니다: {e}")
+        return
+    # 헤더(MCH1, MC, 상품명) 제외, MC/상품명 둘 다 있는 행만 사용한다.
+    rows = [
+        (row[1].strip(), row[2].strip())
+        for row in values[1:]
+        if len(row) >= 3 and row[1] and row[2]
+    ]
+    _category_index = build_category_index(rows)
+    print(f"자사 카탈로그 {len(rows)}건으로 제품군 분류 색인을 만들었습니다.")
+
+
 def detect_category(product_name: str) -> str:
+    catalog_match = match_category_from_catalog(product_name, _category_index)
+    if catalog_match:
+        return catalog_match
     for kw in sorted(CATEGORY_KEYWORDS, key=len, reverse=True):
         if kw in product_name:
             return CATEGORY_KEYWORDS[kw]
@@ -1047,6 +1157,7 @@ def run_once():
     require_config()
 
     creds = get_credentials()
+    load_category_index(creds)
     drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
     gc = gspread.authorize(creds)
     spreadsheet = gc.open_by_key(SPREADSHEET_ID)
