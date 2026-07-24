@@ -297,6 +297,43 @@ def ocr_image_azure(image_bytes, max_retries=4):
     raise RuntimeError("Azure OCR 재시도 횟수 초과")
 
 
+# 순수 가격/할인액 숫자 줄("23,980", "-2,000", "21,980원")만 매칭한다 - 이런 줄은
+# 위치와 무관하게 파싱 로직이 카드 전체에서 찾아내므로, 뒤로 밀려도 지장이 없다.
+# "100ml당 2398원"처럼 글자가 섞인 줄은 매칭 안 되므로 건드리지 않는다.
+_PRICE_TOKEN_RE = re.compile(r"^-?[\d,]+\s*원?$")
+
+
+def _defer_offcolumn_price_tokens(positioned):
+    """
+    셀링포인트 문구(왼쪽)와 가격 스택(오른쪽)이 나란히 배치된 2단 카드에서는,
+    오른쪽 가격 숫자 하나의 Y좌표가 왼쪽 문구의 줄바꿈된 두 줄 사이 높이에 걸려서
+    Y좌표만으로 정렬하면 그 문구가 둘로 쪼개진다("...소스," 다음에 "41,980"이
+    끼어들고 그 다음에야 "드레싱에 적합"이 나오는 식). 순수 숫자 줄이면서 Y좌표상
+    바로 앞/뒤 줄보다 확연히 오른쪽(그 줄의 오른쪽 끝보다 더 오른쪽)에서
+    시작하면 - 즉 같은 줄이 아니라 다른 컬럼에 있다는 뜻 - 그 줄을 원래 자리에서
+    빼서 뒤로 미룬다. 앞/뒤 줄도 숫자 줄이면(가격이 여러 줄로 쌓여 나오는 정상
+    레이아웃) 건드리지 않는다 - 그런 경우는 애초에 문장을 쪼개고 있는 게 아니다.
+    """
+    def is_price_token(e):
+        return bool(_PRICE_TOKEN_RE.match(e["text"].strip()))
+
+    main, deferred = [], []
+    for i, e in enumerate(positioned):
+        if not is_price_token(e):
+            main.append(e)
+            continue
+        neighbors = [
+            n for n in (positioned[i - 1] if i > 0 else None,
+                        positioned[i + 1] if i + 1 < len(positioned) else None)
+            if n is not None and not is_price_token(n)
+        ]
+        if neighbors and all(e["left_x"] > n["right_x"] for n in neighbors):
+            deferred.append(e)
+        else:
+            main.append(e)
+    return main, deferred
+
+
 def _extract_text_and_confidence(result):
     """
     Azure가 반환하는 줄 순서는 항상 사진의 실제 위→아래 순서와 일치하지는
@@ -305,22 +342,28 @@ def _extract_text_and_confidence(result):
     줄" 식으로 순서에 의존하므로, 각 줄의 bounding box 중 가장 작은 y좌표(윗쪽
     끝)를 기준으로 재정렬해서 실제 시각적 순서에 가깝게 맞춘다.
     """
-    entries = []  # (top_y 또는 None, text)
+    entries = []
     confidences = []
     for page in result.get("analyzeResult", {}).get("readResults", []):
         for line in page.get("lines", []):
             text_val = line.get("text", "")
             bbox = line.get("boundingBox") or []
-            top_y = min(bbox[1::2]) if len(bbox) >= 8 else None
-            entries.append((top_y, text_val))
+            if len(bbox) >= 8:
+                xs, ys = bbox[0::2], bbox[1::2]
+                entries.append({
+                    "top_y": min(ys), "left_x": min(xs), "right_x": max(xs), "text": text_val,
+                })
+            else:
+                entries.append({"top_y": None, "text": text_val})
             for word in line.get("words", []):
                 conf = word.get("confidence")
                 if conf is not None:
                     confidences.append(conf)
 
-    positioned = sorted((e for e in entries if e[0] is not None), key=lambda e: e[0])
-    unpositioned = [e for e in entries if e[0] is None]
-    full_text = "\n".join(text_val for _, text_val in positioned + unpositioned)
+    positioned = sorted((e for e in entries if e["top_y"] is not None), key=lambda e: e["top_y"])
+    unpositioned = [e for e in entries if e["top_y"] is None]
+    main_lines, deferred_lines = _defer_offcolumn_price_tokens(positioned)
+    full_text = "\n".join(e["text"] for e in main_lines + deferred_lines + unpositioned)
     return full_text, confidences
 
 
