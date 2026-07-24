@@ -361,12 +361,18 @@ def _defer_offcolumn_price_tokens(positioned):
 # 다만 오탐(false split)을 특히 조심해야 한다: 카드 안에 작은 색깔 강조
 # 라벨(예: 빨간 "할인" 표시)이 있어도 그 앞뒤 줄과의 세로 간격 자체는 카드
 # 안의 다른 줄 간격과 비슷하다(같은 카드 안에 촘촘히 배치되어 있으므로). 그래서
-# "색만 다르다"는 절대 단독으로 분리 근거로 안 쓰고, 간격이 정상 줄간격보다
-# 조금이라도 더 벌어져 있을 때만(약한 기준) 색 차이를 보조 근거로 쓴다. 간격이
-# 아주 크게 벌어지면(강한 기준) 색과 무관하게 그 자체로 분리한다.
-_CLUSTER_GAP_RATIO_STRONG = 2.5  # 이 배수 이상 벌어지면 색과 무관하게 분리
-_CLUSTER_GAP_RATIO_WEAK = 1.2    # 이 배수 이상 벌어지면서 색도 다르면 분리
-_CLUSTER_COLOR_DISTANCE = 60     # RGB 유클리드 거리 기준
+# "색만 다르다"는 절대 단독으로 분리 근거로 안 쓴다.
+#
+# 반대 방향의 오탐도 실사진에서 확인됐다: 안토넬라/홀그레인처럼, 같은 가격표
+# 안에서도 본문(제품명/셀링문구)과 아래쪽 바코드+가격 구역 사이에 디자인상
+# 여백이 큰 카드가 많다 - 이 여백이 카드 밖 다른 물체와의 간격만큼 커질 수
+# 있어서, "간격이 아주 크면 색과 무관하게 분리한다"는 예전 규칙이 같은 카드를
+# 둘로 쪼개버렸다. 그 뒤 가격이 있는 덩어리를 우선하는 로직과 맞물려 본문
+# 전체(제품명 등)가 통째로 버려지는 심각한 회귀로 이어졌다. 그래서 간격은
+# 색이 실제로 다를 때만 분리 근거로 쓴다 - 색이 같으면(같은 흰 바탕 가격표
+# 안이라는 뜻) 간격이 아무리 커도 절대 분리하지 않는다.
+_CLUSTER_GAP_RATIO = 1.2      # 이 배수 이상 벌어지면서 색도 다르면 분리
+_CLUSTER_COLOR_DISTANCE = 60  # RGB 유클리드 거리 기준
 
 
 def _orient_image_to_match(image, expected_width, expected_height):
@@ -423,12 +429,11 @@ def _cluster_lines_by_layout(positioned):
         gap = cur["top_y"] - prev["bottom_y"]
         gap_ratio = gap / avg_height
 
-        strong_break = gap_ratio >= _CLUSTER_GAP_RATIO_STRONG
-        weak_break = False
-        if gap_ratio >= _CLUSTER_GAP_RATIO_WEAK and prev.get("color") and cur.get("color"):
-            weak_break = _color_distance(prev["color"], cur["color"]) >= _CLUSTER_COLOR_DISTANCE
+        should_break = False
+        if gap_ratio >= _CLUSTER_GAP_RATIO and prev.get("color") and cur.get("color"):
+            should_break = _color_distance(prev["color"], cur["color"]) >= _CLUSTER_COLOR_DISTANCE
 
-        if strong_break or weak_break:
+        if should_break:
             clusters.append([cur])
         else:
             clusters[-1].append(cur)
