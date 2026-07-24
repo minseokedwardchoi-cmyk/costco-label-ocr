@@ -183,6 +183,7 @@ def list_all_images(drive_service, folder_id):
         "or mimeType = 'image/heic' or mimeType = 'image/heif') and trashed = false"
     )
     files = []
+    seen_ids = set()
     page_token = None
     while True:
         results = drive_service.files().list(
@@ -191,7 +192,14 @@ def list_all_images(drive_service, folder_id):
             pageSize=1000,
             pageToken=page_token,
         ).execute()
-        files.extend(results.get("files", []))
+        # Drive API 페이지네이션 도중 폴더 내용이 바뀌면(사진이 계속 업로드되는
+        # 도중에 조회하는 경우 등) 같은 파일이 서로 다른 페이지에 중복으로
+        # 걸려나오는 경우가 실제로 있다 - 같은 파일ID가 시트에 두 번 기록되는
+        # 문제로 이어지므로 여기서 미리 걸러낸다.
+        for f in results.get("files", []):
+            if f["id"] not in seen_ids:
+                seen_ids.add(f["id"])
+                files.append(f)
         page_token = results.get("nextPageToken")
         if not page_token:
             break
@@ -916,7 +924,13 @@ def _parse_fields_from_lines(lines: list) -> dict:
     start = code_idx + 1 if code_idx is not None else 0
     end = min(boundary_candidates) if boundary_candidates else len(lines)
     korean_lines = lines[start:end]
-    result["제품명(한국어)"] = " ".join(korean_lines).strip()
+    joined_name = " ".join(korean_lines).strip()
+    # 실사진에서 Azure가 카드의 제품명 구역을 통째로 못 읽고 "Global
+    # Product"/가격/바코드 같은 아래쪽 정형 문구만 반환하는 경우가 확인됐다.
+    # 이 구간에 한글이 하나도 없으면 진짜 제품명을 못 읽은 것이므로, 엉뚱한
+    # 정형 문구를 제품명으로 채택하지 않고 빈 채로 남긴다.
+    if re.search(r"[가-힣]", joined_name):
+        result["제품명(한국어)"] = joined_name
 
     # "단가 / 10G"처럼 기준 단위가 함께 찍혀있으므로, 가격만 뽑으면 몇 g당 가격인지
     # 알 수 없다. "217원" 대신 "217원/10g" 형태로 단위까지 같이 기록한다
@@ -1024,11 +1038,17 @@ def parse_traders_fields(text: str) -> dict:
     # 텍스트가 실제 상품카드보다 먼저 인식되는 경우가 있다. 진짜 제품명 줄은
     # 브랜드가 영어로 앞에 붙어도("RICOLA 레몬민트 허브캔디") 항상 한글이 같이
     # 있으므로, 한글이 하나도 없는 순수 영어 줄(로고류)은 건너뛰고 한글이
-    # 포함된 첫 줄을 제품명으로 삼는다.
-    korean_name_idx = next((i for i, l in enumerate(lines) if re.search(r"[가-힣]", l)), 0)
-    result["제품명(한국어)"] = lines[korean_name_idx]
+    # 포함된 첫 줄을 제품명으로 삼는다. 실사진에서 Azure가 카드 위쪽(제품명
+    # 구역)을 통째로 못 읽고 "Global Product"/가격/바코드 같은 아래쪽 정형
+    # 문구만 반환하는 경우가 확인됐다 - 이럴 땐 한글 줄이 단 하나도 없으므로,
+    # 예전처럼 0번째 줄을 억지로 제품명으로 쓰면 "Global Product"나 "11,400"
+    # 같은 걸 제품명으로 잘못 채택하게 된다. 한글 줄이 하나도 없으면 제품명은
+    # 그냥 빈 채로 남긴다(실제로 못 읽은 것이므로).
+    korean_name_idx = next((i for i, l in enumerate(lines) if re.search(r"[가-힣]", l)), None)
+    if korean_name_idx is not None:
+        result["제품명(한국어)"] = lines[korean_name_idx]
 
-    idx = korean_name_idx + 1
+    idx = (korean_name_idx + 1) if korean_name_idx is not None else 0
     if (
         idx < len(lines)
         and re.fullmatch(r"[A-Z0-9 .,'&×\-]{4,}", lines[idx])
@@ -1447,11 +1467,11 @@ def process_one_file(creds, sheets, file_info, archive_folder_id, retailer, sour
         sheet = sheets["costco"]
 
     # needs_review()는 "인식된 단어들의 신뢰도"만 본다 - Azure가 가격표의
-    # 일부(가격/바코드 등) 영역을 아예 통째로 못 읽고 건너뛴 경우엔, 인식된
-    # 나머지 단어들(제품명, 셀링문구 등)의 신뢰도 자체는 높을 수 있어서 이
-    # 경우를 못 잡아낸다. 가격은 상품카드에 항상 있어야 하는 값이므로, 값이
-    # 비어있으면 그 자체로 검토가 필요하다는 뜻이다.
-    if not fields.get("가격"):
+    # 일부(제품명/가격/바코드 등) 영역을 아예 통째로 못 읽고 건너뛴 경우엔,
+    # 인식된 나머지 단어들의 신뢰도 자체는 높을 수 있어서 이 경우를 못
+    # 잡아낸다. 가격과 제품명(한국어)은 상품카드에 항상 있어야 하는 값이므로,
+    # 둘 중 하나라도 비어있으면 그 자체로 검토가 필요하다는 뜻이다.
+    if not fields.get("가격") or not fields.get("제품명(한국어)"):
         low_confidence = True
 
     row_dict = build_row_dict(file_id, name, fields, text)
