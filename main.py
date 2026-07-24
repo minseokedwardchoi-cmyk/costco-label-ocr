@@ -733,9 +733,16 @@ def parse_traders_fields(text: str) -> dict:
     if not lines:
         return result
 
-    result["제품명(한국어)"] = lines[0]
+    # 맨 첫 줄을 무조건 제품명으로 신뢰하면 안 된다 - "TRADERS"(진열대 로고),
+    # "MONTI"(옆 상품 박스), "E-MART"(매장 로고)처럼 사진 위쪽에 찍힌 배경
+    # 텍스트가 실제 상품카드보다 먼저 인식되는 경우가 있다. 진짜 제품명 줄은
+    # 브랜드가 영어로 앞에 붙어도("RICOLA 레몬민트 허브캔디") 항상 한글이 같이
+    # 있으므로, 한글이 하나도 없는 순수 영어 줄(로고류)은 건너뛰고 한글이
+    # 포함된 첫 줄을 제품명으로 삼는다.
+    korean_name_idx = next((i for i, l in enumerate(lines) if re.search(r"[가-힣]", l)), 0)
+    result["제품명(한국어)"] = lines[korean_name_idx]
 
-    idx = 1
+    idx = korean_name_idx + 1
     if (
         idx < len(lines)
         and re.fullmatch(r"[A-Z0-9 .,'&\-]{4,}", lines[idx])
