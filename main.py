@@ -291,7 +291,7 @@ def ocr_image_azure(image_bytes, max_retries=4):
                 poll.raise_for_status()
                 result = poll.json()
                 if result.get("status") == "succeeded":
-                    return _extract_text_and_confidence(result)
+                    return _extract_text_and_confidence(result, image_bytes)
                 if result.get("status") == "failed":
                     raise RuntimeError("Azure OCR 작업 실패")
             raise RuntimeError("Azure OCR 결과 대기 시간 초과")
@@ -342,7 +342,76 @@ def _defer_offcolumn_price_tokens(positioned):
     return main, deferred
 
 
-def _extract_text_and_confidence(result):
+# ---- 사진 한 장에 여러 물체(다른 상품 박스, 배경의 다른 가격표 등)가 같이
+# 찍혔을 때, 진짜 대상 상품카드가 아닌 것들을 걸러내기 위한 레이아웃 분석 ----
+# 같은 상품카드 안의 줄들은 세로 간격이 좁고 배경색도 일정하다. 다른 물체로
+# 넘어가면 보통 간격이 크게 벌어지거나(다른 진열 위치) 배경색이 확 달라진다
+# (다른 색 포장 박스). 이 두 신호로 줄들을 물리적 덩어리(클러스터)로 나누고,
+# 그 중 가장 큰(=사진에서 가장 크게, 가까이 찍힌 - 즉 실제 촬영 대상일 가능성이
+# 가장 높은) 덩어리만 남긴다.
+#
+# 다만 오탐(false split)을 특히 조심해야 한다: 카드 안에 작은 색깔 강조
+# 라벨(예: 빨간 "할인" 표시)이 있어도 그 앞뒤 줄과의 세로 간격 자체는 카드
+# 안의 다른 줄 간격과 비슷하다(같은 카드 안에 촘촘히 배치되어 있으므로). 그래서
+# "색만 다르다"는 절대 단독으로 분리 근거로 안 쓰고, 간격이 정상 줄간격보다
+# 조금이라도 더 벌어져 있을 때만(약한 기준) 색 차이를 보조 근거로 쓴다. 간격이
+# 아주 크게 벌어지면(강한 기준) 색과 무관하게 그 자체로 분리한다.
+_CLUSTER_GAP_RATIO_STRONG = 2.5  # 이 배수 이상 벌어지면 색과 무관하게 분리
+_CLUSTER_GAP_RATIO_WEAK = 1.2    # 이 배수 이상 벌어지면서 색도 다르면 분리
+_CLUSTER_COLOR_DISTANCE = 60     # RGB 유클리드 거리 기준
+
+
+def _sample_background_color(image, left_x, top_y, right_x, bottom_y):
+    """바운딩박스 영역을 1x1로 축소해서 평균색을 낸다. 글자 획은 가늘어서
+    영역 내 픽셀 비중이 적기 때문에, 평균을 내면 자연스럽게 배경색 쪽으로
+    많이 치우친다. 실패하면(영역이 이미지 밖이거나 크기가 0 등) None을
+    돌려주고, 호출부는 이 줄을 색 판단에서 그냥 제외한다."""
+    try:
+        box = (
+            max(0, int(left_x)), max(0, int(top_y)),
+            min(image.width, int(right_x)), min(image.height, int(bottom_y)),
+        )
+        if box[2] <= box[0] or box[3] <= box[1]:
+            return None
+        crop = image.crop(box)
+        return crop.resize((1, 1)).convert("RGB").getpixel((0, 0))
+    except Exception:
+        return None
+
+
+def _color_distance(c1, c2):
+    return sum((a - b) ** 2 for a, b in zip(c1, c2)) ** 0.5
+
+
+def _cluster_lines_by_layout(positioned):
+    """세로 간격(+ 보조적으로 배경색)을 보고 줄들을 물리적 덩어리로 나눈다."""
+    if not positioned:
+        return []
+    clusters = [[positioned[0]]]
+    for prev, cur in zip(positioned, positioned[1:]):
+        prev_height = max(1, prev["bottom_y"] - prev["top_y"])
+        cur_height = max(1, cur["bottom_y"] - cur["top_y"])
+        avg_height = (prev_height + cur_height) / 2
+        gap = cur["top_y"] - prev["bottom_y"]
+        gap_ratio = gap / avg_height
+
+        strong_break = gap_ratio >= _CLUSTER_GAP_RATIO_STRONG
+        weak_break = False
+        if gap_ratio >= _CLUSTER_GAP_RATIO_WEAK and prev.get("color") and cur.get("color"):
+            weak_break = _color_distance(prev["color"], cur["color"]) >= _CLUSTER_COLOR_DISTANCE
+
+        if strong_break or weak_break:
+            clusters.append([cur])
+        else:
+            clusters[-1].append(cur)
+    return clusters
+
+
+def _cluster_area(cluster):
+    return sum((e["right_x"] - e["left_x"]) * (e["bottom_y"] - e["top_y"]) for e in cluster)
+
+
+def _extract_text_and_confidence(result, image_bytes=None):
     """
     Azure가 반환하는 줄 순서는 항상 사진의 실제 위→아래 순서와 일치하지는
     않는다 (특히 바코드/상품코드 구역, 제품명 구역, 가격 구역처럼 서로 떨어진
@@ -359,7 +428,8 @@ def _extract_text_and_confidence(result):
             if len(bbox) >= 8:
                 xs, ys = bbox[0::2], bbox[1::2]
                 entries.append({
-                    "top_y": min(ys), "left_x": min(xs), "right_x": max(xs), "text": text_val,
+                    "top_y": min(ys), "bottom_y": max(ys),
+                    "left_x": min(xs), "right_x": max(xs), "text": text_val,
                 })
             else:
                 entries.append({"top_y": None, "text": text_val})
@@ -370,6 +440,26 @@ def _extract_text_and_confidence(result):
 
     positioned = sorted((e for e in entries if e["top_y"] is not None), key=lambda e: e["top_y"])
     unpositioned = [e for e in entries if e["top_y"] is None]
+
+    # 사진에 다른 물체(옆/뒤 진열대의 다른 상품, 다른 가격표)가 같이 찍혀서
+    # 그 텍스트까지 섞여 들어오는 걸 막기 위해, 실제 이미지 픽셀에서 배경색을
+    # 뽑아 세로 간격과 함께 레이아웃을 분석한다. 이미지를 못 열거나 실패해도
+    # (다음 실행에서 이미지 형식이 바뀌는 등) 원래 동작으로 안전하게 넘어간다 -
+    # 이 분석은 어디까지나 정확도를 높이는 보조 수단이라, 실패했다고 파이프라인
+    # 전체가 죽으면 안 된다.
+    if image_bytes and positioned:
+        try:
+            image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            for e in positioned:
+                e["color"] = _sample_background_color(
+                    image, e["left_x"], e["top_y"], e["right_x"], e["bottom_y"]
+                )
+            clusters = _cluster_lines_by_layout(positioned)
+            if len(clusters) > 1:
+                positioned = max(clusters, key=_cluster_area)
+        except Exception as e:
+            print(f"  경고: 레이아웃(배경색/간격) 분석 실패, 필터링 없이 진행: {e}")
+
     main_lines, deferred_lines = _defer_offcolumn_price_tokens(positioned)
     full_text = "\n".join(e["text"] for e in main_lines + deferred_lines + unpositioned)
     return full_text, confidences
