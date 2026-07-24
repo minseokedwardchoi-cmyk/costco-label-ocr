@@ -1114,6 +1114,8 @@ def update_category_sheet(sheet, row_dicts: list):
     values = sheet.get_all_values()
     blocks, next_new_row = _scan_category_blocks(values)
     updates = []
+    max_col_used = 1
+    max_row_used = len(values)
 
     for row_dict in row_dicts:
         category = detect_category(row_dict.get("제품명(한국어)") or "")
@@ -1129,15 +1131,27 @@ def update_category_sheet(sheet, row_dicts: list):
                 "range": f"A{title_row + 1}:A{title_row + len(CATEGORY_ROW_LABELS)}",
                 "values": [[label] for label in CATEGORY_ROW_LABELS],
             })
+            max_row_used = max(max_row_used, title_row + len(CATEGORY_ROW_LABELS))
 
         col_letter = _col_letter(block["next_col"])
         for label, source_key in CATEGORY_FIELD_MAP.items():
             value = row_dict.get(source_key) or ""
             row = block["field_rows"][label]
             updates.append({"range": f"{col_letter}{row}", "values": [[value]]})
+        max_col_used = max(max_col_used, block["next_col"])
         block["next_col"] += 1
 
     if updates:
+        # 한 제품군에 상품이 계속 쌓이면(특히 "미분류") 시트 기본 26열을 금방
+        # 넘어설 수 있다. 시트 크기를 안 늘리고 그 열에 쓰려고 하면 Sheets API가
+        # "grid limits를 벗어났다"며 batch_update 전체를 통째로 거부해서, 이번에
+        # 쓰려던 항목뿐 아니라 이미 잘 들어가 있던 다른 항목까지 전부 안 써진
+        # 것처럼 실패해버린다(실제로 코스트코 정리본이 이 문제로 계속 비어
+        # 있었다). 그래서 필요한 만큼 미리 늘려두고 쓴다.
+        if max_col_used > sheet.col_count:
+            sheet.resize(cols=max_col_used + 10)
+        if max_row_used > sheet.row_count:
+            sheet.resize(rows=max_row_used + 20)
         sheet.batch_update(updates, value_input_option="USER_ENTERED")
 
 
