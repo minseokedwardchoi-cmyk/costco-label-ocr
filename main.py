@@ -975,8 +975,12 @@ def _parse_fields_from_lines(lines: list) -> dict:
 
     if not result["가격"]:
         # 콤마 없는 가격도 드물게 있을 수 있으니, "원" 글자가 정상적으로 인식된
-        # 나머지 금액 중에서 값이 제일 큰 것을 찾는 것으로 대비한다.
-        all_prices = [m.group(0) for m in re.finditer(r"[\d,]{2,}\s*원", "\n".join(lines))]
+        # 나머지 금액 중에서 값이 제일 큰 것을 찾는 것으로 대비한다. "100g당
+        # 899원"처럼 "단가" 키워드 없이 단위당가격만 찍힌 경우, 그 안의
+        # "899원" 조각까지 후보로 잡히면 진짜 가격을 못 찾았을 때 이 단가
+        # 조각을 엉뚱하게 채택해버리므로 먼저 지운다.
+        text_without_unit_price = UNIT_PRICE_PATTERN.sub("", "\n".join(lines))
+        all_prices = [m.group(0) for m in re.finditer(r"[\d,]{2,}\s*원", text_without_unit_price)]
         remaining_prices = [p for p in all_prices if p != danga_price]
         if remaining_prices:
             result["가격"] = max(remaining_prices, key=lambda p: int(re.sub(r"[^\d]", "", p) or "0"))
@@ -1064,7 +1068,13 @@ def parse_traders_fields(text: str) -> dict:
     result["가격"] = find_price(lines)
 
     if not result["가격"]:
-        all_prices = [m.group(0) for m in re.finditer(r"[\d,]{2,}\s*원", text)]
+        # "100g당 428원"처럼 단위당가격 표현 안에 있는 "428원"까지 콤마 없는
+        # 가격 후보로 잡히면, 진짜 판매가를 못 찾았을 때 이 단가 조각을
+        # 엉뚱하게 상품 가격으로 잘못 채택해버린다(실사진에서 확인됨 - 가격표
+        # 뒷부분을 Azure가 통째로 못 읽은 카드에서 "100g당 428원"의 428원이
+        # 가격 칸에 들어감). 단위당가격 문구는 먼저 지우고 나서 찾는다.
+        text_without_unit_price = UNIT_PRICE_PATTERN.sub("", text)
+        all_prices = [m.group(0) for m in re.finditer(r"[\d,]{2,}\s*원", text_without_unit_price)]
         if all_prices:
             result["가격"] = max(all_prices, key=lambda p: int(re.sub(r"[^\d]", "", p) or "0"))
 
@@ -1435,6 +1445,15 @@ def process_one_file(creds, sheets, file_info, archive_folder_id, retailer, sour
     else:
         fields = parse_price_fields(text)
         sheet = sheets["costco"]
+
+    # needs_review()는 "인식된 단어들의 신뢰도"만 본다 - Azure가 가격표의
+    # 일부(가격/바코드 등) 영역을 아예 통째로 못 읽고 건너뛴 경우엔, 인식된
+    # 나머지 단어들(제품명, 셀링문구 등)의 신뢰도 자체는 높을 수 있어서 이
+    # 경우를 못 잡아낸다. 가격은 상품카드에 항상 있어야 하는 값이므로, 값이
+    # 비어있으면 그 자체로 검토가 필요하다는 뜻이다.
+    if not fields.get("가격"):
+        low_confidence = True
+
     row_dict = build_row_dict(file_id, name, fields, text)
     append_rows_to_sheet(sheet, [row_dict])
 
