@@ -297,10 +297,11 @@ def ocr_image_azure(image_bytes, max_retries=4):
     raise RuntimeError("Azure OCR 재시도 횟수 초과")
 
 
-# 순수 가격/할인액 숫자 줄("23,980", "-2,000", "21,980원")만 매칭한다 - 이런 줄은
-# 위치와 무관하게 파싱 로직이 카드 전체에서 찾아내므로, 뒤로 밀려도 지장이 없다.
-# "100ml당 2398원"처럼 글자가 섞인 줄은 매칭 안 되므로 건드리지 않는다.
-_PRICE_TOKEN_RE = re.compile(r"^-?[\d,]+\s*원?$")
+# 순수 가격/할인액 숫자 줄("23,980", "-2,000", "- 2,000", "21,980원")만
+# 매칭한다 - 이런 줄은 위치와 무관하게 파싱 로직이 카드 전체에서 찾아내므로,
+# 뒤로 밀려도 지장이 없다. "100ml당 2398원"처럼 글자가 섞인 줄은 매칭 안
+# 되므로 건드리지 않는다.
+_PRICE_TOKEN_RE = re.compile(r"^-?\s?[\d,]+\s*원?$")
 
 
 def _defer_offcolumn_price_tokens(positioned):
@@ -396,7 +397,7 @@ WEIGHT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 PRICE_LINE_PATTERN = re.compile(r"^(\d{1,3}(?:,\d{3})+)\s*\S{0,2}$")
-DISCOUNT_LINE_PATTERN = re.compile(r"^-[\d,]+\s*원?$")
+DISCOUNT_LINE_PATTERN = re.compile(r"^-\s?[\d,]+\s*원?$")
 
 # 중량이 독립된 줄이 아니라 "오리온 오그래놀라 시나몬츄러스 440g* 3개"처럼
 # 제품명 끝에 그대로 붙어 나오는 경우가 많다. 중량 단위 뒤에 "* 3개", "x2개",
@@ -426,6 +427,68 @@ def _split_trailing_weight(name: str) -> tuple:
     if _TRAILING_QUANTITY_RE.match(rest):
         return name[:last.start()].strip(), name[last.start():].strip()
     return name, ""
+
+
+# "신세계포인트", "Global Product", "적립", "행사기간"처럼 셀링포인트 문구가
+# 아니라 코스트코/트레이더스가 라벨 양식 자체에 고정으로 찍는 정형 문구들.
+# 상품마다 달라지는 게 아니라 양쪽 매장이 재사용하는 고정 문구라 목록이
+# 무한정 늘어나진 않는다 - 새로운 정형 문구를 마주치면 여기에 추가한다.
+_SELLING_POINT_EXCLUDE_SUBSTRINGS = (
+    "신세계포인트", "Global Product", "적립", "카드할인", "행사기간",
+    "회원가", "비회원가",
+)
+
+
+def _is_selling_point_noise(line: str) -> bool:
+    """셀링포인트 문장의 이어지는 줄로 착각하면 안 되는, 다른 종류의 줄인지
+    판단한다 (가격/단가/코드/영문제품명/정형 프로모션 문구)."""
+    if PRICE_LINE_PATTERN.match(line) or DISCOUNT_LINE_PATTERN.match(line):
+        return True
+    if UNIT_PRICE_PATTERN.search(line):
+        return True
+    if re.fullmatch(r"\d{4,14}", line):  # 상품코드/바코드
+        return True
+    if re.fullmatch(r"[A-Z0-9 .,'&\-]{4,}", line) and re.search(r"[A-Z]{2,}", line):
+        return True  # 영문 제품명류
+    return any(sub in line for sub in _SELLING_POINT_EXCLUDE_SUBSTRINGS)
+
+
+_BULLET_START_RE = re.compile(r"^[-•·]\s*(.+)$")
+
+
+def extract_selling_points(text: str) -> str:
+    """
+    "- 신선하고 품질이 좋은 ... 압착하여" 다음 줄에 "만든 오일"처럼, 대시로
+    시작하는 셀링포인트 문구가 화면 폭 때문에 줄바꿈되어 여러 줄로 나뉘어
+    나온다. 대시/불릿 문자로 시작하는 줄을 새 항목의 시작으로 보고, 다음
+    대시가 나오기 전까지 이어지는 줄들을 계속 붙인다 - 단, 가격/코드/영문명/
+    정형 프로모션 문구처럼 셀링포인트가 아닌 게 뻔한 줄이 나오면 그 항목은
+    거기서 끝난다. "- 2,000"처럼 할인액도 대시로 시작하므로, 대시 뒤에
+    글자(한글/영문)가 하나도 없으면 애초에 항목 시작으로 인정하지 않는다.
+    실사진으로 계속 검증하며 다듬어야 하는 초기 버전이다.
+    """
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    points = []
+    current = None
+    for line in lines:
+        m = _BULLET_START_RE.match(line)
+        if m and re.search(r"[가-힣A-Za-z]", m.group(1)):
+            if current:
+                points.append(current.strip())
+            current = m.group(1).strip()
+            continue
+        if current is None:
+            continue
+        if _is_selling_point_noise(line):
+            points.append(current.strip())
+            current = None
+            continue
+        current += " " + line
+    if current:
+        points.append(current.strip())
+    if not points:
+        return ""
+    return "- " + points[0] + "".join(f"\n - {p}" for p in points[1:])
 
 
 # 코드 바로 다음에 진짜 제품명이 아니라 "14.970", "15,990+"처럼 순수 숫자/기호
@@ -731,44 +794,59 @@ def parse_traders_fields(text: str) -> dict:
 
 
 # ---------------- 제품군정리 시트 ----------------
-# 제품명(한국어)에 이 키워드 중 하나가 들어있으면 그 제품군으로 분류한다. 아직
-# 마주치지 못한 제품군은 자동으로 UNCATEGORIZED_LABEL로 들어가서 데이터가
+# 제품명(한국어)에 이 키(왼쪽)가 들어있으면 매핑된 제품군(오른쪽)으로 분류한다.
+# 대부분은 키와 제품군 이름이 똑같지만("올리브유"->"올리브유"), "하리보
+# 골드베렌"처럼 제품명에 제품군을 나타내는 글자가 아예 없는 경우를 위해 브랜드/
+# 제품 종류 이름 -> 실제 제품군으로 매핑해두기도 한다("골드베렌"->"구미젤리").
+# 아직 마주치지 못한 제품군은 자동으로 UNCATEGORIZED_LABEL로 들어가서 데이터가
 # 유실되진 않지만, 실제로 찍히는 상품 종류를 봐가며 이 목록을 계속 채워나가야
-# 분류율이 올라간다. 길이가 긴 키워드부터 먼저 시도해야 "유기농 엑스트라버진
+# 분류율이 올라간다. 길이가 긴 키부터 먼저 시도해야 "유기농 엑스트라버진
 # 올리브유"가 "올리브유"보다 먼저 매칭되어 더 구체적인 이름으로 분류된다.
-CATEGORY_KEYWORDS = [
-    "선크림", "폴로티", "스트레치바지", "반팔티", "콜라겐", "비타민",
-    "허브캔디", "방수팩", "선글라스", "팝콘치킨", "레티놀",
-]
+CATEGORY_KEYWORDS = {
+    "선크림": "선크림", "폴로티": "폴로티", "스트레치바지": "스트레치바지",
+    "반팔티": "반팔티", "콜라겐": "콜라겐", "비타민": "비타민",
+    "허브캔디": "허브캔디", "방수팩": "방수팩", "선글라스": "선글라스",
+    "팝콘치킨": "팝콘치킨", "레티놀": "레티놀",
+    "올리브유": "올리브유", "올리브오일": "올리브유",
+    "아보카도오일": "아보카도오일", "아보카도 오일": "아보카도오일",
+    "마요네즈": "마요네즈", "마요네스": "마요네즈",
+    "머스타드": "머스타드", "감자칩": "감자칩", "감자튀김": "감자튀김",
+    "슈스트링": "감자튀김",
+    "치킨너겟": "치킨너겟", "가라아게": "치킨너겟",
+    "땅콩버터": "땅콩버터", "피넛버터": "땅콩버터",
+    "오레오": "초콜릿 샌드위치 쿠키",
+    # 제품명만으로는 제품군을 유추할 수 없는 브랜드/제품명 -> 제품군 매핑.
+    # 새 브랜드를 마주칠 때마다 여기 한 줄씩 추가해나간다.
+    "하리보": "구미젤리", "골드베렌": "구미젤리", "스타믹스": "구미젤리",
+    "소바바치킨": "냉동치킨",
+}
 UNCATEGORIZED_LABEL = "미분류"
 
-# 제품군 블록 하나는 "제목 행" + 아래 14개 항목 행으로 구성된다. 상품은 이
+# 제품군 블록 하나는 "제목 행" + 아래 11개 항목 행으로 구성된다. 상품은 이
 # 항목들을 세로로 채운 열 하나로 표현되고(카드형), 같은 제품군의 상품들이
 # 옆으로(B, C, D...) 나란히 쌓인다. OCR 상품카드에는 이 중 상품명/규격·단량/
-# 판매가/단위단가/상품코드/파일ID/원문텍스트만 있으므로 CATEGORY_FIELD_MAP에
-# 있는 행만 채우고 나머지(사진/소싱형태/매출(연)/매출율/산도/원산지/
-# 셀링포인트)는 빈 칸으로 남긴다 - 수기로 채우거나 다른 소스에서 나중에
-# 채워 넣을 몫이다.
+# 판매가/단위단가/셀링만 있으므로 CATEGORY_FIELD_MAP에 있는 행만 채우고
+# 나머지(사진/소싱형태/매출(연)/매총율/산도/병입원산지)는 빈 칸으로 남긴다 -
+# 수기로 채우거나 다른 소스에서 나중에 채워 넣을 몫이다. 상품코드/파일ID/
+# 원문텍스트는 여기 안 넣는다 - 이 시트는 사람이 보기 좋은 정리본이고, 그
+# 추적용 정보는 원본(RAW) 시트에 이미 행마다 남아있다.
 CATEGORY_ROW_LABELS = [
     "사진", "상품명", "소싱형태", "매출(연)", "규격/단량", "판매가",
-    "단위단가", "매출율", "산도", "원산지", "셀링포인트", "상품코드",
-    "파일ID", "원문텍스트",
+    "단위단가", "매총율", "산도", "병입원산지", "셀링",
 ]
 CATEGORY_FIELD_MAP = {
     "상품명": "제품명(한국어)",
     "규격/단량": "중량",
     "판매가": "가격",
     "단위단가": "단가",
-    "상품코드": "상품코드",
-    "파일ID": "파일ID",
-    "원문텍스트": "원문텍스트",
+    "셀링": "셀링포인트",
 }
 
 
 def detect_category(product_name: str) -> str:
     for kw in sorted(CATEGORY_KEYWORDS, key=len, reverse=True):
         if kw in product_name:
-            return kw
+            return CATEGORY_KEYWORDS[kw]
     return UNCATEGORIZED_LABEL
 
 
@@ -852,6 +930,9 @@ def build_row_dict(file_id, filename, fields, raw_text):
         "파일명": filename,
         "처리일시": time.strftime("%Y-%m-%d %H:%M:%S"),
         "원문텍스트": raw_text,
+        # RAW 시트 컬럼(COLUMN_ORDER)엔 없는 값이라 원본 로그에는 안 보이고,
+        # 제품군정리(카테고리) 시트의 "셀링" 행에만 쓰인다.
+        "셀링포인트": extract_selling_points(raw_text),
     }
     row_dict.update(fields)  # 상품코드/제품명(한국어)/가격
     return row_dict
