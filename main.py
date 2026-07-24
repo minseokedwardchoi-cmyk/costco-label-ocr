@@ -649,9 +649,22 @@ def _is_selling_point_noise(line: str) -> bool:
         return True  # 영문 제품명류
     if "단가" in line:  # "단가 / 개", OCR이 "/"를 "ㅣ"로 잘못 읽은 "단가 ㅣ 개" 포함
         return True
-    if re.fullmatch(r"\d{2,3}\s*cm\s*[:.]?\s*\d{1,3}", line, re.IGNORECASE):
-        return True  # 의류 사이즈표("66CM : 26")
     return any(sub in line for sub in _SELLING_POINT_EXCLUDE_SUBSTRINGS)
+
+
+# 의류 사이즈표("66CM : 26")처럼, 카드 안의 다른(관련 없는) 컬럼에서 끼어든 게
+# 명백한 줄은 지금 조립 중인 항목을 거기서 끝내면 안 된다 - 두 컬럼짜리
+# 카드에서 셀링포인트 문구 중간에 옆 컬럼의 사이즈표 한 줄이 Y좌표상 끼어드는
+# 경우가 실사진에서 확인됐다("* 시원하고 건조가 빠른" 다음에 사이즈표 몇 줄이
+# 끼고 나서야 "쿨맥스(COOLMAX) 원단 사용"이 이어짐). 이런 줄은 항목을 안
+# 끝내고 그냥 건너뛰어야, 그 뒤에 이어지는 진짜 내용을 놓치지 않는다 - 반면
+# 코드/영문명/단가처럼 "여기서부터는 확실히 다른 절"임을 뜻하는 노이즈는
+# 지금처럼 항목을 끝내는 게 맞다.
+_SIZE_TABLE_LINE_RE = re.compile(r"^\d{2,3}\s*cm\s*[:.]?\s*\d{1,3}$", re.IGNORECASE)
+
+
+def _is_skippable_interleaved_noise(line: str) -> bool:
+    return bool(_SIZE_TABLE_LINE_RE.match(line))
 
 
 # 대부분은 "-"/"•"/"·"로 시작하지만, 카드에 따라 "▶"(섹션 제목으로도 쓰이지만
@@ -685,6 +698,8 @@ def _extract_selling_points_with_markers(lines, markers):
         if "▶" not in markers and line.startswith("▶") and (current is not None or points):
             break
         if current is None:
+            continue
+        if _is_skippable_interleaved_noise(line):
             continue
         if _is_selling_point_noise(line):
             points.append(current.strip())
