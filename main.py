@@ -550,6 +550,24 @@ def _split_trailing_weight(name: str) -> tuple:
     return name, ""
 
 
+# 건강기능식품류는 무게(g/ml/kg 등) 대신 "80포", "180정", "1,000MG × 180정"처럼
+# 개수만으로 규격을 나타내는 경우가 많다 - WEIGHT_PATTERN이 다루는 단위가 아니라
+# 지금까지는 그냥 제품명에 붙은 채로 남아있었다. "정"을 OCR이 "적"으로 잘못
+# 읽는 경우가 실제로 있어서("112적") 같이 받아준다.
+_TRAILING_COUNT_RE = re.compile(
+    r"((?:[\d,]+\s*(?:MG|mg|G|g)\s*[×xX]\s*)?\d{1,4}\s*(?:정|적|캡슐|포|병|팩|롤))\s*$"
+)
+
+
+def _split_trailing_count(name: str) -> tuple:
+    """제품명 문자열 끝에 개수 기반 규격이 붙어있으면 (규격 뗀 제품명, 규격)을
+    돌려주고, 없으면 (원래 이름, "")을 그대로 돌려준다."""
+    m = _TRAILING_COUNT_RE.search(name)
+    if not m:
+        return name, ""
+    return name[:m.start()].strip(), m.group(1).strip()
+
+
 # "신세계포인트", "Global Product", "적립", "행사기간"처럼 셀링포인트 문구가
 # 아니라 코스트코/트레이더스가 라벨 양식 자체에 고정으로 찍는 정형 문구들.
 # 상품마다 달라지는 게 아니라 양쪽 매장이 재사용하는 고정 문구라 목록이
@@ -713,7 +731,24 @@ def _parse_fields_from_lines(lines: list) -> dict:
             price_boundary_idx = i
             break
 
+    # "할인행사(2026/06/29 ~2026/07/12)"처럼 할인 기간을 알리는 줄이 영문명보다
+    # 먼저 나오는 경우가 있다. 보통은 영문명이 먼저 경계를 잡아주지만, OCR이
+    # 영문명을 온전히 못 읽으면("GQ LAB CHOLESTEROL"의 "GQ LAB"이 통째로
+    # 누락되어 "CHOLESTEROL" 한 단어만 남는 등, 영문명 조건의 "2단어 이상"을
+    # 못 채움) english_idx가 안 잡혀서 이 할인 기간 문구까지 한글 제품명에
+    # 그대로 딸려 들어간다. 그래서 영문명과 무관하게 독립적인 경계로 둔다.
+    discount_event_idx = None
+    for i, line in enumerate(lines):
+        if code_idx is not None and i <= code_idx:
+            continue
+        if "할인행사" in line or "행사기간" in line or re.search(r"\d{4}/\d{2}/\d{2}", line):
+            discount_event_idx = i
+            break
+
     english_idx = None
+    stray_caps_idx = None  # 영문명 조건은 다 못 채우지만, 여전히 한글 제품명의
+    # 일부는 아닐 가능성이 높은 대문자 단독 단어("CHOLESTEROL" 등)의 위치.
+    # 영문명으로 채택하진 않지만 한글 제품명 경계로는 쓴다 - 아래 참고.
     seen_korean_line = False
     for i, line in enumerate(lines):
         if code_idx is not None and i <= code_idx:
@@ -742,6 +777,13 @@ def _parse_fields_from_lines(lines: list) -> dict:
             english_idx = i
             result["제품명(영어)"] = line
             break
+        # "GQ LAB CHOLESTEROL"의 "GQ LAB"이 OCR에서 통째로 누락되고
+        # "CHOLESTEROL" 한 단어만 남는 경우처럼, 영문명 전체를 못 읽었지만
+        # 그 잔여 단어 자체는 확실히 영문명 조각이다. 영문명으로 채택할 만큼
+        # 확실하진 않아 result["제품명(영어)"]엔 안 넣지만, 한글 제품명이 이
+        # 단어까지 삼켜버리는 건 막아야 하므로 경계 후보로는 기록해둔다.
+        if stray_caps_idx is None and re.fullmatch(r"[A-Z]{4,}", line):
+            stray_caps_idx = i
 
     # 한글 제품명은 상품코드 다음 줄부터(코드를 아예 못 찾았으면 맨 처음부터 -
     # 예: 바코드 구역이 프레임에 없는 화면 캡처), 중량/영문명/단가/가격 중 가장
@@ -751,7 +793,11 @@ def _parse_fields_from_lines(lines: list) -> dict:
     # 실제로는 한글 제품명의 일부이므로("RICOLA 레몬민트 허브캔디") 한글 포함
     # 여부로 거르지 않고 구간 안의 모든 줄을 그대로 합친다.
     boundary_candidates = [
-        i for i in (weight_idx, english_idx, danga_idx, price_boundary_idx) if i is not None
+        i for i in (
+            weight_idx, english_idx, danga_idx, price_boundary_idx,
+            discount_event_idx, stray_caps_idx,
+        )
+        if i is not None
     ]
     start = code_idx + 1 if code_idx is not None else 0
     end = min(boundary_candidates) if boundary_candidates else len(lines)
@@ -826,6 +872,12 @@ def _parse_fields_from_lines(lines: list) -> dict:
         if trailing_weight:
             result["제품명(한국어)"] = cleaned_name
             result["중량"] = trailing_weight
+    # 무게 단위가 없는 건강기능식품류("...80포", "...180정")도 마찬가지로 보정한다.
+    if not result["중량"] and result["제품명(한국어)"]:
+        cleaned_name, trailing_count = _split_trailing_count(result["제품명(한국어)"])
+        if trailing_count:
+            result["제품명(한국어)"] = cleaned_name
+            result["중량"] = trailing_count
 
     return result
 
@@ -907,6 +959,11 @@ def parse_traders_fields(text: str) -> dict:
         if trailing_weight:
             result["제품명(한국어)"] = cleaned_name
             result["중량"] = trailing_weight
+    if not result["중량"] and result["제품명(한국어)"]:
+        cleaned_name, trailing_count = _split_trailing_count(result["제품명(한국어)"])
+        if trailing_count:
+            result["제품명(한국어)"] = cleaned_name
+            result["중량"] = trailing_count
 
     return result
 
