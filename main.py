@@ -692,6 +692,13 @@ def _extract_selling_points_with_markers(lines, markers):
     current = None
     for line in lines:
         m = bullet_re.match(line)
+        # "-5,000 원"처럼 할인액도 대시로 시작하는데, "원"이라는 글자 자체가
+        # 한글이라서 "뒤에 한글/영문이 있으면 진짜 항목"이라는 원래 조건을
+        # 통과해버려 가짜 셀링포인트로 채택되는 경우가 실사진에서 확인됐다
+        # (NEPA/BRIGGS/바이탈뷰티 카드 등). DISCOUNT_LINE_PATTERN에 걸리는
+        # 줄은 "원"이 붙어있어도 항목 시작으로 인정하지 않는다.
+        if m and DISCOUNT_LINE_PATTERN.match(line):
+            m = None
         if m and re.search(r"[가-힣A-Za-z]", m.group(1)):
             if current:
                 points.append(current.strip())
