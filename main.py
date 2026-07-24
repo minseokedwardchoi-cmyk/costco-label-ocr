@@ -646,6 +646,19 @@ def _name_cleanliness(name: str) -> float:
     return 1 - (junk / len(tokens))
 
 
+def _normalize_bare_code(line: str) -> str:
+    """OCR이 코드 숫자 중간에 공백을 잘못 끼워넣는 경우가 실제로 있다
+    ("196 987" - 진짜 코드는 "196987"). 이러면 원래 fullmatch(r"\\d{4,8}")가
+    실패해서 코드 자체를 못 찾고, 그 뒤로 코드가 없는 것처럼 처리되어 배경
+    잡음까지 제품명에 다 딸려 들어간다. 공백을 뺀 값이 4~8자리 숫자면 코드로
+    인정하고 그 공백 없는 값을 돌려준다 - 공백이 둘 이상이면(진짜 코드가 아닐
+    가능성이 높은 문장류) 코드로 인정하지 않는다. 코드가 아니면 빈 문자열."""
+    if line.count(" ") > 1:
+        return ""
+    compact = line.replace(" ", "")
+    return compact if re.fullmatch(r"\d{4,8}", compact) else ""
+
+
 # ---------------- 항목 파싱: 상품코드 / 한국어 제품명 / 가격 ----------------
 def parse_price_fields(text: str) -> dict:
     """
@@ -665,7 +678,7 @@ def parse_price_fields(text: str) -> dict:
          채택한다.
     """
     lines = [l.strip() for l in text.split("\n") if l.strip()]
-    code_indices = [i for i, l in enumerate(lines) if re.fullmatch(r"\d{4,8}", l)]
+    code_indices = [i for i, l in enumerate(lines) if _normalize_bare_code(l)]
 
     if len(code_indices) <= 1:
         return _parse_fields_from_lines(lines)
@@ -696,8 +709,9 @@ def _parse_fields_from_lines(lines: list) -> dict:
 
     code_idx = None
     for i, line in enumerate(lines):
-        if re.fullmatch(r"\d{4,8}", line):
-            result["상품코드"] = line
+        normalized_code = _normalize_bare_code(line)
+        if normalized_code:
+            result["상품코드"] = normalized_code
             code_idx = i
             break
 
