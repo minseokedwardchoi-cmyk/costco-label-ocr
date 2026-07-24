@@ -431,6 +431,15 @@ def _cluster_area(cluster):
     return sum((e["right_x"] - e["left_x"]) * (e["bottom_y"] - e["top_y"]) for e in cluster)
 
 
+def _cluster_has_price(cluster):
+    """진짜 가격표 덩어리는 항상 "23,980"류 콤마 가격 줄을 포함한다. 옆/뒤에
+    같이 찍힌 다른 상품의 포장 문구(브랜드명, 성분표 등)는 글자 크기가 커서
+    실제 가격표보다 픽셀 면적이 더 큰 경우가 실사진에서 확인됐다 - 면적만
+    보면 이런 배경 포장이 이겨버린다. 가격 줄이 있는 덩어리를 우선하면 이
+    문제를 피할 수 있다."""
+    return any(PRICE_LINE_PATTERN.match(e["text"].strip()) for e in cluster)
+
+
 def _extract_text_and_confidence(result, image_bytes=None):
     """
     Azure가 반환하는 줄 순서는 항상 사진의 실제 위→아래 순서와 일치하지는
@@ -480,7 +489,8 @@ def _extract_text_and_confidence(result, image_bytes=None):
                 )
             clusters = _cluster_lines_by_layout(positioned)
             if len(clusters) > 1:
-                positioned = max(clusters, key=_cluster_area)
+                priced_clusters = [c for c in clusters if _cluster_has_price(c)]
+                positioned = max(priced_clusters or clusters, key=_cluster_area)
         except Exception as e:
             print(f"  경고: 레이아웃(배경색/간격) 분석 실패, 필터링 없이 진행: {e}")
 
@@ -520,6 +530,33 @@ WEIGHT_PATTERN = re.compile(
 PRICE_LINE_PATTERN = re.compile(r"^(\d{1,3}(?:,\d{3})+)\s*\S{0,2}$")
 DISCOUNT_LINE_PATTERN = re.compile(r"^-\s?[\d,]+\s*원?$")
 
+
+def _find_discount_amount(lines):
+    for line in lines:
+        m = DISCOUNT_LINE_PATTERN.match(line)
+        if m:
+            return int(re.sub(r"[^\d]", "", line))
+    return None
+
+
+# "값이 제일 큰 게 정가"라는 규칙만으로는, 배경에 겹친 다른 가격표나 프로모션
+# 문구("100ml당 2398원"의 "2398" 등)를 OCR이 콤마 포함 형태로 잘못 읽어들여
+# 실제 정가보다 큰 숫자를 만들어내는 경우를 못 걸러낸다(예: 실제 카드엔 없는
+# "41,980"이 23,980/21,980과 나란히 인식됨). 할인액 줄이 있으면, 할인은 항상
+# "정가 - 할인액 = 할인가" 산수가 정확히 맞아야 하므로 그 관계를 만족하는
+# 조합을 우선 찾는다 - 환각으로 생긴 숫자는 어떤 후보와도 할인액만큼 정확히
+# 차이나지 않으므로 이 검증에서 자연스럽게 걸러진다. 검증되는 조합이 없으면
+# (할인이 없거나 산수가 안 맞으면) 기존처럼 최댓값을 정가로 본다.
+def _select_regular_price(prices, discount):
+    if discount:
+        values = [int(p.replace(",", "")) for p in prices]
+        for a in values:
+            for b in values:
+                if a != b and a - discount == b:
+                    return f"{a:,}원"
+    return f"{max(prices, key=lambda p: int(p.replace(',', '')))}원"
+
+
 # 중량이 독립된 줄이 아니라 "오리온 오그래놀라 시나몬츄러스 440g* 3개"처럼
 # 제품명 끝에 그대로 붙어 나오는 경우가 많다. 중량 단위 뒤에 "* 3개", "x2개",
 # "포"처럼 짧은 수량 표시만 더 있고 그걸로 줄이 끝나면, 그 지점부터를 전부
@@ -540,14 +577,35 @@ UNIT_PRICE_PATTERN = re.compile(
 def _split_trailing_weight(name: str) -> tuple:
     """제품명 문자열 끝에 중량이 붙어있으면 (중량 뗀 제품명, 중량)을 돌려주고,
     없으면 (원래 이름, "")을 그대로 돌려준다."""
+    # "에어프라이어 4L+1.5L"처럼 규격 전체가 괄호로 감싸인 채 나오는 경우가
+    # 아니라, "(48g * 12입)"처럼 규격 표기 전체가 괄호 하나로 감싸인 채 붙는
+    # 경우도 있다. 괄호 안에 중량 패턴이 있으면 괄호 전체를 그대로 중량으로
+    # 떼어낸다 - 안에서 "48g * 12입"처럼 콤보로 이어져도 낱개로 다시 쪼갤
+    # 필요 없이 그대로 살린다. (괄호 안에 중량이 없는 "1L(퓨어)" 같은 경우는
+    # 여기 해당 없이 아래 일반 로직으로 넘어간다.)
+    paren_match = re.search(r"\(([^()]*)\)\s*$", name)
+    if paren_match and WEIGHT_PATTERN.search(paren_match.group(1)):
+        return name[:paren_match.start()].strip(), name[paren_match.start():].strip()
+
     matches = list(WEIGHT_PATTERN.finditer(name))
     if not matches:
         return name, ""
     last = matches[-1]
     rest = name[last.end():]
-    if _TRAILING_QUANTITY_RE.match(rest):
-        return name[:last.start()].strip(), name[last.start():].strip()
-    return name, ""
+    if not _TRAILING_QUANTITY_RE.match(rest):
+        return name, ""
+    start = last.start()
+    # "에어프라이어 4L+1.5L"처럼 콤보 규격이 "+" 같은 짧은 연결자로 이어진
+    # 경우, 맨 뒤 조각("1.5L")만 떼면 앞 조각("4L")을 잃어버린다. 바로 앞
+    # 중량 조각과의 사이가 연결자뿐이면 그 조각까지 같이 묶어서 중량으로
+    # 인정한다.
+    for prev in reversed(matches[:-1]):
+        gap = name[prev.end():start]
+        if re.fullmatch(r"[\s+xX×,]{1,3}", gap):
+            start = prev.start()
+        else:
+            break
+    return name[:start].strip(), name[start:].strip()
 
 
 # 건강기능식품류는 무게(g/ml/kg 등) 대신 "80포", "180정", "1,000MG × 180정"처럼
@@ -587,12 +645,55 @@ def _is_selling_point_noise(line: str) -> bool:
         return True
     if re.fullmatch(r"\d{4,14}", line):  # 상품코드/바코드
         return True
-    if re.fullmatch(r"[A-Z0-9 .,'&\-]{4,}", line) and re.search(r"[A-Z]{2,}", line):
+    if re.fullmatch(r"[A-Z0-9 .,'&×\-]{4,}", line) and re.search(r"[A-Z]{2,}", line):
         return True  # 영문 제품명류
+    if "단가" in line:  # "단가 / 개", OCR이 "/"를 "ㅣ"로 잘못 읽은 "단가 ㅣ 개" 포함
+        return True
+    if re.fullmatch(r"\d{2,3}\s*cm\s*[:.]?\s*\d{1,3}", line, re.IGNORECASE):
+        return True  # 의류 사이즈표("66CM : 26")
     return any(sub in line for sub in _SELLING_POINT_EXCLUDE_SUBSTRINGS)
 
 
-_BULLET_START_RE = re.compile(r"^[-•·]\s*(.+)$")
+# 대부분은 "-"/"•"/"·"로 시작하지만, 카드에 따라 "▶"(섹션 제목으로도 쓰이지만
+# "-" 불릿이 아예 없는 카드에서는 그 자체가 유일한 불릿 표시인 경우도 있다)나
+# "*"만 쓰는 경우도 실사진에서 확인됐다(에어프라이어, 청바지 카드 등). 다만
+# "▶"/"*"는 에버콜라겐/덴프스처럼 "-" 불릿 앞에 붙는 섹션 제목으로도 흔히
+# 쓰이므로, 무조건 같이 인식하면 그 제목 줄까지 불릿으로 오인해서 실제
+# 내용과 뒤섞인다. 그래서 우선순위를 둔다: "-•·"만으로 뭔가 찾아지면 그걸로
+# 끝내고, 하나도 못 찾을 때만 "▶"를 추가해서 다시 시도하고, 그래도 없으면
+# "*"까지 추가해서 마지막으로 시도한다.
+_BULLET_MARKER_TIERS = ("-•·", "-•·▶", "-•·▶*")
+
+
+def _extract_selling_points_with_markers(lines, markers):
+    bullet_re = re.compile(rf"^[{re.escape(markers)}]\s*(.+)$")
+    points = []
+    current = None
+    for line in lines:
+        m = bullet_re.match(line)
+        if m and re.search(r"[가-힣A-Za-z]", m.group(1)):
+            if current:
+                points.append(current.strip())
+            current = m.group(1).strip()
+            continue
+        # "▶"가 이번 등급에서 불릿 문자로 안 쓰이면("-" 불릿이 이미 찾아진
+        # 경우), "▶제품 특징" / "▶섭취량 및 섭취방법"처럼 카드 안의 서로 다른
+        # 절 제목으로 쓰인다. 첫 번째 절 제목은(아직 아무 불릿도 못 찾은
+        # 상태이므로) 그냥 지나치지만, 이미 불릿을 하나라도 찾은 뒤에 또
+        # 다른 "▶" 제목이 나오면 - 그건 "섭취방법"처럼 셀링포인트가 아닌
+        # 다른 절로 넘어갔다는 뜻이므로 거기서 추출을 멈춘다.
+        if "▶" not in markers and line.startswith("▶") and (current is not None or points):
+            break
+        if current is None:
+            continue
+        if _is_selling_point_noise(line):
+            points.append(current.strip())
+            current = None
+            continue
+        current += " " + line
+    if current:
+        points.append(current.strip())
+    return points
 
 
 def extract_selling_points(text: str) -> str:
@@ -607,27 +708,11 @@ def extract_selling_points(text: str) -> str:
     실사진으로 계속 검증하며 다듬어야 하는 초기 버전이다.
     """
     lines = [l.strip() for l in text.split("\n") if l.strip()]
-    points = []
-    current = None
-    for line in lines:
-        m = _BULLET_START_RE.match(line)
-        if m and re.search(r"[가-힣A-Za-z]", m.group(1)):
-            if current:
-                points.append(current.strip())
-            current = m.group(1).strip()
-            continue
-        if current is None:
-            continue
-        if _is_selling_point_noise(line):
-            points.append(current.strip())
-            current = None
-            continue
-        current += " " + line
-    if current:
-        points.append(current.strip())
-    if not points:
-        return ""
-    return "- " + points[0] + "".join(f"\n - {p}" for p in points[1:])
+    for markers in _BULLET_MARKER_TIERS:
+        points = _extract_selling_points_with_markers(lines, markers)
+        if points:
+            return "- " + points[0] + "".join(f"\n - {p}" for p in points[1:])
+    return ""
 
 
 # 코드 바로 다음에 진짜 제품명이 아니라 "14.970", "15,990+"처럼 순수 숫자/기호
@@ -784,7 +869,7 @@ def _parse_fields_from_lines(lines: list) -> dict:
         # 줄("50G X 12", "1.2KG" 등)은 이미 충분히 걸러진다 - 그런 줄은 단어가
         # 1개뿐이거나 대문자가 서로 떨어져 있어서 조건을 통과하지 못한다.
         if (
-            re.fullmatch(r"[A-Z0-9 .,'&\-]{4,}", line)
+            re.fullmatch(r"[A-Z0-9 .,'&×\-]{4,}", line)
             and re.search(r"[A-Z]{2,}", line)
             and len(line.split()) >= 2
         ):
@@ -827,7 +912,9 @@ def _parse_fields_from_lines(lines: list) -> dict:
     danga_price = ""
     danga_price_line_idx = None  # 가격 탐색에서 이 줄은 다시 쓰지 않도록 인덱스로 기억
     if danga_idx is not None:
-        unit_match = re.search(r"단가\s*/\s*(\S+)", lines[danga_idx])
+        # OCR이 "/" 구분자를 세로줄 모양이 비슷한 "ㅣ"(한글 자모)로 잘못 읽는
+        # 경우가 실제로 있다("단가 ㅣ 개") - 둘 다 받아준다.
+        unit_match = re.search(r"단가\s*[/ㅣ]\s*(\S+)", lines[danga_idx])
         unit = unit_match.group(1) if unit_match else ""
         for offset, line in enumerate(lines[danga_idx:danga_idx + 3]):
             m = re.search(r"[\d,]{2,}\s*원", line)
@@ -867,7 +954,7 @@ def _parse_fields_from_lines(lines: list) -> dict:
                 prices.append(m.group(1))
         if not prices:
             return ""
-        return f"{max(prices, key=lambda p: int(p.replace(',', '')))}원"
+        return _select_regular_price(prices, _find_discount_amount(candidate_lines))
 
     result["가격"] = find_price(lines, exclude_idx=danga_price_line_idx)
 
@@ -925,7 +1012,7 @@ def parse_traders_fields(text: str) -> dict:
     idx = korean_name_idx + 1
     if (
         idx < len(lines)
-        and re.fullmatch(r"[A-Z0-9 .,'&\-]{4,}", lines[idx])
+        and re.fullmatch(r"[A-Z0-9 .,'&×\-]{4,}", lines[idx])
         and re.search(r"[A-Z]{2,}", lines[idx])
     ):
         result["제품명(영어)"] = lines[idx]
@@ -957,7 +1044,7 @@ def parse_traders_fields(text: str) -> dict:
         prices = [m.group(1) for m in (PRICE_LINE_PATTERN.match(l) for l in candidate_lines) if m]
         if not prices:
             return ""
-        return f"{max(prices, key=lambda p: int(p.replace(',', '')))}원"
+        return _select_regular_price(prices, _find_discount_amount(candidate_lines))
 
     result["가격"] = find_price(lines)
 
