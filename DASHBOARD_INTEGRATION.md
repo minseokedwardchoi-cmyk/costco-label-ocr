@@ -37,13 +37,15 @@ Content-Type: application/json
 {"ref": "main"}
 ```
 
-(선택) 특정 Drive 폴더만 테스트로 처리하고 싶으면 `inputs.folder_id`를 추가하세요:
+(선택) 특정 Drive 폴더만 테스트로 처리하고 싶으면 `inputs.costco_folder_id` /
+`inputs.traders_folder_id`를 추가하세요 (둘 중 하나만 넣어도 됩니다):
 
 ```json
-{"ref": "main", "inputs": {"folder_id": "<테스트용 Drive 폴더 ID>"}}
+{"ref": "main", "inputs": {"costco_folder_id": "<테스트용 코스트코 Drive 폴더 ID>"}}
 ```
 
-비워두거나 아예 안 보내면 평소처럼 기본 폴더(`DRIVE_FOLDER_ID` 시크릿)를 사용합니다.
+비워두거나 아예 안 보내면 평소처럼 기본 폴더(`DRIVE_FOLDER_ID_COSTCO` /
+`DRIVE_FOLDER_ID_TRADERS` 시크릿)를 사용합니다.
 
 **성공하면 HTTP 204(No Content)**를 돌려줍니다 - 응답 본문은 없습니다.
 이 호출은 "실행을 큐에 넣는다"는 뜻이고, **OCR 처리가 끝날 때까지 기다려주지
@@ -110,7 +112,8 @@ Authorization: Bearer <GITHUB_PAT>
 ## 4. 참고 - 필요한 GitHub Secrets
 
 실행 자체에 필요한 값들은 이미 저장소 **Settings → Secrets and variables →
-Actions**에 등록되어 있습니다 (`DRIVE_FOLDER_ID`, `SPREADSHEET_ID`, `SHEET_NAME`,
-`AZURE_VISION_ENDPOINT`, `AZURE_VISION_KEY`, `GOOGLE_SERVICE_ACCOUNT_JSON`).
+Actions**에 등록되어 있습니다 (`DRIVE_FOLDER_ID_COSTCO`, `DRIVE_FOLDER_ID_TRADERS`,
+`SPREADSHEET_ID`, `SHEET_NAME`, `AZURE_VISION_ENDPOINT`, `AZURE_VISION_KEY`,
+`GOOGLE_SERVICE_ACCOUNT_JSON`).
 대시보드 쪽에서는 이 값들을 알 필요가 없고, 그냥 위 1-2의 트리거만 호출하면
 됩니다. 자세한 시스템 구조는 `README.md` 참고.

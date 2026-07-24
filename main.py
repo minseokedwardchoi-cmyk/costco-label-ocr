@@ -54,11 +54,14 @@ load_dotenv()
 SERVICE_ACCOUNT_FILE = os.environ.get("SERVICE_ACCOUNT_FILE", "service_account.json")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
 
-DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID")
+# 코스트코/트레이더스 사진을 텍스트 내용으로 자동 판별하던 방식(구 detect_retailer)은
+# 오분류가 잦아 폐기했다. 대신 Drive 폴더 자체를 리테일러별로 나눠서, 어느 폴더에서
+# 온 사진인지로 형식을 확정한다 - 코스트코 폴더에 넣은 사진은 항상 코스트코 파서로,
+# 트레이더스 폴더에 넣은 사진은 항상 트레이더스 파서로만 처리한다.
+DRIVE_FOLDER_ID_COSTCO = os.environ.get("DRIVE_FOLDER_ID_COSTCO")
+DRIVE_FOLDER_ID_TRADERS = os.environ.get("DRIVE_FOLDER_ID_TRADERS")
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID")
 SHEET_NAME = os.environ.get("SHEET_NAME", "시트1")
-# 같은 Drive 폴더에 코스트코/트레이더스 가격표 사진이 섞여 올라온다. 형식을
-# 자동 판별해서(detect_retailer 참고) 각자의 시트 탭에 나눠 기록한다.
 TRADERS_SHEET_NAME = os.environ.get("TRADERS_SHEET_NAME", "트레이더스")
 # 코스트코/트레이더스 원본 시트는 그대로 두고, 같은 데이터를 제품군(예: 올리브유)
 # 단위로 정리해서 보여주는 별도 시트. 원본 시트가 진짜 원본이고 이 시트는 거기서
@@ -87,8 +90,9 @@ SCOPES = [
 ]
 
 # 처리 완료된 사진을 옮겨두는 하위 폴더 이름. 삭제하지 않고 이동만 하므로
-# 나중에 재검증이 필요하면 그대로 다시 볼 수 있고, 신규 업로드 폴더
-# (DRIVE_FOLDER_ID)는 다음 실행의 조회 대상에서 계속 가벼운 상태로 유지된다.
+# 나중에 재검증이 필요하면 그대로 다시 볼 수 있고, 신규 업로드 폴더(코스트코/
+# 트레이더스 각각의 DRIVE_FOLDER_ID_*)는 다음 실행의 조회 대상에서 계속 가벼운
+# 상태로 유지된다. 리테일러별 원본 폴더 아래에 각자 '처리완료' 하위 폴더를 둔다.
 ARCHIVE_FOLDER_NAME = "처리완료"
 
 # 핵심 컬럼: 식품/비식품 가릴 것 없이 모든 SKU에 공통으로 채워지는 것들.
@@ -103,7 +107,13 @@ COLUMN_ORDER = ["파일ID", "파일명", "처리일시", "원문텍스트"] + PR
 def require_config():
     missing = [
         name
-        for name in ["DRIVE_FOLDER_ID", "SPREADSHEET_ID", "AZURE_VISION_ENDPOINT", "AZURE_VISION_KEY"]
+        for name in [
+            "DRIVE_FOLDER_ID_COSTCO",
+            "DRIVE_FOLDER_ID_TRADERS",
+            "SPREADSHEET_ID",
+            "AZURE_VISION_ENDPOINT",
+            "AZURE_VISION_KEY",
+        ]
         if not globals()[name]
     ]
     if not GOOGLE_SERVICE_ACCOUNT_JSON and not os.path.exists(SERVICE_ACCOUNT_FILE):
@@ -159,9 +169,9 @@ def load_processed_ids(sheet):
 # ---------------- Drive: 전체 이미지 조회 (페이지네이션 포함) ----------------
 HEIC_MIME_TYPES = ("image/heic", "image/heif")
 
-def list_all_images(drive_service):
+def list_all_images(drive_service, folder_id):
     query = (
-        f"'{DRIVE_FOLDER_ID}' in parents and "
+        f"'{folder_id}' in parents and "
         "(mimeType = 'image/jpeg' or mimeType = 'image/png' "
         "or mimeType = 'image/heic' or mimeType = 'image/heif') and trashed = false"
     )
@@ -204,11 +214,11 @@ def get_or_create_archive_folder(drive_service, parent_id):
     return folder["id"]
 
 
-def archive_file(drive_service, file_id, archive_folder_id):
+def archive_file(drive_service, file_id, archive_folder_id, source_folder_id):
     drive_service.files().update(
         fileId=file_id,
         addParents=archive_folder_id,
-        removeParents=DRIVE_FOLDER_ID,
+        removeParents=source_folder_id,
         fields="id, parents",
     ).execute()
 
@@ -596,30 +606,6 @@ def _parse_fields_from_lines(lines: list) -> dict:
 
 
 # ---------------- 트레이더스 가격표 파싱 ----------------
-# 코스트코는 상품코드(4~8자리)가 텍스트 맨 앞에 오지만, 트레이더스는 맨 앞이
-# 제품명이고 상품코드(바코드 번호, 8~13자리)가 바코드 아래 한참 뒤에 나온다.
-# 이 위치 차이로 형식을 판별한다 - 자릿수만으로는 8자리에서 겹칠 수 있어서
-# "맨 앞 줄이 코드냐"가 더 안정적인 기준이다.
-def detect_retailer(text: str) -> str:
-    """
-    코스트코 상품코드(4~8자리)와 트레이더스 바코드 번호(9~14자리)는 자릿수가
-    겹치지 않는다. 등급 표시("한국파기등급") 같은 잡음 줄이 진짜 코드 위에
-    끼어들면 "맨 첫 줄"만으로는 오판별하므로(잡음 줄이 코드가 아니니 트레이더스로
-    잘못 판정됨), parse_price_fields()의 코드 탐색과 마찬가지로 텍스트 전체에서
-    가장 먼저 나오는 "단독 숫자 줄"을 기준으로 삼는다 - 그 줄의 자릿수로 판별.
-    화면 캡처처럼 코드/바코드 구역 자체가 원문에 없어서 어느 쪽도 못 찾으면
-    코스트코로 기본 처리한다 - 코스트코 파서가 훨씬 많이 검증되어 있어서,
-    형식이 불확실할 때 더 안전한 쪽이다.
-    """
-    lines = [l.strip() for l in text.split("\n") if l.strip()]
-    for line in lines:
-        if re.fullmatch(r"\d{4,8}", line):
-            return "costco"
-        if re.fullmatch(r"\d{9,14}", line):
-            return "traders"
-    return "costco"
-
-
 TRADERS_CODE_PATTERN = re.compile(r"\d{8,14}")
 
 
@@ -898,7 +884,7 @@ def get_thread_drive_service(creds):
     return _thread_local.drive_service
 
 
-def process_one_file(creds, sheets, file_info, archive_folder_id):
+def process_one_file(creds, sheets, file_info, archive_folder_id, retailer, source_folder_id):
     name, file_id = file_info["name"], file_info["id"]
     drive_service = get_thread_drive_service(creds)
     image_bytes = download_image(drive_service, file_id)
@@ -907,11 +893,10 @@ def process_one_file(creds, sheets, file_info, archive_folder_id):
     text, confidences = ocr_image_azure(image_bytes)
     low_confidence = needs_review(confidences)
 
-    # 코스트코/트레이더스 사진이 같은 Drive 폴더에 섞여 올라오므로, 텍스트
-    # 구조를 보고 형식을 판별해 알맞은 파서와 시트로 보낸다 (detect_retailer
-    # 참고). 배경에 다른 가격표가 같이 찍혀도(예: 초점 밖 진열대의 옆 상품)
-    # 사진 한 장당 항상 메인 상품 하나만 뽑는다.
-    retailer = detect_retailer(text)
+    # 코스트코/트레이더스는 더 이상 텍스트 내용으로 추측하지 않는다 - 어느
+    # Drive 폴더(source_folder_id)에서 온 사진인지로 이미 확정돼서 넘어온다.
+    # 배경에 다른 가격표가 같이 찍혀도(예: 초점 밖 진열대의 옆 상품) 사진
+    # 한 장당 항상 메인 상품 하나만 뽑는다.
     if retailer == "traders":
         fields = parse_traders_fields(text)
         sheet = sheets["traders"]
@@ -926,7 +911,7 @@ def process_one_file(creds, sheets, file_info, archive_folder_id):
     # 아니다 - 그 사진만 원래 폴더에 계속 남아있을 뿐이라 실행을 실패로
     # 처리하지 않고 경고만 남긴다.
     try:
-        archive_file(drive_service, file_id, archive_folder_id)
+        archive_file(drive_service, file_id, archive_folder_id, source_folder_id)
     except Exception as e:
         print(f"  경고: '{name}' 보관 폴더 이동 실패 (시트 기록은 완료됨): {e}")
 
@@ -966,22 +951,28 @@ def run_once():
         "traders": open_or_create_sheet(CATEGORY_SHEET_NAME_TRADERS),
     }
 
-    # 코스트코/트레이더스 어느 시트에 기록됐든 이미 처리한 파일이니, 두 시트의
-    # 파일ID를 합쳐서 "처리 완료" 목록으로 삼는다 - 안 그러면 한 시트에만 있는
-    # 파일이 다른 시트 기준으로는 계속 "신규"로 보여서 중복 처리될 수 있다.
-    processed_ids = load_processed_ids(sheets["costco"]) | load_processed_ids(sheets["traders"])
-    all_files = list_all_images(drive_service)
-    new_files = [f for f in all_files if f["id"] not in processed_ids]
+    # 코스트코/트레이더스는 이제 서로 다른 Drive 폴더에서 온다 - 어느 폴더에서
+    # 조회했는지가 곧 리테일러이므로, 신규 파일 목록도 시트별로 각자의 폴더에서
+    # 각자의 처리완료 목록 기준으로 따로 뽑는다.
+    folder_ids = {"costco": DRIVE_FOLDER_ID_COSTCO, "traders": DRIVE_FOLDER_ID_TRADERS}
+    new_files = {}
+    archive_folder_ids = {}
+    for retailer, folder_id in folder_ids.items():
+        processed_ids = load_processed_ids(sheets[retailer])
+        all_files = list_all_images(drive_service, folder_id)
+        new_files[retailer] = [f for f in all_files if f["id"] not in processed_ids]
+        archive_folder_ids[retailer] = get_or_create_archive_folder(drive_service, folder_id)
 
-    if not new_files:
+    total_new = sum(len(files) for files in new_files.values())
+    if total_new == 0:
         print("처리할 새 이미지가 없습니다.")
         return
 
-    print(f"신규 이미지 {len(new_files)}건 발견. 처리를 시작합니다...")
+    print(f"신규 이미지 {total_new}건 발견"
+          f"(코스트코 {len(new_files['costco'])}건, 트레이더스 {len(new_files['traders'])}건). "
+          "처리를 시작합니다...")
     print(f"(Azure 무료 티어 속도 제한: 분당 {AZURE_MAX_CALLS_PER_MINUTE}건 -> "
-          f"예상 소요 시간 약 {len(new_files) / AZURE_MAX_CALLS_PER_MINUTE:.0f}분)")
-
-    archive_folder_id = get_or_create_archive_folder(drive_service, DRIVE_FOLDER_ID)
+          f"예상 소요 시간 약 {total_new / AZURE_MAX_CALLS_PER_MINUTE:.0f}분)")
 
     success_count = 0
     failed = []
@@ -989,8 +980,11 @@ def run_once():
 
     with ThreadPoolExecutor(max_workers=CONCURRENT_WORKERS) as executor:
         futures = {
-            executor.submit(process_one_file, creds, sheets, f, archive_folder_id): f
-            for f in new_files
+            executor.submit(
+                process_one_file, creds, sheets, f, archive_folder_ids[retailer], retailer, folder_ids[retailer]
+            ): f
+            for retailer, files in new_files.items()
+            for f in files
         }
         for future in as_completed(futures):
             f = futures[future]

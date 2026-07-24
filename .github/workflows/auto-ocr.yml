@@ -5,8 +5,12 @@ on:
                        # 연동 방법은 DASHBOARD_INTEGRATION.md 참고. Actions 탭에서
                        # 사람이 수동으로 Run workflow를 눌러도 똑같이 동작한다.
     inputs:
-      folder_id:
-        description: "처리할 Drive 폴더 ID 임시 지정 (소량 테스트용). 비워두면 기본 폴더(DRIVE_FOLDER_ID 시크릿)를 그대로 씀"
+      costco_folder_id:
+        description: "코스트코 Drive 폴더 ID 임시 지정 (소량 테스트용). 비워두면 기본 폴더(DRIVE_FOLDER_ID_COSTCO 시크릿)를 그대로 씀"
+        required: false
+        default: ""
+      traders_folder_id:
+        description: "트레이더스 Drive 폴더 ID 임시 지정 (소량 테스트용). 비워두면 기본 폴더(DRIVE_FOLDER_ID_TRADERS 시크릿)를 그대로 씀"
         required: false
         default: ""
 
@@ -33,7 +37,8 @@ jobs:
 
       - run: python main.py
         env:
-          DRIVE_FOLDER_ID: ${{ github.event.inputs.folder_id || secrets.DRIVE_FOLDER_ID }}
+          DRIVE_FOLDER_ID_COSTCO: ${{ github.event.inputs.costco_folder_id || secrets.DRIVE_FOLDER_ID_COSTCO }}
+          DRIVE_FOLDER_ID_TRADERS: ${{ github.event.inputs.traders_folder_id || secrets.DRIVE_FOLDER_ID_TRADERS }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           SHEET_NAME: ${{ secrets.SHEET_NAME }}
           AZURE_VISION_ENDPOINT: ${{ secrets.AZURE_VISION_ENDPOINT }}
