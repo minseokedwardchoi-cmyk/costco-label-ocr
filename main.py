@@ -675,33 +675,31 @@ def _parse_fields_from_lines(lines: list) -> dict:
     # 가끔 다른 문자(예: "z")로 잘못 읽는 경우가 있어("7,990z"), "원" 글자 자체보다
     # 콤마 포함 숫자 형태를 우선 신뢰한다. 단가는 보통 콤마 없는 2~3자리 숫자라서
     # ("217원", "89원") 이 방식으로도 서로 헷갈리지 않는다.
-    # - 단가로 이미 쓴 줄(danga_price_line_idx)은 절대 가격으로 다시 쓰지 않는다
-    #   (같은 값이 단가/가격 두 칸에 중복으로 들어가는 것 방지).
-    # - "할인행사" 문구나 "-4,500원"처럼 할인폭을 나타내는 줄이 나오면, 그 뒤에
-    #   나오는 가격(할인가)은 절대 선택하지 않는다 - 정가만 "가격"으로 취급한다.
-    def find_price(candidate_lines):
+    # 할인이 있는 카드는 정가/할인가 둘 다 콤마 형식 숫자로 찍히는데, 할인은 항상
+    # 가격을 낮추므로 정가가 항상 더 큰 값이다 - 그래서 "몇 번째 줄에 있냐"가
+    # 아니라 "값이 더 크냐"로 정가를 고른다. 예전에는 "할인 표시 줄 앞쪽에서만
+    # 찾는다"는 위치 기반 규칙을 썼는데, 할인가 숫자는 보통 더 크게 강조
+    # 인쇄되어 있어서(바운딩박스가 커서) OCR 줄 순서 자체가 할인 표시 문구보다
+    # 앞으로 밀려버리면 이 규칙이 무력화된다 - 값 기준으로 판단하면 줄 순서가
+    # 어떻게 뒤섞여도 영향받지 않는다. 단가로 이미 쓴 줄(danga_price_line_idx)은
+    # 후보에서 제외한다(같은 값이 단가/가격 두 칸에 중복으로 들어가는 것 방지).
+    def find_price(candidate_lines, exclude_idx=None):
+        prices = []
         for i, line in enumerate(candidate_lines):
-            if i == danga_price_line_idx:
+            if i == exclude_idx:
                 continue
             m = PRICE_LINE_PATTERN.match(line)
             if m:
-                return f"{m.group(1)}원"
-        return ""
+                prices.append(m.group(1))
+        if not prices:
+            return ""
+        return f"{max(prices, key=lambda p: int(p.replace(',', '')))}원"
 
-    discount_idx = next(
-        (i for i, l in enumerate(lines) if "할인" in l or DISCOUNT_LINE_PATTERN.match(l)),
-        None,
-    )
-    if discount_idx is not None:
-        # 할인 표시 이전 구간에서 먼저 찾고(=정가), 없으면 그래도 뭔가는 남겨야 하니
-        # 전체에서 찾는다(할인 표시가 우연히 다른 문구와 겹쳤을 경우의 대비).
-        result["가격"] = find_price(lines[:discount_idx]) or find_price(lines)
-    else:
-        result["가격"] = find_price(lines)
+    result["가격"] = find_price(lines, exclude_idx=danga_price_line_idx)
 
     if not result["가격"]:
         # 콤마 없는 가격도 드물게 있을 수 있으니, "원" 글자가 정상적으로 인식된
-        # 나머지 금액 중에서 찾는 것으로 대비한다.
+        # 나머지 금액 중에서 값이 제일 큰 것을 찾는 것으로 대비한다.
         all_prices = [m.group(0) for m in re.finditer(r"[\d,]{2,}\s*원", "\n".join(lines))]
         remaining_prices = [p for p in all_prices if p != danga_price]
         if remaining_prices:
@@ -759,30 +757,22 @@ def parse_traders_fields(text: str) -> dict:
             break
 
     # 가격: 콤마 형식(예: "15,380")의 독립된 줄을 카드 전체에서 찾는다. 큰 판매가
-    # 숫자는 폰트가 커서 바운딩박스 top-Y가 바코드 번호 줄보다 위로 잡히는 경우가
-    # 많아, 인쇄상으로는 코드 아래 있어도 OCR 줄 순서에서는 코드보다 먼저 나올 수
-    # 있다 - "코드 다음 줄부터"로만 찾으면 이런 카드에서 가격을 통째로 놓쳐서
-    # 아래 "원" 문자 기반 폴백이 대신 "10g당 154원"의 154를 가격으로 잘못 채택하게
-    # 된다. 단가는 "10g당 154원"처럼 콤마 없는 숫자라 PRICE_LINE_PATTERN(콤마
-    # 필수)에 애초에 안 걸리므로 카드 전체에서 찾아도 단가와 헷갈릴 일은 없다.
-    # "신세계포인트 적립 할인", "-2,000"처럼 할인 표시가 있으면 그 이후에 나오는
-    # 가격(할인 후 최종가)은 절대 선택하지 않는다 - 코스트코 파서와 동일한 규칙으로
-    # 항상 정가만 "가격"으로 채택한다.
+    # 숫자는 폰트가 커서 바운딩박스 top-Y가 다른 줄보다 위로 잡히는 경우가 많아,
+    # 인쇄상으로는 아래 있어도 OCR 줄 순서에서는 훨씬 먼저 나올 수 있다 - 특정
+    # 위치(코드 다음, 할인 표시 앞 등)를 기준으로 찾으면 이런 카드에서 계속
+    # 깨진다. 할인이 있는 카드는 정가/할인가 둘 다 콤마 형식으로 찍히는데, 할인은
+    # 항상 가격을 낮추므로 정가가 항상 더 큰 값이다 - 그래서 "몇 번째 줄에
+    # 있냐"가 아니라 "값이 더 크냐"로 정가를 고른다. 이러면 줄 순서가 어떻게
+    # 뒤섞여도(할인가가 할인 표시 문구보다 먼저 인식되어도) 영향받지 않는다.
+    # 단가는 "10g당 154원"처럼 콤마 없는 숫자라 PRICE_LINE_PATTERN(콤마 필수)에
+    # 애초에 안 걸리므로 카드 전체에서 찾아도 단가와 헷갈릴 일은 없다.
     def find_price(candidate_lines):
-        for line in candidate_lines:
-            m = PRICE_LINE_PATTERN.match(line)
-            if m:
-                return f"{m.group(1)}원"
-        return ""
+        prices = [m.group(1) for m in (PRICE_LINE_PATTERN.match(l) for l in candidate_lines) if m]
+        if not prices:
+            return ""
+        return f"{max(prices, key=lambda p: int(p.replace(',', '')))}원"
 
-    discount_idx = next(
-        (i for i, l in enumerate(lines) if "할인" in l or DISCOUNT_LINE_PATTERN.match(l)),
-        None,
-    )
-    if discount_idx is not None:
-        result["가격"] = find_price(lines[:discount_idx]) or find_price(lines)
-    else:
-        result["가격"] = find_price(lines)
+    result["가격"] = find_price(lines)
 
     if not result["가격"]:
         all_prices = [m.group(0) for m in re.finditer(r"[\d,]{2,}\s*원", text)]
