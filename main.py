@@ -779,6 +779,30 @@ def _normalize_bare_code(line: str) -> str:
     return compact if re.fullmatch(r"\d{4,8}", compact) else ""
 
 
+# 사람들이 Drive 폴더에 상품카드(가격표) 사진뿐 아니라 제품 뒷면(영양정보/
+# 원재료명/제조사 표기 등) 사진도 같이 올린다 - 폴더가 같아서 구조적으로는
+# 구분할 수 없고, 내용을 봐야 한다. 실사진 두 장(도브 뷰티 크림바 뒷면 vs
+# 상품카드) 비교로 확인한 두 조건을 그대로 쓴다:
+#   1) 가격(콤마 형식 판매가 줄)이 아예 없다 - 상품카드엔 반드시 있다.
+#   2) 제조원/판매업자류 문구가 있다 - 뒷면엔 법적 표기로 항상 있고,
+#      상품카드엔 나오지 않는다.
+# 두 조건이 "그리고"(AND)로 다 맞아야 뒷면으로 판단한다 - Azure가 상품카드의
+# 가격 줄만 어쩌다 놓쳐도(이번 세션에서 실제로 있었던 문제), 그 카드엔
+# 제조원류 문구 자체가 없으므로 조건 2에서 걸러져 오분류를 막아준다.
+_BACK_LABEL_MANUFACTURER_KEYWORDS = (
+    "제조원", "판매원", "판매업자", "유통업자", "수입원",
+    "화장품책임판매업자", "식품제조업자", "제조판매업자",
+)
+
+
+def is_back_label(lines: list) -> bool:
+    has_price_line = any(PRICE_LINE_PATTERN.match(l) for l in lines)
+    has_manufacturer_info = any(
+        kw in line for line in lines for kw in _BACK_LABEL_MANUFACTURER_KEYWORDS
+    )
+    return not has_price_line and has_manufacturer_info
+
+
 # ---------------- 항목 파싱: 상품코드 / 한국어 제품명 / 가격 ----------------
 def parse_price_fields(text: str) -> dict:
     """
@@ -1466,6 +1490,8 @@ def process_one_file(creds, sheets, file_info, archive_folder_id, retailer, sour
         image_bytes = convert_heic_to_jpeg(image_bytes)
     text, confidences = ocr_image_azure(image_bytes)
     low_confidence = needs_review(confidences)
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    is_back = is_back_label(lines)
 
     # 코스트코/트레이더스는 더 이상 텍스트 내용으로 추측하지 않는다 - 어느
     # Drive 폴더(source_folder_id)에서 온 사진인지로 이미 확정돼서 넘어온다.
@@ -1482,8 +1508,10 @@ def process_one_file(creds, sheets, file_info, archive_folder_id, retailer, sour
     # 일부(제품명/가격/바코드 등) 영역을 아예 통째로 못 읽고 건너뛴 경우엔,
     # 인식된 나머지 단어들의 신뢰도 자체는 높을 수 있어서 이 경우를 못
     # 잡아낸다. 가격과 제품명(한국어)은 상품카드에 항상 있어야 하는 값이므로,
-    # 둘 중 하나라도 비어있으면 그 자체로 검토가 필요하다는 뜻이다.
-    if not fields.get("가격") or not fields.get("제품명(한국어)"):
+    # 둘 중 하나라도 비어있으면 그 자체로 검토가 필요하다는 뜻이다. 다만 이건
+    # 상품카드에만 해당하는 얘기다 - 제품 뒷면 사진은 애초에 가격이 없는 게
+    # 정상이므로 뒷면으로 판별된 사진에는 이 검토 신호를 적용하지 않는다.
+    if not is_back and (not fields.get("가격") or not fields.get("제품명(한국어)")):
         low_confidence = True
 
     row_dict = build_row_dict(file_id, name, fields, text)
@@ -1498,7 +1526,7 @@ def process_one_file(creds, sheets, file_info, archive_folder_id, retailer, sour
     except Exception as e:
         print(f"  경고: '{name}' 보관 폴더 이동 실패 (시트 기록은 완료됨): {e}")
 
-    return name, fields.get("제품명(한국어)") or "", low_confidence, row_dict, retailer
+    return name, fields.get("제품명(한국어)") or "", low_confidence, row_dict, retailer, is_back
 
 
 # ---------------- 메인 실행 ----------------
@@ -1573,11 +1601,17 @@ def run_once():
         for future in as_completed(futures):
             f = futures[future]
             try:
-                name, product, flag, row_dict, retailer = future.result()
+                name, product, flag, row_dict, retailer, is_back = future.result()
                 success_count += 1
-                processed_row_dicts[retailer].append(row_dict)
+                # 제품 뒷면 사진은 RAW 시트엔 그대로 기록되지만(위에서 이미 끝남),
+                # 제품군정리(정리본)에는 상품카드에서 이미 뽑은 내용을 중복으로
+                # 넣지 않도록 애초에 이 목록에 넣지 않는다 - 그러면 update_category_sheet()가
+                # 이 사진을 위한 새 열 자체를 만들지 않는다.
+                if not is_back:
+                    processed_row_dicts[retailer].append(row_dict)
                 flag_str = " [검토필요]" if flag else ""
-                print(f"  완료: {name} -> {product or '(제품명 인식 실패)'}{flag_str}")
+                back_str = " [뒷면]" if is_back else ""
+                print(f"  완료: {name} -> {product or '(제품명 인식 실패)'}{flag_str}{back_str}")
             except Exception as e:
                 failed.append((f["name"], str(e)))
                 print(f"  실패: {f['name']} -> {e}")
