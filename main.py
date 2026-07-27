@@ -28,6 +28,7 @@ Azure Read API는 무료 티어(F0)에서 월 5,000건까지 완전 무료로 �
 GitHub Actions에서는 리포지토리 Secrets 값이 환경변수로 주입된다.
 """
 
+import datetime
 import io
 import os
 import re
@@ -108,7 +109,10 @@ CORE_PRICE_FIELDS = ["상품코드", "제품명(한국어)", "가격"]
 OPTIONAL_PRICE_FIELDS = ["제품명(영어)", "중량", "단가"]
 PRICE_FIELDS = CORE_PRICE_FIELDS + OPTIONAL_PRICE_FIELDS
 
-COLUMN_ORDER = ["파일ID", "파일명", "처리일시", "원문텍스트"] + PRICE_FIELDS
+COLUMN_ORDER = (
+    ["파일ID", "파일명", "처리일시", "원문텍스트"] + PRICE_FIELDS
+    + ["업로더", "뒷면여부", "매칭파일ID"]
+)
 
 
 def require_config():
@@ -188,7 +192,11 @@ def list_all_images(drive_service, folder_id):
     while True:
         results = drive_service.files().list(
             q=query,
-            fields="nextPageToken, files(id, name, mimeType)",
+            # owners(emailAddress): 앞뒤 사진 매칭에 쓸 "누가 올렸는지" 신호.
+            # 개인 Drive 폴더(공유 드라이브 아님)에 각자 계정으로 올리는
+            # 구조라 업로드한 사람 소유로 파일이 생성되므로 이 필드에 실제
+            # 업로더 이메일이 찍힌다.
+            fields="nextPageToken, files(id, name, mimeType, owners(emailAddress))",
             pageSize=1000,
             pageToken=page_token,
         ).execute()
@@ -255,6 +263,57 @@ def convert_heic_to_jpeg(image_bytes: bytes) -> bytes:
     out = io.BytesIO()
     image.convert("RGB").save(out, format="JPEG", quality=92)
     return out.getvalue()
+
+
+# EXIF DateTimeOriginal(0x9003)은 최상위 IFD가 아니라 "Exif" 서브 IFD(0x8769)
+# 안에 있다 - Image.getexif()만으로는 안 보이고 get_ifd()로 한 번 더 들어가야
+# 한다. DateTimeDigitized(0x9004)는 촬영 직후 자동 백업 등으로 아주 드물게
+# DateTimeOriginal이 비어있을 때의 보조값.
+_EXIF_IFD_EXIF = 0x8769
+_EXIF_DATETIME_ORIGINAL = 0x9003
+_EXIF_DATETIME_DIGITIZED = 0x9004
+_EXIF_DATETIME_FALLBACK = 0x0132  # 최상위 IFD의 DateTime(파일 수정시각에 가까움, 최후 보조값)
+
+# 삼성 카메라 기본 파일명(20260713_111558.jpg)에 박힌 촬영시각. EXIF가 없는
+# 드문 경우의 2순위 폴백 - 아이폰의 IMG_1234류 일련번호는 절대시각이 아니라서
+# (기기 안에서만 유효한 카운터) 파싱 대상에 넣지 않는다.
+_FILENAME_TIMESTAMP_PATTERN = re.compile(r"(20\d{2})(\d{2})(\d{2})[_-](\d{2})(\d{2})(\d{2})")
+
+
+def extract_capture_time(image_bytes: bytes, filename: str):
+    """사람별로 사진을 촬영 순서대로 정렬하기 위한 시각을 구한다. Drive
+    업로드 완료 시각(createdTime)은 파일 크기·네트워크 상태에 따라 완료
+    순서가 실제 촬영 순서와 달라질 수 있어 쓰지 않는다 - 카메라가 셔터를
+    누른 순간 자동으로 남기는 EXIF 촬영시각을 1순위로, 그마저 없으면(예:
+    메신저를 거치며 메타데이터가 지워진 사진) 삼성 파일명의 날짜_시각
+    패턴을 2순위로 쓴다. 아이폰 HEIC도 pillow_heif가 등록한 오프너를 통해
+    JPEG와 동일하게 EXIF를 읽는다. 변환 전 원본 바이트에서 읽어야 한다 -
+    convert_heic_to_jpeg()로 재인코딩하면 EXIF가 보존되지 않는다. 둘 다
+    없으면 순서를 알 수 없다는 뜻이므로 None을 돌려주고, 그 사진은 앞뒤
+    매칭 대상에서 빠진다(데이터 자체는 RAW 시트에 그대로 남는다)."""
+    try:
+        image = Image.open(io.BytesIO(image_bytes))
+        exif = image.getexif()
+        raw = None
+        if exif:
+            exif_ifd = exif.get_ifd(_EXIF_IFD_EXIF)
+            raw = (
+                exif_ifd.get(_EXIF_DATETIME_ORIGINAL)
+                or exif_ifd.get(_EXIF_DATETIME_DIGITIZED)
+                or exif.get(_EXIF_DATETIME_FALLBACK)
+            )
+        if raw:
+            return datetime.datetime.strptime(raw.strip(), "%Y:%m:%d %H:%M:%S")
+    except Exception:
+        pass
+
+    m = _FILENAME_TIMESTAMP_PATTERN.search(filename)
+    if m:
+        try:
+            return datetime.datetime(*(int(g) for g in m.groups()))
+        except ValueError:
+            pass
+    return None
 
 
 def is_heic(file_info: dict) -> bool:
@@ -804,6 +863,36 @@ def is_back_label(lines: list) -> bool:
         _BACK_LABEL_MANUFACTURER_PATTERN.search(line) for line in lines
     )
     return not has_price_line and has_manufacturer_info
+
+
+def match_card_back_pairs(entries: list) -> dict:
+    """상품카드와 그 뒷면 사진을 짝지어 {파일ID: [매칭된 파일ID, ...]}로
+    돌려준다. entries의 각 항목은 {"file_id", "uploader", "capture_time",
+    "is_back"}. 업로더가 같은(=같은 사람이 찍은) 사진들만 서로 비교하고,
+    그 안에서 촬영시각(capture_time, extract_capture_time() 결과) 순으로
+    정렬한 뒤 카드 바로 다음에 연달아 나오는 뒷면들을 그 카드에 붙인다 -
+    뒷면을 여러 장(정면+측면 등) 찍을 수 있어 "다음 카드가 나오기 전까지"를
+    한 묶음으로 본다. 업로더를 모르거나(owners 필드 없음) 촬영시각을
+    모르는(EXIF도 파일명도 없음) 사진은 순서를 신뢰할 수 없으므로 애초에
+    비교 대상에서 뺀다 - 그 사진 자체는 RAW 시트에 매칭 없이 그대로
+    남을 뿐 데이터가 사라지지는 않는다."""
+    by_uploader = {}
+    for e in entries:
+        if not e["uploader"] or e["capture_time"] is None:
+            continue
+        by_uploader.setdefault(e["uploader"], []).append(e)
+
+    result = {}
+    for group in by_uploader.values():
+        group.sort(key=lambda e: e["capture_time"])
+        pending_card = None
+        for e in group:
+            if not e["is_back"]:
+                pending_card = e
+            elif pending_card is not None:
+                result.setdefault(pending_card["file_id"], []).append(e["file_id"])
+                result.setdefault(e["file_id"], []).append(pending_card["file_id"])
+    return result
 
 
 # ---------------- 항목 파싱: 상품코드 / 한국어 제품명 / 가격 ----------------
@@ -1401,7 +1490,7 @@ def update_category_sheet(sheet, row_dicts: list):
 sheet_lock = threading.Lock()  # gspread 동시 append 충돌 방지
 
 
-def build_row_dict(file_id, filename, fields, raw_text):
+def build_row_dict(file_id, filename, fields, raw_text, uploader, is_back):
     row_dict = {
         "파일ID": file_id,
         "파일명": filename,
@@ -1410,9 +1499,32 @@ def build_row_dict(file_id, filename, fields, raw_text):
         # RAW 시트 컬럼(COLUMN_ORDER)엔 없는 값이라 원본 로그에는 안 보이고,
         # 제품군정리(카테고리) 시트의 "셀링" 행에만 쓰인다.
         "셀링포인트": extract_selling_points(raw_text),
+        "업로더": uploader,
+        "뒷면여부": "뒷면" if is_back else "",
+        # 이 시점엔 아직 이 배치의 다른 사진들과 비교해보기 전이라 매칭을
+        # 모른다 - 병렬 처리가 다 끝난 뒤 apply_match_results()가 채운다.
+        "매칭파일ID": "",
     }
     row_dict.update(fields)  # 상품코드/제품명(한국어)/가격
     return row_dict
+
+
+def apply_match_results(sheet, match_by_file_id: dict):
+    """match_card_back_pairs()가 계산한 매칭 결과를 이미 append된 RAW 시트
+    행에 반영한다. 행을 append할 때는 아직 이 배치의 다른 파일들과 비교해
+    보기 전이라 매칭파일ID를 빈 칸으로 써두므로, 병렬 처리가 다 끝나고
+    한 번에 계산한 뒤 파일ID로 실제 행 번호를 찾아 그 칸만 채운다."""
+    if not match_by_file_id:
+        return
+    col_letter = _col_letter(COLUMN_ORDER.index("매칭파일ID") + 1)
+    file_ids = sheet.col_values(1)
+    updates = [
+        {"range": f"{col_letter}{row_num}", "values": [[", ".join(match_by_file_id[fid])]]}
+        for row_num, fid in enumerate(file_ids[1:], start=2)
+        if fid in match_by_file_id
+    ]
+    if updates:
+        sheet.batch_update(updates, value_input_option="USER_ENTERED")
 
 
 def append_rows_to_sheet(sheet, row_dicts):
@@ -1489,6 +1601,11 @@ def process_one_file(creds, sheets, file_info, archive_folder_id, retailer, sour
     name, file_id = file_info["name"], file_info["id"]
     drive_service = get_thread_drive_service(creds)
     image_bytes = download_image(drive_service, file_id)
+    # 앞뒤 사진 매칭용 신호. HEIC->JPEG 변환은 EXIF를 보존하지 않으므로
+    # 반드시 변환 전 원본 바이트에서 촬영시각을 읽어야 한다. owners는
+    # Drive 목록 조회 시점에 이미 받아온 값(list_all_images 참고).
+    capture_time = extract_capture_time(image_bytes, name)
+    uploader = (file_info.get("owners") or [{}])[0].get("emailAddress", "")
     if is_heic(file_info):
         image_bytes = convert_heic_to_jpeg(image_bytes)
     text, confidences = ocr_image_azure(image_bytes)
@@ -1517,7 +1634,7 @@ def process_one_file(creds, sheets, file_info, archive_folder_id, retailer, sour
     if not is_back and (not fields.get("가격") or not fields.get("제품명(한국어)")):
         low_confidence = True
 
-    row_dict = build_row_dict(file_id, name, fields, text)
+    row_dict = build_row_dict(file_id, name, fields, text, uploader, is_back)
     append_rows_to_sheet(sheet, [row_dict])
 
     # 시트 기록이 끝난 뒤에 사진을 '처리완료' 폴더로 옮긴다. 이동이 실패해도
@@ -1529,7 +1646,7 @@ def process_one_file(creds, sheets, file_info, archive_folder_id, retailer, sour
     except Exception as e:
         print(f"  경고: '{name}' 보관 폴더 이동 실패 (시트 기록은 완료됨): {e}")
 
-    return name, fields.get("제품명(한국어)") or "", low_confidence, row_dict, retailer, is_back
+    return name, fields.get("제품명(한국어)") or "", low_confidence, row_dict, retailer, is_back, uploader, capture_time
 
 
 # ---------------- 메인 실행 ----------------
@@ -1592,6 +1709,10 @@ def run_once():
     success_count = 0
     failed = []
     processed_row_dicts = {"costco": [], "traders": []}
+    # 앞뒤 매칭용 - 뒷면 사진도 포함해서(processed_row_dicts와 달리) 이 배치
+    # 안에서 실제로 처리된 모든 사진을 모아둔다. 매칭은 이 배치의 다른
+    # 사진들과 비교해야 해서 병렬 처리가 다 끝난 뒤에만 계산할 수 있다.
+    match_entries = {"costco": [], "traders": []}
 
     with ThreadPoolExecutor(max_workers=CONCURRENT_WORKERS) as executor:
         futures = {
@@ -1604,7 +1725,7 @@ def run_once():
         for future in as_completed(futures):
             f = futures[future]
             try:
-                name, product, flag, row_dict, retailer, is_back = future.result()
+                name, product, flag, row_dict, retailer, is_back, uploader, capture_time = future.result()
                 success_count += 1
                 # 제품 뒷면 사진은 RAW 시트엔 그대로 기록되지만(위에서 이미 끝남),
                 # 제품군정리(정리본)에는 상품카드에서 이미 뽑은 내용을 중복으로
@@ -1612,6 +1733,12 @@ def run_once():
                 # 이 사진을 위한 새 열 자체를 만들지 않는다.
                 if not is_back:
                     processed_row_dicts[retailer].append(row_dict)
+                match_entries[retailer].append({
+                    "file_id": row_dict["파일ID"],
+                    "uploader": uploader,
+                    "capture_time": capture_time,
+                    "is_back": is_back,
+                })
                 flag_str = " [검토필요]" if flag else ""
                 back_str = " [뒷면]" if is_back else ""
                 print(f"  완료: {name} -> {product or '(제품명 인식 실패)'}{flag_str}{back_str}")
@@ -1626,6 +1753,18 @@ def run_once():
             update_category_sheet(category_sheets[retailer], row_dicts)
         except Exception as e:
             print(f"경고: {retailer} 제품군정리 시트 갱신 실패 (원본 시트 기록은 정상 완료됨): {e}")
+
+    # 상품카드 <-> 뒷면 매칭도 이 배치 안의 모든 사진이 다 모인 뒤에만 계산할
+    # 수 있으므로 여기서 한 번에 처리한다. 실패해도 원본 시트 기록 자체는
+    # 이미 끝난 뒤라 데이터 유실은 아니다.
+    for retailer, entries in match_entries.items():
+        try:
+            matches = match_card_back_pairs(entries)
+            apply_match_results(sheets[retailer], matches)
+            if matches:
+                print(f"  {retailer}: 앞뒤 매칭 {len(matches)}건 반영")
+        except Exception as e:
+            print(f"경고: {retailer} 앞뒤 매칭 반영 실패 (원본 시트 기록은 정상 완료됨): {e}")
 
     print(f"\n완료: {success_count}건 성공, {len(failed)}건 실패")
     if failed:
