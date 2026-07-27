@@ -430,8 +430,19 @@ def _defer_offcolumn_price_tokens(positioned):
 # 전체(제품명 등)가 통째로 버려지는 심각한 회귀로 이어졌다. 그래서 간격은
 # 색이 실제로 다를 때만 분리 근거로 쓴다 - 색이 같으면(같은 흰 바탕 가격표
 # 안이라는 뜻) 간격이 아무리 커도 절대 분리하지 않는다.
+#
+# "색이 실제로 다르다"만으로는 아직 부족했다 - 같은 흰 가격표라도 태그
+# 홀더의 그림자나 조명 반사(글레어) 때문에 본문 쪽과 가격 쪽의 밝기가 크게
+# 차이나는 경우가 실사진 대부분에서 확인됐다(예: (153,159,163) vs
+# (219,223,225), 유클리드 거리 110 - 위 60 기준을 훌쩍 넘는데도 둘 다
+# 채도는 0.06/0.03으로 사실상 무채색). 그림자/글레어는 R/G/B 세 채널을
+# 거의 같은 비율로 밝게 또는 어둡게 만들 뿐이라 색 자체(채도)는 그대로
+# 무채색에 가깝게 남는다 - 실제로 다른 색 포장/라벨(카드 밖 다른 물체)만
+# 뚜렷한 채도 차이를 만든다. 그래서 유클리드 거리가 크더라도 두 색 다
+# 무채색이면(채도가 낮으면) "밝기 차이일 뿐"으로 보고 분리하지 않는다.
 _CLUSTER_GAP_RATIO = 1.2      # 이 배수 이상 벌어지면서 색도 다르면 분리
 _CLUSTER_COLOR_DISTANCE = 60  # RGB 유클리드 거리 기준
+_CLUSTER_MIN_SATURATION = 0.15  # 이 미만이면 무채색(흰/회/검)으로 간주
 
 
 def _orient_image_to_match(image, expected_width, expected_height):
@@ -476,6 +487,24 @@ def _color_distance(c1, c2):
     return sum((a - b) ** 2 for a, b in zip(c1, c2)) ** 0.5
 
 
+def _saturation(c):
+    """0(완전 무채색: 흰/회/검)~1(뚜렷한 색) 범위로, RGB 세 채널이 서로
+    얼마나 벌어져 있는지를 본다. 그림자/글레어는 세 채널을 거의 같은 비율로
+    밝게/어둡게 만들 뿐이라 채도는 낮게 유지되고, 실제로 다른 색 물체만
+    채도가 뚜렷하게 올라간다."""
+    mx, mn = max(c), min(c)
+    return (mx - mn) / mx if mx else 0.0
+
+
+def _is_different_background(c1, c2):
+    """유클리드 거리만으로는 흰 가격표 위의 밝기 차이(그림자/글레어)와 실제로
+    다른 색 물체를 구분하지 못한다 - 둘 다 채도가 낮으면(무채색이면) 거리가
+    아무리 커도 조명 차이일 뿐 다른 물체가 아니라고 본다."""
+    if _saturation(c1) < _CLUSTER_MIN_SATURATION and _saturation(c2) < _CLUSTER_MIN_SATURATION:
+        return False
+    return _color_distance(c1, c2) >= _CLUSTER_COLOR_DISTANCE
+
+
 def _cluster_lines_by_layout(positioned):
     """세로 간격(+ 보조적으로 배경색)을 보고 줄들을 물리적 덩어리로 나눈다."""
     if not positioned:
@@ -490,7 +519,7 @@ def _cluster_lines_by_layout(positioned):
 
         should_break = False
         if gap_ratio >= _CLUSTER_GAP_RATIO and prev.get("color") and cur.get("color"):
-            should_break = _color_distance(prev["color"], cur["color"]) >= _CLUSTER_COLOR_DISTANCE
+            should_break = _is_different_background(prev["color"], cur["color"])
 
         if should_break:
             clusters.append([cur])
