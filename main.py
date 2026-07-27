@@ -656,11 +656,16 @@ WEIGHT_PATTERN = re.compile(
     r"(?<![A-Za-z0-9])(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?\s*(g|ml|kg|l|m)(?![a-wyz])",
     re.IGNORECASE,
 )
-PRICE_LINE_PATTERN = re.compile(r"^(\d{1,3}(?:,\d{3})+)\s*\S{0,2}$")
+# 콤마 천단위 구분자를 Azure가 마침표로 잘못 읽는 경우가 실사진에서 확인됐다
+# ("9,790"이 "9.790"으로) - 한국 판매가엔 소수점이 없으므로, 이 위치(3자리씩
+# 묶는 자리)에 나오는 마침표는 사실상 항상 콤마의 오독이다. 그래서 콤마와
+# 마침표를 둘 다 구분자로 받는다.
+PRICE_LINE_PATTERN = re.compile(r"^(\d{1,3}(?:[,.]\d{3})+)\s*\S{0,2}$")
 # 할인액 앞의 "-"도 Azure가 en dash(–)/em dash(—)/마이너스 기호(−)로 잘못
 # 읽을 수 있어(모양이 거의 같음) 같이 받는다 - 안 받으면 할인액 줄이
-# 셀링포인트 불릿으로 잘못 채택될 위험이 있다.
-DISCOUNT_LINE_PATTERN = re.compile(r"^[-–—−]\s?[\d,]+\s*원?$")
+# 셀링포인트 불릿으로 잘못 채택될 위험이 있다. 천단위 구분자도 가격 줄과
+# 마찬가지로 마침표로 잘못 읽힐 수 있어 같이 받는다.
+DISCOUNT_LINE_PATTERN = re.compile(r"^[-–—−]\s?[\d,.]+\s*원?$")
 
 
 def _find_discount_amount(lines):
@@ -679,14 +684,22 @@ def _find_discount_amount(lines):
 # 조합을 우선 찾는다 - 환각으로 생긴 숫자는 어떤 후보와도 할인액만큼 정확히
 # 차이나지 않으므로 이 검증에서 자연스럽게 걸러진다. 검증되는 조합이 없으면
 # (할인이 없거나 산수가 안 맞으면) 기존처럼 최댓값을 정가로 본다.
+def _price_to_int(p: str) -> int:
+    # PRICE_LINE_PATTERN이 콤마와 마침표를 둘 다 천단위 구분자로 받으므로,
+    # 숫자로 바꿀 땐 어느 쪽이었든 그냥 다 지운다. 값을 다시 쓸 때는 항상
+    # f"{n:,}"로 콤마 형식으로 통일해서, 마침표로 잘못 읽힌 값이 그대로
+    # 시트에 남지 않게 한다.
+    return int(re.sub(r"[^\d]", "", p))
+
+
 def _select_regular_price(prices, discount):
     if discount:
-        values = [int(p.replace(",", "")) for p in prices]
+        values = [_price_to_int(p) for p in prices]
         for a in values:
             for b in values:
                 if a != b and a - discount == b:
                     return f"{a:,}원"
-    return f"{max(prices, key=lambda p: int(p.replace(',', '')))}원"
+    return f"{max(_price_to_int(p) for p in prices):,}원"
 
 
 # 중량이 독립된 줄이 아니라 "오리온 오그래놀라 시나몬츄러스 440g* 3개"처럼
@@ -953,7 +966,40 @@ def extract_selling_points(text: str) -> str:
         points = _extract_selling_points_with_markers(lines, markers)
         if points:
             return "- " + points[0] + "".join(f"\n - {p}" for p in points[1:])
+    fallback = _find_unmarked_description(lines)
+    if fallback:
+        return "- " + fallback
     return ""
+
+
+# 베이커리류 카드는 셀링포인트에 "-"/"▶" 같은 불릿 표시가 아예 없이, 영문
+# 제품명 바로 다음에 화면 폭 때문에 여러 줄로 줄바꿈된 순수 설명 문장 하나만
+# 있는 경우가 실사진에서 확인됐다(신라명과 탕종식빵, 삼립 토마토피자브레드
+# 등). 불릿 기반 추출(위 세 등급)이 전부 아무것도 못 찾았을 때만 쓰는 마지막
+# 폴백으로, 영문 제품명 줄(대문자 2단어 이상 - english_idx와 같은 조건) 바로
+# 다음부터 노이즈(가격/단가/코드/정형문구 등)가 나오거나 한글이 없는 줄이
+# 나오기 전까지 이어지는 줄들을 통째로 한 문장으로 합친다.
+def _find_unmarked_description(lines: list) -> str:
+    english_idx = None
+    for i, line in enumerate(lines):
+        if (
+            re.fullmatch(r"[A-Z0-9 .,'&×\-]{4,}", line)
+            and re.search(r"[A-Z]{2,}", line)
+            and len(line.split()) >= 2
+        ):
+            english_idx = i
+            break
+    if english_idx is None:
+        return ""
+
+    desc_lines = []
+    for line in lines[english_idx + 1:]:
+        if not re.search(r"[가-힣]", line):
+            break
+        if _is_skippable_interleaved_noise(line) or _is_selling_point_noise(line):
+            break
+        desc_lines.append(line)
+    return " ".join(desc_lines).strip()
 
 
 # 코드 바로 다음에 진짜 제품명이 아니라 "14.970", "15,990+"처럼 순수 숫자/기호
@@ -1289,7 +1335,7 @@ def _parse_fields_from_lines(lines: list) -> dict:
         # "899원" 조각까지 후보로 잡히면 진짜 가격을 못 찾았을 때 이 단가
         # 조각을 엉뚱하게 채택해버리므로 먼저 지운다.
         text_without_unit_price = UNIT_PRICE_PATTERN.sub("", "\n".join(lines))
-        all_prices = [m.group(0) for m in re.finditer(r"[\d,]{2,}\s*원", text_without_unit_price)]
+        all_prices = [m.group(0) for m in re.finditer(r"[\d,.]{2,}\s*원", text_without_unit_price)]
         remaining_prices = [p for p in all_prices if p != danga_price]
         if remaining_prices:
             result["가격"] = max(remaining_prices, key=lambda p: int(re.sub(r"[^\d]", "", p) or "0"))
@@ -1404,7 +1450,7 @@ def parse_traders_fields(text: str) -> dict:
         # 뒷부분을 Azure가 통째로 못 읽은 카드에서 "100g당 428원"의 428원이
         # 가격 칸에 들어감). 단위당가격 문구는 먼저 지우고 나서 찾는다.
         text_without_unit_price = UNIT_PRICE_PATTERN.sub("", text)
-        all_prices = [m.group(0) for m in re.finditer(r"[\d,]{2,}\s*원", text_without_unit_price)]
+        all_prices = [m.group(0) for m in re.finditer(r"[\d,.]{2,}\s*원", text_without_unit_price)]
         if all_prices:
             result["가격"] = max(all_prices, key=lambda p: int(re.sub(r"[^\d]", "", p) or "0"))
 
