@@ -109,9 +109,13 @@ CORE_PRICE_FIELDS = ["상품코드", "제품명(한국어)", "가격"]
 OPTIONAL_PRICE_FIELDS = ["제품명(영어)", "중량", "단가"]
 PRICE_FIELDS = CORE_PRICE_FIELDS + OPTIONAL_PRICE_FIELDS
 
+# "정리본위치"는 이 카드가 제품군정리(카테고리) 시트의 어느 칸(열+제목행)에
+# 기록됐는지를 "C15" 같은 값으로 남겨둔다. 제품군정리 시트 자체에는 추적용
+# ID를 두지 않는다는 원칙(7절 참고)을 지키면서도, 카드보다 늦게 올라오는
+# 뒷면 사진(소싱형태/병입원산지)을 나중에 그 칸에 소급 반영할 수 있게 해준다.
 COLUMN_ORDER = (
     ["파일ID", "파일명", "처리일시", "원문텍스트"] + PRICE_FIELDS
-    + ["업로더", "뒷면여부", "촬영시각", "매칭파일ID"]
+    + ["업로더", "뒷면여부", "촬영시각", "매칭파일ID", "정리본위치"]
 )
 
 
@@ -993,6 +997,141 @@ def match_card_back_pairs(entries: list) -> dict:
     return result
 
 
+# ---------------- 뒷면: 소싱형태 / 병입원산지 판별 ----------------
+# 소싱형태는 상품카드 제품명과 뒷면 텍스트를 함께 봐야 판단할 수 있다:
+#   1. 상품카드 제품명에 PB 브랜드 문구가 있으면 무조건 "PB"
+#   2. (아니면) 뒷면의 수입원/수입자/수입업체/수입판매업소가 그 사진을 찍은
+#      매장의 계열사(코스트코 <-> 코스트코, 트레이더스(이마트) <-> 이마트)와
+#      일치하면 "직수입". 트레이더스 사진에 수입업체가 코스트코 계열이면
+#      (또는 그 반대) 그 매장 입장에서는 직수입이 아니므로 여기 해당 안 됨.
+#   3. (아니면) 제조사(류)와 수입사(류)가 뒷면에 둘 다 적혀있으면 "벤더구매"
+#   4. 위 세 경우에 다 해당하지 않으면 소싱형태는 비우고 병입원산지는 "국내"
+#      (수입 경로 자체가 안 적혀있다는 뜻이므로 국내 생산으로 간주)
+_PB_NAME_PATTERN = re.compile(
+    r"[Tt]\s*[Ss]tandard|티\s*스탠다드|[Kk]irkland|커클랜드", re.IGNORECASE
+)
+
+_ENTITY_SUFFIX = r"(?:원|자|처|업자|업체|회사|사)"
+# "수입판매업소"는 코스트코/이마트 라벨에 흔한 표현인데 위 공용 접미사
+# 목록만으로는 못 잡으므로("수입"+"판매업소"), 수입 쪽에 별도로 붙여준다.
+_IMPORTER_LABEL_PATTERN = re.compile(rf"수입\s*(?:{_ENTITY_SUFFIX}|판매업소)")
+_MANUFACTURER_LABEL_PATTERN = re.compile(rf"(?:화장품)?제조\s*{_ENTITY_SUFFIX}")
+# 라벨 뒤에 붙은 값을 어디까지 읽을지 정하는 경계 - 다음 항목 라벨(제조/판매/
+# 수입/유통/공급 계열, 원산지/제조국)이 나오거나, 줄바꿈/불릿/대괄호가 나오면
+# 거기서 값을 끊는다. 같은 줄에 라벨 여러 개가 붙어 나오는 경우(뒷면 라벨은
+# 항목이 다닥다닥 붙어 있는 경우가 많다)를 대비한 것.
+_FIELD_BOUNDARY_PATTERN = re.compile(
+    r"[\[\n•▪]|" + _BACK_LABEL_MANUFACTURER_PATTERN.pattern + r"|원산지|제조국"
+)
+
+_ORIGIN_LABEL_PATTERN = re.compile(r"(?:원산지|제조국)\s*[\]:：]*\s*([가-힣]{1,10})")
+_MADE_IN_PATTERN = re.compile(r"made\s+in\s+([A-Za-z]+)", re.IGNORECASE)
+
+_COUNTRY_NAMES_KO = (
+    "대한민국", "한국", "중국", "일본", "미국", "베트남", "태국", "인도네시아",
+    "말레이시아", "필리핀", "인도", "대만", "이탈리아", "프랑스", "독일", "스페인",
+    "영국", "스위스", "네덜란드", "벨기에", "폴란드", "캐나다", "멕시코", "브라질",
+    "호주", "뉴질랜드", "튀르키예", "스웨덴", "노르웨이", "덴마크", "핀란드",
+    "칠레", "아르헨티나", "러시아",
+)
+_COUNTRY_EN_TO_KO = {
+    "ITALY": "이탈리아", "CHINA": "중국", "USA": "미국", "AMERICA": "미국",
+    "VIETNAM": "베트남", "THAILAND": "태국", "FRANCE": "프랑스", "GERMANY": "독일",
+    "SPAIN": "스페인", "JAPAN": "일본", "KOREA": "대한민국", "INDONESIA": "인도네시아",
+    "MALAYSIA": "말레이시아", "PHILIPPINES": "필리핀", "TAIWAN": "대만",
+    "SWITZERLAND": "스위스", "NETHERLANDS": "네덜란드", "BELGIUM": "벨기에",
+    "POLAND": "폴란드", "CANADA": "캐나다", "MEXICO": "멕시코", "BRAZIL": "브라질",
+    "AUSTRALIA": "호주", "TURKEY": "튀르키예", "SWEDEN": "스웨덴", "NORWAY": "노르웨이",
+    "DENMARK": "덴마크", "FINLAND": "핀란드", "INDIA": "인도", "UK": "영국",
+    "ENGLAND": "영국",
+}
+
+_COSTCO_CHAIN_KEYWORDS = ("코스트코",)
+_EMART_CHAIN_KEYWORDS = ("이마트", "트레이더스")
+# 사진이 어느 매장(retailer 파라미터, "costco"/"traders")에서 왔는지를
+# 실제 유통 계열사로 매핑한다 - 트레이더스는 이마트 계열이라 "직수입" 판정 시
+# 뒷면 수입업체가 "이마트"로 적혀있어야 그 매장 입장에서 직수입인 것이다.
+_RETAILER_CHAIN = {"costco": "costco", "traders": "emart"}
+
+
+def _chain_of(name: str):
+    if any(k in name for k in _COSTCO_CHAIN_KEYWORDS):
+        return "costco"
+    if any(k in name for k in _EMART_CHAIN_KEYWORDS):
+        return "emart"
+    return None
+
+
+def _extract_after_label(text: str, label_pattern: "re.Pattern"):
+    """text 안에서 label_pattern이 처음 매치되는 지점 바로 뒤의 값을
+    잘라 돌려준다. 라벨 자체가 없으면 None(=그 항목이 아예 안 적혀있음),
+    라벨은 있는데 값이 비어있으면 빈 문자열을 돌려준다."""
+    m = label_pattern.search(text)
+    if not m:
+        return None
+    rest = re.sub(r"^\s*[\]:：]*\s*", "", text[m.end():])
+    stop = _FIELD_BOUNDARY_PATTERN.search(rest)
+    value = rest[:stop.start()] if stop else rest[:80]
+    return value.strip(" .,:;·-")
+
+
+def parse_sourcing_fields(text: str) -> dict:
+    importer = _extract_after_label(text, _IMPORTER_LABEL_PATTERN)
+    manufacturer = _extract_after_label(text, _MANUFACTURER_LABEL_PATTERN)
+    return {
+        "importer_value": importer or "",
+        "has_importer": importer is not None,
+        "has_manufacturer": manufacturer is not None,
+    }
+
+
+def extract_origin(text: str) -> str:
+    """뒷면 텍스트에서 병입원산지(제조국)를 뽑는다. 우선순위: ① "원산지:"/
+    "제조국:" 같은 명시적 라벨 -> ② "Made in X" -> ③ 그 외엔 제조자/제조원
+    표기 근처에서 국가명을 찾는다(뒷면 라벨은 보통 주소 맨 끝에 국가명을
+    붙인다 - 예: "...스테다프로핀셜 이스트세시아 이탈리아"). 아무 것도 못
+    찾으면 빈 문자열(수기 확인 필요)을 돌려준다."""
+    m = _ORIGIN_LABEL_PATTERN.search(text)
+    if m:
+        value = m.group(1)
+        return "국내" if value in ("대한민국", "한국") else value
+
+    m = _MADE_IN_PATTERN.search(text)
+    if m:
+        mapped = _COUNTRY_EN_TO_KO.get(m.group(1).upper())
+        if mapped:
+            return "국내" if mapped == "대한민국" else mapped
+
+    found = [c for c in _COUNTRY_NAMES_KO if c in text]
+    if found:
+        last = max(found, key=lambda c: text.rfind(c))
+        return "국내" if last in ("대한민국", "한국") else last
+
+    return ""
+
+
+def determine_sourcing(product_name: str, retailer: str, back_text: str) -> tuple:
+    """(소싱형태, 병입원산지)를 함께 돌려준다. product_name은 상품카드에서
+    읽은 제품명(뒷면이 아님), back_text는 매칭된 뒷면 사진(들)의 원문텍스트."""
+    origin = extract_origin(back_text)
+
+    if _PB_NAME_PATTERN.search(product_name or ""):
+        return "PB", origin
+
+    fields = parse_sourcing_fields(back_text)
+    importer_chain = _chain_of(fields["importer_value"])
+    if importer_chain and importer_chain == _RETAILER_CHAIN.get(retailer):
+        return "직수입", origin
+    if fields["has_manufacturer"] and fields["has_importer"]:
+        return "벤더구매", origin
+
+    # 수입 경로 자체가 안 적혀있으면 소싱형태는 비운다. 병입원산지는 그래도
+    # "원산지:"/"제조국:"/"Made in" 같은 명시적 표기가 있으면 그 값을 우선
+    # 쓰고("국내"로 덮어써 원산지 표기와 모순되는 값을 만들지 않는다),
+    # 그런 표기가 전혀 없을 때만 국내산으로 간주해 "국내"를 채운다.
+    return "", (origin or "국내")
+
+
 # ---------------- 항목 파싱: 상품코드 / 한국어 제품명 / 가격 ----------------
 def parse_price_fields(text: str) -> dict:
     """
@@ -1556,13 +1695,19 @@ def update_category_sheet(sheet, row_dicts: list):
     트레이더스 원본 시트는 건드리지 않는 별도 파생 시트라, 여기서 실수가
     나도 원본 대조로 다시 정리할 수 있다. 여러 스레드가 동시에 열 번호를
     계산하면 충돌하므로, OCR 병렬 처리가 다 끝난 뒤 이 함수 하나만 단일
-    스레드로 호출한다. 같은 상품코드가 다시 나와도 항상 새 열을 만든다."""
+    스레드로 호출한다. 같은 상품코드가 다시 나와도 항상 새 열을 만든다.
+
+    돌려주는 값은 {파일ID: "C15"} 형태로, 각 카드가 어느 칸(열+제목행)에
+    기록됐는지를 나타낸다 - 뒷면 사진이 나중에 도착했을 때 소싱형태/
+    병입원산지를 그 칸에 소급 반영하려면(sync_back_sourcing 참고) 이 위치를
+    RAW 시트의 "정리본위치" 컬럼에 남겨둬야 하기 때문이다."""
     if not row_dicts:
-        return
+        return {}
 
     values = sheet.get_all_values()
     blocks, next_new_row = _scan_category_blocks(values)
     updates = []
+    positions = {}
     max_col_used = 1
     max_row_used = len(values)
 
@@ -1588,6 +1733,9 @@ def update_category_sheet(sheet, row_dicts: list):
             row = block["field_rows"][label]
             updates.append({"range": f"{col_letter}{row}", "values": [[value]]})
         max_col_used = max(max_col_used, block["next_col"])
+        file_id = row_dict.get("파일ID")
+        if file_id:
+            positions[file_id] = f"{col_letter}{block['title_row']}"
         block["next_col"] += 1
 
     if updates:
@@ -1602,6 +1750,8 @@ def update_category_sheet(sheet, row_dicts: list):
         if max_row_used > sheet.row_count:
             sheet.resize(rows=max_row_used + 20)
         sheet.batch_update(updates, value_input_option="USER_ENTERED")
+
+    return positions
 
 
 # ---------------- 시트 저장 ----------------
@@ -1623,6 +1773,9 @@ def build_row_dict(file_id, filename, fields, raw_text, uploader, is_back, captu
         # 이 시점엔 아직 시트에 쌓인 다른 사진들과 비교해보기 전이라 매칭을
         # 모른다 - resync_card_back_matches()가 별도로 채운다.
         "매칭파일ID": "",
+        # 카드가 제품군정리 시트에 기록될 때(update_category_sheet) 채워진다.
+        # 뒷면 사진 자체는 이 값이 끝까지 빈 칸으로 남는다.
+        "정리본위치": "",
     }
     row_dict.update(fields)  # 상품코드/제품명(한국어)/가격
     return row_dict
@@ -1686,6 +1839,100 @@ def resync_card_back_matches(sheet):
             updates.append({"range": f"{match_col_letter}{i + 2}", "values": [[new_value]]})
     if updates:
         sheet.batch_update(updates, value_input_option="USER_ENTERED")
+    return len(updates)
+
+
+def _write_category_positions(sheet, positions: dict):
+    """update_category_sheet()가 돌려준 {파일ID: "C15"}를 RAW 시트의
+    "정리본위치" 컬럼에 되써 넣는다. 이번 실행에서 방금 append한 행이라
+    파일ID로 다시 찾아야 몇 번째 행인지 알 수 있다."""
+    if not positions:
+        return
+    file_id_col = COLUMN_ORDER.index("파일ID") + 1
+    pos_col_letter = _col_letter(COLUMN_ORDER.index("정리본위치") + 1)
+    file_ids = sheet.col_values(file_id_col)[1:]  # 헤더 제외
+    updates = []
+    for i, file_id in enumerate(file_ids):
+        if file_id in positions:
+            updates.append({"range": f"{pos_col_letter}{i + 2}", "values": [[positions[file_id]]]})
+    if updates:
+        sheet.batch_update(updates, value_input_option="USER_ENTERED")
+
+
+def sync_back_sourcing(sheet, category_sheet, retailer: str) -> int:
+    """RAW 시트 전체 이력을 훑어, 상품카드<->뒷면 매칭이 되어 있고 그 카드가
+    이미 제품군정리 시트에 칸을 가지고 있는(정리본위치가 채워진) 경우에
+    한해 소싱형태/병입원산지를 계산해서 그 칸에 채운다.
+
+    resync_card_back_matches()와 마찬가지로 매번 전체 이력을 다시 계산한다 -
+    뒷면이 카드보다 늦게(심지어 다른 실행 회차에) 올라와도 소급 반영되어야
+    하기 때문이다. 다만 이미 값이 채워진 칸(과거에 이 함수가 채웠든, 사람이
+    수기로 고쳤든)은 절대 덮어쓰지 않는다 - 이 시트는 사람이 직접 편집하는
+    정리본이므로, 자동화가 매 실행마다 수기 수정 내용을 지우면 안 된다."""
+    idx = {
+        name: COLUMN_ORDER.index(name)
+        for name in ("파일ID", "업로더", "뒷면여부", "촬영시각", "원문텍스트", "제품명(한국어)", "정리본위치")
+    }
+    columns = {name: sheet.col_values(i + 1)[1:] for name, i in idx.items()}
+    row_count = len(columns["파일ID"])
+    for name in columns:
+        if len(columns[name]) < row_count:
+            columns[name] += [""] * (row_count - len(columns[name]))
+
+    entries = []
+    for i in range(row_count):
+        file_id = columns["파일ID"][i]
+        if not file_id:
+            continue
+        capture_time = None
+        raw_time = columns["촬영시각"][i]
+        if raw_time:
+            try:
+                capture_time = datetime.datetime.strptime(raw_time, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                capture_time = None
+        entries.append({
+            "file_id": file_id,
+            "uploader": columns["업로더"][i],
+            "capture_time": capture_time,
+            "is_back": columns["뒷면여부"][i] == "뒷면",
+            "text": columns["원문텍스트"][i],
+            "product_name": columns["제품명(한국어)"][i],
+            "position": columns["정리본위치"][i],
+        })
+    by_id = {e["file_id"]: e for e in entries}
+    matches = match_card_back_pairs(entries)
+
+    candidates = []  # (셀주소, 값)
+    for card in entries:
+        if card["is_back"] or not card["position"]:
+            continue
+        back_ids = matches.get(card["file_id"], [])
+        back_text = "\n".join(by_id[bid]["text"] for bid in back_ids if bid in by_id)
+        if not back_text:
+            continue
+        m = re.match(r"^([A-Z]+)(\d+)$", card["position"])
+        if not m:
+            continue
+        col, title_row = m.group(1), int(m.group(2))
+        sourcing, origin = determine_sourcing(card["product_name"], retailer, back_text)
+        sourcing_row = title_row + CATEGORY_ROW_LABELS.index("소싱형태") + 1
+        origin_row = title_row + CATEGORY_ROW_LABELS.index("병입원산지") + 1
+        candidates.append((f"{col}{sourcing_row}", sourcing))
+        candidates.append((f"{col}{origin_row}", origin))
+
+    candidates = [(cell, value) for cell, value in candidates if value]
+    if not candidates:
+        return 0
+
+    current = category_sheet.batch_get([cell for cell, _ in candidates])
+    updates = []
+    for (cell, value), grid in zip(candidates, current):
+        existing = grid[0][0] if grid and grid[0] else ""
+        if not existing:
+            updates.append({"range": cell, "values": [[value]]})
+    if updates:
+        category_sheet.batch_update(updates, value_input_option="USER_ENTERED")
     return len(updates)
 
 
@@ -1901,7 +2148,11 @@ def run_once():
     # 처리가 다 끝난 뒤 단일 스레드로 한 번에 처리한다.
     for retailer, row_dicts in processed_row_dicts.items():
         try:
-            update_category_sheet(category_sheets[retailer], row_dicts)
+            positions = update_category_sheet(category_sheets[retailer], row_dicts)
+            # 방금 만든 칸의 위치를 RAW 시트에 남겨둔다 - 뒷면 사진이 나중에
+            # (심지어 다음 실행 회차에) 도착했을 때 그 칸을 다시 찾아 소싱형태/
+            # 병입원산지를 채우려면 필요하다 (sync_back_sourcing 참고).
+            _write_category_positions(sheets[retailer], positions)
         except Exception as e:
             print(f"경고: {retailer} 제품군정리 시트 갱신 실패 (원본 시트 기록은 정상 완료됨): {e}")
 
@@ -1917,6 +2168,14 @@ def run_once():
                 print(f"  {retailer}: 앞뒤 매칭 {updated}건 반영(과거 실행분 포함)")
         except Exception as e:
             print(f"경고: {retailer} 앞뒤 매칭 반영 실패 (원본 시트 기록은 정상 완료됨): {e}")
+        # 앞뒤 매칭이 갱신된 뒤에 소싱형태/병입원산지를 반영해야, 이번 실행에서
+        # 막 매칭된 카드<->뒷면 쌍도 바로 반영된다.
+        try:
+            filled = sync_back_sourcing(sheet, category_sheets[retailer], retailer)
+            if filled:
+                print(f"  {retailer}: 소싱형태/병입원산지 {filled}건 반영")
+        except Exception as e:
+            print(f"경고: {retailer} 소싱형태/병입원산지 반영 실패 (원본 시트 기록은 정상 완료됨): {e}")
 
     print(f"\n완료: {success_count}건 성공, {len(failed)}건 실패")
     if failed:
