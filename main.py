@@ -449,6 +449,12 @@ def _defer_offcolumn_price_tokens(positioned):
 _CLUSTER_GAP_RATIO = 1.2      # 이 배수 이상 벌어지면서 색도 다르면 분리
 _CLUSTER_COLOR_DISTANCE = 60  # RGB 유클리드 거리 기준
 _CLUSTER_MIN_SATURATION = 0.15  # 이 미만이면 무채색(흰/회/검)으로 간주
+# 무채색 두 개라도 밝기 차이가 이 값을 넘으면(예: 거의 검정 vs 거의 흰색)
+# 조명 차이로 보지 않는다 - 실사진(진열대 위 다른 상품의 검은 스펙 안내판
+# 배경 vs 그 아래 흰 코스트코 태그)에서 확인된 실제 밝기차보다 한참 위,
+# 같은 흰 태그 안의 그림자/글레어로 확인된 밝기차(최대 약 90)보다는 한참
+# 아래로 잡아서 두 경우를 가른다.
+_CLUSTER_MAX_SHADOW_BRIGHTNESS_GAP = 130
 
 
 def _orient_image_to_match(image, expected_width, expected_height):
@@ -502,11 +508,27 @@ def _saturation(c):
     return (mx - mn) / mx if mx else 0.0
 
 
+def _brightness(c):
+    return sum(c) / 3
+
+
 def _is_different_background(c1, c2):
     """유클리드 거리만으로는 흰 가격표 위의 밝기 차이(그림자/글레어)와 실제로
     다른 색 물체를 구분하지 못한다 - 둘 다 채도가 낮으면(무채색이면) 거리가
-    아무리 커도 조명 차이일 뿐 다른 물체가 아니라고 본다."""
-    if _saturation(c1) < _CLUSTER_MIN_SATURATION and _saturation(c2) < _CLUSTER_MIN_SATURATION:
+    아무리 커도 조명 차이일 뿐 다른 물체가 아니라고 본다.
+
+    다만 무채색이라는 것만으로 전부 조명 차이로 넘기면 안 된다 - 진열대 위
+    다른 상품(예: 조명 스펙을 검은 바탕에 흰 글씨로 안내하는 판)이 바로
+    위/옆에 찍히면, 그 검은 배경과 이 카드의 흰 배경도 둘 다 "무채색"이지만
+    실제로는 완전히 다른 두 물체다(실사진에서 확인됨 - TAPO 카메라 태그
+    바로 위 다른 상품의 검은 스펙 안내판). 이런 경우는 밝기 차이 자체가
+    그림자/글레어로 설명 가능한 범위를 훨씬 넘어서므로(거의 검정 vs 거의
+    흰색), 무채색이어도 밝기 차이가 너무 크면 다른 물체로 본다."""
+    achromatic = (
+        _saturation(c1) < _CLUSTER_MIN_SATURATION
+        and _saturation(c2) < _CLUSTER_MIN_SATURATION
+    )
+    if achromatic and abs(_brightness(c1) - _brightness(c2)) <= _CLUSTER_MAX_SHADOW_BRIGHTNESS_GAP:
         return False
     return _color_distance(c1, c2) >= _CLUSTER_COLOR_DISTANCE
 
@@ -635,7 +657,10 @@ WEIGHT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 PRICE_LINE_PATTERN = re.compile(r"^(\d{1,3}(?:,\d{3})+)\s*\S{0,2}$")
-DISCOUNT_LINE_PATTERN = re.compile(r"^-\s?[\d,]+\s*원?$")
+# 할인액 앞의 "-"도 Azure가 en dash(–)/em dash(—)/마이너스 기호(−)로 잘못
+# 읽을 수 있어(모양이 거의 같음) 같이 받는다 - 안 받으면 할인액 줄이
+# 셀링포인트 불릿으로 잘못 채택될 위험이 있다.
+DISCOUNT_LINE_PATTERN = re.compile(r"^[-–—−]\s?[\d,]+\s*원?$")
 
 
 def _find_discount_amount(lines):
@@ -689,13 +714,33 @@ UNIT_PRICE_PATTERN = re.compile(
     r"(\d+(?:\.\d+)?\s*(?:g|ml|kg|l|m)?)\s*당\s*([\d,]+)\s*원", re.IGNORECASE
 )
 
+# "392원/개", "233원/100 ml"처럼 "단가"라는 글자도, "~당~원" 문구도 없이
+# 그냥 "금액원/단위" 형태로 한 줄에 통째로 찍히는 세제류 카드도 있다. 같은
+# 정보를 "1개당"/"1회당"처럼 두 단위로 중복 표기해서 이런 줄이 두 개 나오는
+# 경우도 실사진에서 확인됐다("392원/개"와 "392원/회") - 카드에 먼저(=더
+# 위쪽에) 인쇄된 줄을 대표값으로 쓴다.
+_STANDALONE_UNIT_PRICE_RE = re.compile(r"^([\d,]+)\s*원\s*/\s*(.+)$")
+
+
+def _find_standalone_unit_price(lines: list) -> str:
+    for line in lines:
+        m = _STANDALONE_UNIT_PRICE_RE.match(line)
+        if m:
+            unit = m.group(2).replace(" ", "")
+            return f"{m.group(1)}원/{unit}"
+    return ""
+
+
 # 건강기능식품류는 무게(g/ml/kg 등) 대신 "80포", "180정", "1,000MG × 180정"처럼
 # 개수만으로 규격을 나타내는 경우가 많다 - WEIGHT_PATTERN이 다루는 단위가 아니라
 # 지금까지는 그냥 제품명에 붙은 채로 남아있었다. "정"을 OCR이 "적"으로 잘못
-# 읽는 경우가 실제로 있어서("112적") 같이 받아준다. "입"(개당 낱개 수를 세는
-# 아주 흔한 단위, "3입"/"12입"/"6입")도 마찬가지라 같이 받는다.
+# 읽는 경우가 실제로 있어서("112적") 같이 받아준다. "입"/"매"(개당 낱개 수를
+# 세는 아주 흔한 단위, "3입"/"12입"/"6입", "145매")도 마찬가지라 같이 받는다.
+# "30캡슐× 3EA"처럼 개수 단위 뒤에 "× 3EA"류 배수 표기가 한 번 더 붙는
+# 경우도 있어("캡슐개수 × 낱개묶음수"), 있으면 그 배수까지 통째로 포함한다.
 _TRAILING_COUNT_RE = re.compile(
-    r"((?:[\d,]+\s*(?:MG|mg|G|g)\s*[×xX]\s*)?\d{1,4}\s*(?:정|적|캡슐|포|병|팩|롤|입))\s*$"
+    r"((?:[\d,]+\s*(?:MG|mg|G|g)\s*[×xX]\s*)?\d{1,4}\s*(?:정|적|캡슐|포|병|팩|롤|입|매)"
+    r"(?:\s*[×xX*]\s*\d+\s*(?:EA|ea|Ea|개)?)?)\s*$"
 )
 
 # "쉬크 하이드로5 스킨 프로텍트 기*2+날*14", "질레트 프로글라이드 파워
@@ -845,7 +890,11 @@ def _is_skippable_interleaved_noise(line: str) -> bool:
 # 내용과 뒤섞인다. 그래서 우선순위를 둔다: "-•·"만으로 뭔가 찾아지면 그걸로
 # 끝내고, 하나도 못 찾을 때만 "▶"를 추가해서 다시 시도하고, 그래도 없으면
 # "*"까지 추가해서 마지막으로 시도한다.
-_BULLET_MARKER_TIERS = ("-•·", "-•·▶", "-•·▶*")
+# 인쇄된 하이픈을 Azure가 en dash(–)/em dash(—)/마이너스 기호(−)로 잘못
+# 읽는 경우도 있다 - 사람 눈엔 다 "-"로 보이는 모양이 거의 같은 글자들이라
+# 첫 등급부터 같이 받는다(예전 등급에 없어서 이런 사진은 셀링포인트가 통째로
+# 안 뽑히는 문제가 있었다).
+_BULLET_MARKER_TIERS = ("-–—−•·", "-–—−•·▶", "-–—−•·▶*")
 
 
 def _extract_selling_points_with_markers(lines, markers):
@@ -1010,6 +1059,14 @@ def parse_price_fields(text: str) -> dict:
          파편이 섞여 들어간 구간은 이 기준으로 걸러진다.
       3) 그래도 동점이면 가장 먼저 나온 구간(대개 사진이 겨냥한 목표 가격표)을
          채택한다.
+
+    실사진에서 확인된 함정: 진짜 카드 뒤쪽(제품 포장 자체의 장식 문구 등)에
+    우연히 숫자 4~8자리처럼 보이는 잡음이 하나 더 있으면, 그 잡음이 "다음
+    코드"로 오인되어 진짜 카드의 구간을 정가 줄 도달 전에 끊어버린다. 실제
+    카드는 항상 "코드 -> ... -> 단가 -> 정가" 순서이므로, 구간 안에 "단가"
+    문구가 이미 나왔는데 아직 정가(콤마 가격 줄)를 못 찾았다면 다음 코드
+    후보 하나쯤은 진짜 코드가 아니라 잡음일 가능성이 높다고 보고 구간을
+    그 다음 경계까지 넓힌다 - 그래야 뒤에 이어지는 진짜 정가를 놓치지 않는다.
     """
     lines = [l.strip() for l in text.split("\n") if l.strip()]
     code_indices = [i for i, l in enumerate(lines) if _normalize_bare_code(l)]
@@ -1019,7 +1076,15 @@ def parse_price_fields(text: str) -> dict:
 
     best_fields, best_score = None, None
     for idx, code_i in enumerate(code_indices):
-        end = code_indices[idx + 1] if idx + 1 < len(code_indices) else len(lines)
+        end_idx = idx + 1
+        end = code_indices[end_idx] if end_idx < len(code_indices) else len(lines)
+        while (
+            end_idx < len(code_indices)
+            and any("단가" in lines[k] for k in range(code_i, end))
+            and not any(PRICE_LINE_PATTERN.match(lines[k]) for k in range(code_i, end))
+        ):
+            end_idx += 1
+            end = code_indices[end_idx] if end_idx < len(code_indices) else len(lines)
         segment_fields = _parse_fields_from_lines(lines[code_i:end])
         name = segment_fields.get("제품명(한국어)") or ""
         base = (1 if name else 0) + (1 if segment_fields.get("가격") else 0)
@@ -1186,6 +1251,10 @@ def _parse_fields_from_lines(lines: list) -> dict:
         if unit_price_match:
             unit = unit_price_match.group(1).replace(" ", "")
             result["단가"] = f"{unit_price_match.group(2)}원/{unit}"
+    if not result["단가"]:
+        # "단가"라는 글자도 "~당~원" 문구도 없이 "392원/개"처럼 통째로 한 줄에
+        # 찍히는 경우도 있다.
+        result["단가"] = _find_standalone_unit_price(lines)
 
     # 가격은 "12,990원"처럼 천단위 콤마가 있는 큰 금액이다. Azure OCR이 "원" 글자를
     # 가끔 다른 문자(예: "z")로 잘못 읽는 경우가 있어("7,990z"), "원" 글자 자체보다
@@ -1300,6 +1369,8 @@ def parse_traders_fields(text: str) -> dict:
     if danga_match:
         unit = danga_match.group(1).replace(" ", "")
         result["단가"] = f"{danga_match.group(2)}원/{unit}"
+    if not result["단가"]:
+        result["단가"] = _find_standalone_unit_price(lines)
 
     code_idx = None
     for i, line in enumerate(lines):
