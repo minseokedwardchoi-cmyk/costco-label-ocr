@@ -1132,10 +1132,17 @@ _PB_NAME_PATTERN = re.compile(
     r"[Tt]\s*[Ss]tandard|티\s*스탠다드|[Kk]irkland|커클랜드", re.IGNORECASE
 )
 
-_ENTITY_SUFFIX = r"(?:원|자|처|업자|업체|회사|사)"
-# "수입판매업소"는 코스트코/이마트 라벨에 흔한 표현인데 위 공용 접미사
-# 목록만으로는 못 잡으므로("수입"+"판매업소"), 수입 쪽에 별도로 붙여준다.
-_IMPORTER_LABEL_PATTERN = re.compile(rf"수입\s*(?:{_ENTITY_SUFFIX}|판매업소)")
+_ENTITY_SUFFIX = r"(?:원|자|처|업자|업체|업소|회사|사)"
+# 실사진에서 확인된 "수입" 라벨 표기가 다양하다: "수입업소"(가장 흔함, "판매"
+# 없이 바로 업소), "수입판매원"/"수입 판매원"(수입과 접미사 사이에 "판매"가
+# 낀 경우 - P&G/LG생활건강 라벨에 흔함), "수입 및 판매업소", "수입판매책임업자"
+# 등. "수입" 바로 뒤에 접미사가 오는 경우만 인정하면 이런 변형들을 다 놓친다.
+# "및"/가운뎃점/"판매"/"책임" 같은 흔한 연결어가 중간에 끼어도 인정하되,
+# "공식 수입 업체인" 같은 마케팅 문장(진짜 라벨이 아님)까지 걸리지 않도록
+# 연결어 목록은 실제 라벨에서 확인된 것들로만 한정한다.
+_IMPORTER_LABEL_PATTERN = re.compile(
+    rf"수입\s*(?:및\s*)?(?:[·・]\s*)?(?:판매\s*)?(?:책임\s*)?(?:{_ENTITY_SUFFIX}|판매업소)"
+)
 _MANUFACTURER_LABEL_PATTERN = re.compile(rf"(?:화장품)?제조\s*{_ENTITY_SUFFIX}")
 # 라벨 뒤에 붙은 값을 어디까지 읽을지 정하는 경계 - 다음 항목 라벨(제조/판매/
 # 수입/유통/공급 계열, 원산지/제조국)이 나오거나, 줄바꿈/불릿/대괄호가 나오면
@@ -1159,6 +1166,12 @@ _COUNTRY_NAMES_KO = (
     "영국", "스위스", "네덜란드", "벨기에", "폴란드", "캐나다", "멕시코", "브라질",
     "호주", "뉴질랜드", "튀르키예", "스웨덴", "노르웨이", "덴마크", "핀란드",
     "칠레", "아르헨티나", "러시아",
+    # 실사진에서 확인된, 기존 목록에 없던 원산지들 - 그리스(비판톨 더마
+    # 바디로션), 콜롬비아(아이보리 젠틀바 오리지널향) 등. 유럽/중남미 쪽으로
+    # 흔히 나올만한 나라를 몇 개 더 보강했다.
+    "그리스", "콜롬비아", "포르투갈", "오스트리아", "아일랜드", "체코",
+    "헝가리", "이스라엘", "이집트", "싱가포르", "남아프리카공화국", "페루",
+    "에콰도르", "크로아티아",
 )
 _COUNTRY_EN_TO_KO = {
     "ITALY": "이탈리아", "CHINA": "중국", "USA": "미국", "AMERICA": "미국",
@@ -1169,7 +1182,10 @@ _COUNTRY_EN_TO_KO = {
     "POLAND": "폴란드", "CANADA": "캐나다", "MEXICO": "멕시코", "BRAZIL": "브라질",
     "AUSTRALIA": "호주", "TURKEY": "튀르키예", "SWEDEN": "스웨덴", "NORWAY": "노르웨이",
     "DENMARK": "덴마크", "FINLAND": "핀란드", "INDIA": "인도", "UK": "영국",
-    "ENGLAND": "영국",
+    "ENGLAND": "영국", "GREECE": "그리스", "COLOMBIA": "콜롬비아",
+    "PORTUGAL": "포르투갈", "AUSTRIA": "오스트리아", "IRELAND": "아일랜드",
+    "ISRAEL": "이스라엘", "EGYPT": "이집트", "SINGAPORE": "싱가포르",
+    "PERU": "페루", "ECUADOR": "에콰도르", "CROATIA": "크로아티아",
 }
 
 _COSTCO_CHAIN_KEYWORDS = ("코스트코",)
@@ -1211,12 +1227,34 @@ def parse_sourcing_fields(text: str) -> dict:
     }
 
 
+def _country_in(text: str) -> str:
+    """text 안에서 알려진 국가명(한글 또는 영문)을 찾아 한글로 돌려준다.
+    여러 개 있으면 가장 뒤에 나오는 것을 우선한다 - 주소는 보통 끝에
+    국가명을 적으므로("...신시내티, 오하이오주, 미국"), 앞쪽에 우연히 섞인
+    지명/사명보다 뒤쪽 값이 실제 원산지일 가능성이 높다. 하나도 없으면
+    빈 문자열."""
+    candidates = []
+    for c in _COUNTRY_NAMES_KO:
+        pos = text.rfind(c)
+        if pos != -1:
+            candidates.append((pos, c))
+    for en, ko in _COUNTRY_EN_TO_KO.items():
+        for em in re.finditer(rf"\b{en}\b", text, re.IGNORECASE):
+            candidates.append((em.start(), ko))
+    if not candidates:
+        return ""
+    candidates.sort()
+    return candidates[-1][1]
+
+
 def extract_origin(text: str) -> str:
     """뒷면 텍스트에서 병입원산지(제조국)를 뽑는다. 우선순위: ① "원산지:"/
-    "제조국:" 같은 명시적 라벨 -> ② "Made in X" -> ③ 그 외엔 제조자/제조원
-    표기 근처에서 국가명을 찾는다(뒷면 라벨은 보통 주소 맨 끝에 국가명을
-    붙인다 - 예: "...스테다프로핀셜 이스트세시아 이탈리아"). 아무 것도 못
-    찾으면 빈 문자열(수기 확인 필요)을 돌려준다."""
+    "제조국:" 같은 명시적 라벨(값이 한글) -> ② 제조자/제조원 라벨 바로 뒤
+    주소에서 국가명을 찾음(라벨은 있는데 값이 영문 회사명+주소로만 끝나는
+    경우가 실사진에서 많이 확인됨 - "Colgate Sanxiao co., Ltd... China.",
+    "Johnson & Johnson (Thailand) Limited...BANGKOK, THAILAND") -> ③ "Made
+    in X" -> ④ 그 외엔 텍스트 전체에서 국가명을 찾는다. 아무 것도 못 찾으면
+    빈 문자열(수기 확인 필요)을 돌려준다."""
     m = _ORIGIN_LABEL_PATTERN.search(text)
     if m:
         value = m.group(1)
@@ -1227,10 +1265,25 @@ def extract_origin(text: str) -> str:
         # 줄로 넘어간 경우) 이 라벨 매치를 신뢰하지 않고 아래 다른 방식으로
         # 계속 찾는다. _COUNTRY_NAMES_KO 목록에 없는 나라(예: 콜롬비아)도
         # 실제 라벨 값이면 그대로 믿는다 - 목록은 라벨이 아예 없을 때 쓰는
-        # ③번 폴백 전용이라, 여기서 목록에 없다고 버리면 라벨이 명확히 있는
+        # 폴백 전용이라, 여기서 목록에 없다고 버리면 라벨이 명확히 있는
         # 값을 오히려 못 믿게 되는 역효과가 난다.
         if len(value) >= 2:
             return value
+
+    # "원산지"/"제조국" 라벨 자체가 없거나 값이 한글이 아니어서(예: "[국외
+    # 제조업소 및 원산지] Colgate Sanxiao co., Ltd... China.") 위에서 못
+    # 찾았으면, 제조자/제조원 라벨 바로 뒤 주소(보통 다음 한두 줄)에서
+    # 국가명을 찾는다. 다른 라벨(수입자/판매자 등)이 이어지면 거기서 끊어서
+    # 엉뚱한 뒤쪽 항목의 국가명을 잘못 줍지 않게 한다.
+    mfr_match = _MANUFACTURER_LABEL_PATTERN.search(text)
+    if mfr_match:
+        window = text[mfr_match.end():mfr_match.end() + 200]
+        boundary = re.search(r"[\[•▪]|" + _BACK_LABEL_MANUFACTURER_PATTERN.pattern, window)
+        if boundary:
+            window = window[:boundary.start()]
+        found = _country_in(window)
+        if found:
+            return "국내" if found in ("대한민국", "한국") else found
 
     m = _MADE_IN_PATTERN.search(text)
     if m:
@@ -1238,10 +1291,9 @@ def extract_origin(text: str) -> str:
         if mapped:
             return "국내" if mapped == "대한민국" else mapped
 
-    found = [c for c in _COUNTRY_NAMES_KO if c in text]
+    found = _country_in(text)
     if found:
-        last = max(found, key=lambda c: text.rfind(c))
-        return "국내" if last in ("대한민국", "한국") else last
+        return "국내" if found in ("대한민국", "한국") else found
 
     return ""
 
