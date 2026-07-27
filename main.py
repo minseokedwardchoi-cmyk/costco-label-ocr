@@ -784,21 +784,24 @@ def _normalize_bare_code(line: str) -> str:
 # 구분할 수 없고, 내용을 봐야 한다. 실사진 두 장(도브 뷰티 크림바 뒷면 vs
 # 상품카드) 비교로 확인한 두 조건을 그대로 쓴다:
 #   1) 가격(콤마 형식 판매가 줄)이 아예 없다 - 상품카드엔 반드시 있다.
-#   2) 제조원/판매업자류 문구가 있다 - 뒷면엔 법적 표기로 항상 있고,
-#      상품카드엔 나오지 않는다.
+#   2) 제조/판매/수입하는 기업 표기가 있다 - 뒷면엔 법적 표기로 항상 있고,
+#      상품카드엔 나오지 않는다. 다만 이 표기의 용어는 적용 법령(화장품법/
+#      식품위생법/생활화학제품법 등)마다 제각각이라(화장품책임판매업자,
+#      식품제조업자, 제조원/판매원, 생활화학제품의 제조자/판매자/수입자 등)
+#      개별 단어를 나열하는 대신 (제조/판매/수입/유통/공급) + (원/자/처/업자/
+#      업체/회사/사) 조합을 통째로 잡는다.
 # 두 조건이 "그리고"(AND)로 다 맞아야 뒷면으로 판단한다 - Azure가 상품카드의
 # 가격 줄만 어쩌다 놓쳐도(이번 세션에서 실제로 있었던 문제), 그 카드엔
-# 제조원류 문구 자체가 없으므로 조건 2에서 걸러져 오분류를 막아준다.
-_BACK_LABEL_MANUFACTURER_KEYWORDS = (
-    "제조원", "판매원", "판매업자", "유통업자", "수입원",
-    "화장품책임판매업자", "식품제조업자", "제조판매업자",
+# 기업 표기 자체가 없으므로 조건 2에서 걸러져 오분류를 막아준다.
+_BACK_LABEL_MANUFACTURER_PATTERN = re.compile(
+    r"(?:제조|판매|수입|유통|공급)(?:원|자|처|업자|업체|회사|사)"
 )
 
 
 def is_back_label(lines: list) -> bool:
     has_price_line = any(PRICE_LINE_PATTERN.match(l) for l in lines)
     has_manufacturer_info = any(
-        kw in line for line in lines for kw in _BACK_LABEL_MANUFACTURER_KEYWORDS
+        _BACK_LABEL_MANUFACTURER_PATTERN.search(line) for line in lines
     )
     return not has_price_line and has_manufacturer_info
 
