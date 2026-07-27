@@ -669,8 +669,17 @@ def _select_regular_price(prices, discount):
 # "포"처럼 짧은 수량 표시만 더 있고 그걸로 줄이 끝나면, 그 지점부터를 전부
 # 중량 쪽으로 떼어낸다. "1L(퓨어)"처럼 단위 뒤에 짧은 괄호 설명만 붙는 경우도
 # 마찬가지로 허용한다.
+#
+# "츠바키 ... 180g*2+리필 150g+펌프"처럼, 중량 조각 사이/뒤에 "리필"/"펌프"
+# 같은 짧은 한글 설명이 끼어드는 콤보도 실사진에서 확인됐다 - 단순 접속기호
+# (+,x,×)만 허용하던 기존 이음새로는 이 한글 단어에서 막혀 버렸다. 이음새에
+# 곱셈 배수(*2 등)와 짧은 한글 단어(4자 이하)를 같이 허용해서, 중량 조각들
+# 사이(뒤에서 볼 때는 앞으로 병합, 앞에서 볼 때는 뒤로 확장) 모두에 쓴다.
+_SPEC_JOIN_RE = r"(?:[*xX×]\s*\d+)?[\s+xX×,]*[가-힣]{0,4}[\s+xX×,]*"
+
 _TRAILING_QUANTITY_RE = re.compile(
-    r"^[\sx×X*]*\d*\s*(개|포|입|병|팩|ea|EA|Ea)?\.?\s*(\([^)]{1,10}\))?$"
+    r"^[\sx×X*]*\d*\s*(개|포|입|병|팩|ea|EA|Ea)?\.?\s*(\([^)]{1,10}\))?"
+    r"(?:" + _SPEC_JOIN_RE + r")*$"
 )
 
 # "100g당 899원"처럼 "단가"라는 글자 없이 "N단위당 M원" 형태로만 찍히는 경우도
@@ -680,19 +689,51 @@ UNIT_PRICE_PATTERN = re.compile(
     r"(\d+(?:\.\d+)?\s*(?:g|ml|kg|l|m)?)\s*당\s*([\d,]+)\s*원", re.IGNORECASE
 )
 
+# 건강기능식품류는 무게(g/ml/kg 등) 대신 "80포", "180정", "1,000MG × 180정"처럼
+# 개수만으로 규격을 나타내는 경우가 많다 - WEIGHT_PATTERN이 다루는 단위가 아니라
+# 지금까지는 그냥 제품명에 붙은 채로 남아있었다. "정"을 OCR이 "적"으로 잘못
+# 읽는 경우가 실제로 있어서("112적") 같이 받아준다. "입"(개당 낱개 수를 세는
+# 아주 흔한 단위, "3입"/"12입"/"6입")도 마찬가지라 같이 받는다.
+_TRAILING_COUNT_RE = re.compile(
+    r"((?:[\d,]+\s*(?:MG|mg|G|g)\s*[×xX]\s*)?\d{1,4}\s*(?:정|적|캡슐|포|병|팩|롤|입))\s*$"
+)
+
+# "쉬크 하이드로5 스킨 프로텍트 기*2+날*14", "질레트 프로글라이드 파워
+# (면도기1+날8)"처럼, 무게 단위도 개수 단위도 아니라 "부품명+숫자"를 "+"로
+# 이어 붙인 구성품 목록으로 규격을 나타내는 카드도 실사진에서 확인됐다(면도기
+# 종류에 많음 - 손잡이/면도날처럼 세트 구성이 다양해서). 앞의 두 방식(무게/
+# 개수 단위)으로 못 걸러지므로 별도 패턴이 필요하다. 부품명 하나짜리는(예:
+# 제품명 끝의 우연한 "숫자") 오탐 위험이 있어 최소 두 조각(부품+숫자가 "+"로
+# 두 번 이상) 이어진 경우만 인정한다.
+_COMPONENT_COMBO_RE = re.compile(
+    r"(?:^|\s)([가-힣]{1,4}\*?\d{1,3}(?:\s*\+\s*[가-힣]{1,4}\*?\d{1,3})+)\s*$"
+)
+
+
+def _is_spec_combo(text: str) -> bool:
+    """중량/개수/구성 콤보 규격 중 하나에라도 해당하는지 확인한다. 괄호로
+    통째로 감싸인 규격 표기를 뗄 때, 안의 내용이 어떤 종류의 규격이든 다
+    인식하기 위해 세 가지를 한 번에 확인한다."""
+    text = text.strip()
+    return bool(
+        WEIGHT_PATTERN.search(text)
+        or _TRAILING_COUNT_RE.fullmatch(text)
+        or _COMPONENT_COMBO_RE.fullmatch(text)
+    )
+
 
 def _split_trailing_weight(name: str) -> tuple:
     """제품명 문자열 끝에 중량이 붙어있으면 (중량 뗀 제품명, 중량)을 돌려주고,
     없으면 (원래 이름, "")을 그대로 돌려준다."""
     # "에어프라이어 4L+1.5L"처럼 규격 전체가 괄호로 감싸인 채 나오는 경우가
     # 아니라, "(48g * 12입)"처럼 규격 표기 전체가 괄호 하나로 감싸인 채 붙는
-    # 경우도 있다. 괄호 안에 중량 패턴이 있으면 괄호 전체를 그대로 중량으로
-    # 떼어낸다 - 안에서 "48g * 12입"처럼 콤보로 이어져도 낱개로 다시 쪼갤
-    # 필요 없이 그대로 살린다. (괄호 안에 중량이 없는 "1L(퓨어)" 같은 경우는
-    # 여기 해당 없이 아래 일반 로직으로 넘어간다.)
+    # 경우도 있다. 괄호 안이 어떤 종류든 규격으로 인식되면 괄호 전체를 중량
+    # 자리로 떼어낸다 - 괄호(와 안의 콤보 구조)는 버리고 내용만 남긴다.
+    # (괄호 안에 규격이 없는 "1L(퓨어)" 같은 경우는 여기 해당 없이 아래 일반
+    # 로직으로 넘어간다.)
     paren_match = re.search(r"\(([^()]*)\)\s*$", name)
-    if paren_match and WEIGHT_PATTERN.search(paren_match.group(1)):
-        return name[:paren_match.start()].strip(), name[paren_match.start():].strip()
+    if paren_match and _is_spec_combo(paren_match.group(1)):
+        return name[:paren_match.start()].strip(), paren_match.group(1).strip()
 
     matches = list(WEIGHT_PATTERN.finditer(name))
     if not matches:
@@ -702,26 +743,17 @@ def _split_trailing_weight(name: str) -> tuple:
     if not _TRAILING_QUANTITY_RE.match(rest):
         return name, ""
     start = last.start()
-    # "에어프라이어 4L+1.5L"처럼 콤보 규격이 "+" 같은 짧은 연결자로 이어진
-    # 경우, 맨 뒤 조각("1.5L")만 떼면 앞 조각("4L")을 잃어버린다. 바로 앞
-    # 중량 조각과의 사이가 연결자뿐이면 그 조각까지 같이 묶어서 중량으로
-    # 인정한다.
+    # "에어프라이어 4L+1.5L"처럼 콤보 규격이 "+" 같은 짧은 연결자(+ 곱셈 배수,
+    # + 짧은 한글 설명)로 이어진 경우, 맨 뒤 조각("1.5L")만 떼면 앞 조각
+    # ("4L")을 잃어버린다. 바로 앞 중량 조각과의 사이가 이음새뿐이면 그
+    # 조각까지 같이 묶어서 중량으로 인정한다.
     for prev in reversed(matches[:-1]):
         gap = name[prev.end():start]
-        if re.fullmatch(r"[\s+xX×,]{1,3}", gap):
+        if re.fullmatch(_SPEC_JOIN_RE, gap):
             start = prev.start()
         else:
             break
     return name[:start].strip(), name[start:].strip()
-
-
-# 건강기능식품류는 무게(g/ml/kg 등) 대신 "80포", "180정", "1,000MG × 180정"처럼
-# 개수만으로 규격을 나타내는 경우가 많다 - WEIGHT_PATTERN이 다루는 단위가 아니라
-# 지금까지는 그냥 제품명에 붙은 채로 남아있었다. "정"을 OCR이 "적"으로 잘못
-# 읽는 경우가 실제로 있어서("112적") 같이 받아준다.
-_TRAILING_COUNT_RE = re.compile(
-    r"((?:[\d,]+\s*(?:MG|mg|G|g)\s*[×xX]\s*)?\d{1,4}\s*(?:정|적|캡슐|포|병|팩|롤))\s*$"
-)
 
 
 def _split_trailing_count(name: str) -> tuple:
@@ -731,6 +763,37 @@ def _split_trailing_count(name: str) -> tuple:
     if not m:
         return name, ""
     return name[:m.start()].strip(), m.group(1).strip()
+
+
+def _split_trailing_component_combo(name: str) -> tuple:
+    """제품명 문자열 끝에 "부품명+숫자"를 "+"로 이어 붙인 구성품 목록(무게도
+    개수 단위도 아닌 규격)이 붙어있으면 (규격 뗀 제품명, 규격)을 돌려주고,
+    없으면 (원래 이름, "")을 그대로 돌려준다."""
+    m = _COMPONENT_COMBO_RE.search(name)
+    if not m:
+        return name, ""
+    return name[:m.start(1)].strip(), m.group(1).strip()
+
+
+# "덴티스테 플러스 화이트 치약 세트" 같은 세트 상품은 제품명 자체엔 규격이
+# 전혀 안 붙고, 대신 셀링포인트 줄에 "- 구성: 치약 160g*2+60g*1+20g*2"처럼
+# 별도로 규격이 나온다 - 위 세 방법은 전부 제품명 문자열 끝에서만 찾으므로
+# 이 경우를 못 잡는다. "구성:" 문구가 있는 줄을 따로 찾아서 그 안에서
+# 중량 패턴이 시작하는 지점부터 끝까지를 규격으로 본다("치약" 같은 품목명
+# 접두어는 중량이 없는 부분이라 자연히 잘려나간다).
+_COMPOSITION_LABEL_RE = re.compile(r"구성\s*[:：]\s*(.+)$")
+
+
+def _find_composition_spec(lines: list) -> str:
+    for line in lines:
+        m = _COMPOSITION_LABEL_RE.search(line)
+        if not m:
+            continue
+        content = m.group(1).strip()
+        spec_match = WEIGHT_PATTERN.search(content)
+        if spec_match:
+            return content[spec_match.start():].strip()
+    return ""
 
 
 # "신세계포인트", "Global Product", "적립", "행사기간"처럼 셀링포인트 문구가
@@ -1175,6 +1238,19 @@ def _parse_fields_from_lines(lines: list) -> dict:
         if trailing_count:
             result["제품명(한국어)"] = cleaned_name
             result["중량"] = trailing_count
+    # 무게도 개수 단위도 아니라 "부품명+숫자" 구성품 목록으로 규격을 나타내는
+    # 카드("기*2+날*14", "면도기1+날8")도 마찬가지로 보정한다.
+    if not result["중량"] and result["제품명(한국어)"]:
+        cleaned_name, trailing_combo = _split_trailing_component_combo(result["제품명(한국어)"])
+        if trailing_combo:
+            result["제품명(한국어)"] = cleaned_name
+            result["중량"] = trailing_combo
+    # 세트 상품은 제품명 자체엔 규격이 안 붙고 "- 구성: 치약 160g*2+60g*1+20g*2"
+    # 처럼 별도 셀링포인트 줄에 규격이 나오기도 한다. 위 세 방법 다 제품명
+    # 문자열 끝에서만 찾으므로 이 경우를 못 잡는다 - 마지막으로 "구성:" 문구가
+    # 있는 줄을 뒤진다.
+    if not result["중량"]:
+        result["중량"] = _find_composition_spec(lines)
 
     return result
 
@@ -1273,6 +1349,13 @@ def parse_traders_fields(text: str) -> dict:
         if trailing_count:
             result["제품명(한국어)"] = cleaned_name
             result["중량"] = trailing_count
+    if not result["중량"] and result["제품명(한국어)"]:
+        cleaned_name, trailing_combo = _split_trailing_component_combo(result["제품명(한국어)"])
+        if trailing_combo:
+            result["제품명(한국어)"] = cleaned_name
+            result["중량"] = trailing_combo
+    if not result["중량"]:
+        result["중량"] = _find_composition_spec(lines)
 
     return result
 
