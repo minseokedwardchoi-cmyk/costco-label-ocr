@@ -722,9 +722,14 @@ _TRAILING_QUANTITY_RE = re.compile(
 
 # "100g당 899원"처럼 "단가"라는 글자 없이 "N단위당 M원" 형태로만 찍히는 경우도
 # 있다 (트레이더스뿐 아니라 코스트코 화면 캡처류에서도 나온다). 두 파서 모두
-# 이 패턴을 단가 보조 신호로 쓴다.
+# 이 패턴을 단가 보조 신호로 쓴다. 무게 단위(g/ml/kg/l/m)뿐 아니라 "1개당
+# 2,570원"처럼 개수 단위가 오는 경우도 실사진 다수(트레이더스 상품 대부분)에서
+# 확인됐다 - "개"가 g/ml/kg/l/m 목록에 없어서 "당" 앞에서 매칭 자체가
+# 끊겨 통째로 실패하고 있었다. 이미 다른 개수 규격 판별에서 쓰는 단위
+# 목록(정/적/캡슐/포/병/팩/롤/입/매/개)을 그대로 같이 받는다.
 UNIT_PRICE_PATTERN = re.compile(
-    r"(\d+(?:\.\d+)?\s*(?:g|ml|kg|l|m)?)\s*당\s*([\d,]+)\s*원", re.IGNORECASE
+    r"(\d+(?:\.\d+)?\s*(?:g|ml|kg|l|m|정|적|캡슐|포|병|팩|롤|입|매|개)?)\s*당\s*([\d,]+)\s*원",
+    re.IGNORECASE,
 )
 
 # "392원/개", "233원/100 ml"처럼 "단가"라는 글자도, "~당~원" 문구도 없이
@@ -1038,22 +1043,29 @@ def _normalize_bare_code(line: str) -> str:
 #   1) 가격(콤마 형식 판매가 줄)이 아예 없다 - 상품카드엔 반드시 있다.
 #   2) 제조/판매/수입하는 기업 표기가 있다 - 뒷면엔 법적 표기로 항상 있고,
 #      상품카드엔 나오지 않는다. 다만 이 표기의 용어는 적용 법령(화장품법/
-#      식품위생법/생활화학제품법 등)마다 제각각이라(화장품책임판매업자,
-#      식품제조업자, 제조원/판매원, 생활화학제품의 제조자/판매자/수입자 등)
-#      개별 단어를 나열하는 대신 (제조/판매/수입/유통/공급) + (원/자/처/업자/
-#      업체/회사/사) 조합을 통째로 잡는다.
+#      식품위생법/생활화학제품법/위생용품 관리법 등)마다 제각각이라(화장품책임
+#      판매업자, 식품제조업자, 제조원/판매원, 생활화학제품의 제조자/판매자/
+#      수입자, 위생용품의 제조업소/수입업소 등) 개별 단어를 나열하는 대신
+#      (제조/판매/수입/유통/공급) + (원/자/처/업자/업체/업소/회사/사) 조합을
+#      통째로 잡는다.
 # 두 조건이 "그리고"(AND)로 다 맞아야 뒷면으로 판단한다 - Azure가 상품카드의
 # 가격 줄만 어쩌다 놓쳐도(이번 세션에서 실제로 있었던 문제), 그 카드엔
 # 기업 표기 자체가 없으므로 조건 2에서 걸러져 오분류를 막아준다.
 _BACK_LABEL_MANUFACTURER_PATTERN = re.compile(
-    r"(?:제조|판매|수입|유통|공급)(?:원|자|처|업자|업체|회사|사)"
+    r"(?:제조|판매|수입|유통|공급)(?:원|자|처|업자|업체|업소|회사|사)"
 )
 
 
 def is_back_label(lines: list) -> bool:
     has_price_line = any(PRICE_LINE_PATTERN.match(l) for l in lines)
+    # 뒷면 사진 중엔 실제로 사진에 찍힌 범위가 좁아서(라벨 아래쪽이 프레임
+    # 밖으로 잘리는 등) 제조/판매 기업 표기 자체가 통째로 안 찍히는 경우가
+    # 있다 - 그런 사진은 조건 2를 못 만족해 앞면으로 오분류된다. "전성분:"
+    # (화장품 전 성분표)은 뒷면에서만 나오고 상품카드엔 절대 안 나오는
+    # 또 다른 법정 고정 문구라, 기업 표기가 안 잡혀도 이걸로 보조 판정한다.
     has_manufacturer_info = any(
-        _BACK_LABEL_MANUFACTURER_PATTERN.search(line) for line in lines
+        _BACK_LABEL_MANUFACTURER_PATTERN.search(line) or "전성분" in line
+        for line in lines
     )
     return not has_price_line and has_manufacturer_info
 
@@ -1645,6 +1657,22 @@ def _col_letter(col: int) -> str:
     return letters
 
 
+# USER_ENTERED로 쓰는 값이 "+"/"-"/"="/"@"로 시작하면 구글 시트가 그 셀을
+# 수식으로 해석하려다 실패해서 "#ERROR!"로 뜬다(실사진에서 확인됨 - OCR로
+# 뽑은 제품명이 우연히 "+1 정밀 트리머"처럼 "+"로 시작한 경우). 앞에 작은따옴표
+# 하나를 붙이면 시트가 "이 뒤는 그냥 텍스트"로 인식해서 수식으로 해석하지
+# 않고, 화면에 보일 때도 작은따옴표 자체는 안 보인다(수식 입력줄에서만 보임).
+# 시트에 쓰는 모든 값(RAW/정리본/매칭 갱신)에 공통으로 적용한다.
+_FORMULA_TRIGGER_CHARS = ("=", "+", "-", "@")
+
+
+def _sheet_safe(value):
+    text = str(value)
+    if text.startswith(_FORMULA_TRIGGER_CHARS):
+        return "'" + text
+    return value
+
+
 def _scan_category_blocks(values: list):
     """제품군정리 시트의 현재 내용(get_all_values() 결과)을 읽어서
     {제품군명: {"title_row": 제목 행, "field_rows": {항목명: 행번호}, "next_col": 다음 빈 열}}
@@ -1692,7 +1720,7 @@ def update_category_sheet(sheet, row_dicts: list):
             block = {"title_row": title_row, "field_rows": field_rows, "next_col": 2}
             blocks[category] = block
             next_new_row = title_row + 1 + len(CATEGORY_ROW_LABELS) + 2
-            updates.append({"range": f"A{title_row}", "values": [[category]]})
+            updates.append({"range": f"A{title_row}", "values": [[_sheet_safe(category)]]})
             updates.append({
                 "range": f"A{title_row + 1}:A{title_row + len(CATEGORY_ROW_LABELS)}",
                 "values": [[label] for label in CATEGORY_ROW_LABELS],
@@ -1703,7 +1731,7 @@ def update_category_sheet(sheet, row_dicts: list):
         for label, source_key in CATEGORY_FIELD_MAP.items():
             value = row_dict.get(source_key) or ""
             row = block["field_rows"][label]
-            updates.append({"range": f"{col_letter}{row}", "values": [[value]]})
+            updates.append({"range": f"{col_letter}{row}", "values": [[_sheet_safe(value)]]})
         max_col_used = max(max_col_used, block["next_col"])
         block["next_col"] += 1
 
@@ -1800,14 +1828,14 @@ def resync_card_back_matches(sheet):
             continue
         new_value = ", ".join(matches.get(file_id, []))
         if new_value and new_value != columns["매칭파일ID"][i]:
-            updates.append({"range": f"{match_col_letter}{i + 2}", "values": [[new_value]]})
+            updates.append({"range": f"{match_col_letter}{i + 2}", "values": [[_sheet_safe(new_value)]]})
     if updates:
         sheet.batch_update(updates, value_input_option="USER_ENTERED")
     return len(updates)
 
 
 def append_rows_to_sheet(sheet, row_dicts):
-    rows = [[row_dict.get(col, "") for col in COLUMN_ORDER] for row_dict in row_dicts]
+    rows = [[_sheet_safe(row_dict.get(col, "")) for col in COLUMN_ORDER] for row_dict in row_dicts]
     with sheet_lock:
         # table_range를 A1로 명시하지 않으면 gspread가 시트 전체를 스캔해서
         # "표"의 위치를 스스로 추측하는데, 헤더와 실제로 append하는 행의 폭이
