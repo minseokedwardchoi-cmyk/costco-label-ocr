@@ -449,6 +449,12 @@ def _defer_offcolumn_price_tokens(positioned):
 _CLUSTER_GAP_RATIO = 1.2      # 이 배수 이상 벌어지면서 색도 다르면 분리
 _CLUSTER_COLOR_DISTANCE = 60  # RGB 유클리드 거리 기준
 _CLUSTER_MIN_SATURATION = 0.15  # 이 미만이면 무채색(흰/회/검)으로 간주
+# 무채색 두 개라도 밝기 차이가 이 값을 넘으면(예: 거의 검정 vs 거의 흰색)
+# 조명 차이로 보지 않는다 - 실사진(진열대 위 다른 상품의 검은 스펙 안내판
+# 배경 vs 그 아래 흰 코스트코 태그)에서 확인된 실제 밝기차보다 한참 위,
+# 같은 흰 태그 안의 그림자/글레어로 확인된 밝기차(최대 약 90)보다는 한참
+# 아래로 잡아서 두 경우를 가른다.
+_CLUSTER_MAX_SHADOW_BRIGHTNESS_GAP = 130
 
 
 def _orient_image_to_match(image, expected_width, expected_height):
@@ -502,11 +508,27 @@ def _saturation(c):
     return (mx - mn) / mx if mx else 0.0
 
 
+def _brightness(c):
+    return sum(c) / 3
+
+
 def _is_different_background(c1, c2):
     """유클리드 거리만으로는 흰 가격표 위의 밝기 차이(그림자/글레어)와 실제로
     다른 색 물체를 구분하지 못한다 - 둘 다 채도가 낮으면(무채색이면) 거리가
-    아무리 커도 조명 차이일 뿐 다른 물체가 아니라고 본다."""
-    if _saturation(c1) < _CLUSTER_MIN_SATURATION and _saturation(c2) < _CLUSTER_MIN_SATURATION:
+    아무리 커도 조명 차이일 뿐 다른 물체가 아니라고 본다.
+
+    다만 무채색이라는 것만으로 전부 조명 차이로 넘기면 안 된다 - 진열대 위
+    다른 상품(예: 조명 스펙을 검은 바탕에 흰 글씨로 안내하는 판)이 바로
+    위/옆에 찍히면, 그 검은 배경과 이 카드의 흰 배경도 둘 다 "무채색"이지만
+    실제로는 완전히 다른 두 물체다(실사진에서 확인됨 - TAPO 카메라 태그
+    바로 위 다른 상품의 검은 스펙 안내판). 이런 경우는 밝기 차이 자체가
+    그림자/글레어로 설명 가능한 범위를 훨씬 넘어서므로(거의 검정 vs 거의
+    흰색), 무채색이어도 밝기 차이가 너무 크면 다른 물체로 본다."""
+    achromatic = (
+        _saturation(c1) < _CLUSTER_MIN_SATURATION
+        and _saturation(c2) < _CLUSTER_MIN_SATURATION
+    )
+    if achromatic and abs(_brightness(c1) - _brightness(c2)) <= _CLUSTER_MAX_SHADOW_BRIGHTNESS_GAP:
         return False
     return _color_distance(c1, c2) >= _CLUSTER_COLOR_DISTANCE
 
@@ -630,12 +652,22 @@ def needs_review(confidences):
 # 쓰면 "2500"처럼 콤마 없는 4자리 숫자는 통째로 매칭 실패하므로, 콤마 형식과
 # 일반 연속 숫자를 |로 나눠 우선 콤마 형식을 시도하고 안 되면 일반 숫자로
 # 받는다.
+# "30CM X 43.4M"(랩/호일류 롤 제품)처럼 폭을 cm로 표기하는 경우가 실사진에서
+# 확인됐다 - cm도 단위 목록에 추가한다.
 WEIGHT_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9])(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?\s*(g|ml|kg|l|m)(?![a-wyz])",
+    r"(?<![A-Za-z0-9])(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?\s*(g|ml|kg|cm|l|m)(?![a-wyz])",
     re.IGNORECASE,
 )
-PRICE_LINE_PATTERN = re.compile(r"^(\d{1,3}(?:,\d{3})+)\s*\S{0,2}$")
-DISCOUNT_LINE_PATTERN = re.compile(r"^-\s?[\d,]+\s*원?$")
+# 콤마 천단위 구분자를 Azure가 마침표로 잘못 읽는 경우가 실사진에서 확인됐다
+# ("9,790"이 "9.790"으로) - 한국 판매가엔 소수점이 없으므로, 이 위치(3자리씩
+# 묶는 자리)에 나오는 마침표는 사실상 항상 콤마의 오독이다. 그래서 콤마와
+# 마침표를 둘 다 구분자로 받는다.
+PRICE_LINE_PATTERN = re.compile(r"^(\d{1,3}(?:[,.]\d{3})+)\s*\S{0,2}$")
+# 할인액 앞의 "-"도 Azure가 en dash(–)/em dash(—)/마이너스 기호(−)로 잘못
+# 읽을 수 있어(모양이 거의 같음) 같이 받는다 - 안 받으면 할인액 줄이
+# 셀링포인트 불릿으로 잘못 채택될 위험이 있다. 천단위 구분자도 가격 줄과
+# 마찬가지로 마침표로 잘못 읽힐 수 있어 같이 받는다.
+DISCOUNT_LINE_PATTERN = re.compile(r"^[-–—−]\s?[\d,.]+\s*원?$")
 
 
 def _find_discount_amount(lines):
@@ -654,14 +686,22 @@ def _find_discount_amount(lines):
 # 조합을 우선 찾는다 - 환각으로 생긴 숫자는 어떤 후보와도 할인액만큼 정확히
 # 차이나지 않으므로 이 검증에서 자연스럽게 걸러진다. 검증되는 조합이 없으면
 # (할인이 없거나 산수가 안 맞으면) 기존처럼 최댓값을 정가로 본다.
+def _price_to_int(p: str) -> int:
+    # PRICE_LINE_PATTERN이 콤마와 마침표를 둘 다 천단위 구분자로 받으므로,
+    # 숫자로 바꿀 땐 어느 쪽이었든 그냥 다 지운다. 값을 다시 쓸 때는 항상
+    # f"{n:,}"로 콤마 형식으로 통일해서, 마침표로 잘못 읽힌 값이 그대로
+    # 시트에 남지 않게 한다.
+    return int(re.sub(r"[^\d]", "", p))
+
+
 def _select_regular_price(prices, discount):
     if discount:
-        values = [int(p.replace(",", "")) for p in prices]
+        values = [_price_to_int(p) for p in prices]
         for a in values:
             for b in values:
                 if a != b and a - discount == b:
                     return f"{a:,}원"
-    return f"{max(prices, key=lambda p: int(p.replace(',', '')))}원"
+    return f"{max(_price_to_int(p) for p in prices):,}원"
 
 
 # 중량이 독립된 줄이 아니라 "오리온 오그래놀라 시나몬츄러스 440g* 3개"처럼
@@ -684,18 +724,51 @@ _TRAILING_QUANTITY_RE = re.compile(
 
 # "100g당 899원"처럼 "단가"라는 글자 없이 "N단위당 M원" 형태로만 찍히는 경우도
 # 있다 (트레이더스뿐 아니라 코스트코 화면 캡처류에서도 나온다). 두 파서 모두
-# 이 패턴을 단가 보조 신호로 쓴다.
+# 이 패턴을 단가 보조 신호로 쓴다. 무게 단위(g/ml/kg/l/m)뿐 아니라 "1개당
+# 2,570원"처럼 개수 단위가 오는 경우도 실사진 다수(트레이더스 상품 대부분)에서
+# 확인됐다 - "개"가 g/ml/kg/l/m 목록에 없어서 "당" 앞에서 매칭 자체가
+# 끊겨 통째로 실패하고 있었다. 이미 다른 개수 규격 판별에서 쓰는 단위
+# 목록(정/적/캡슐/포/병/팩/롤/입/매/개)을 그대로 같이 받는다.
 UNIT_PRICE_PATTERN = re.compile(
-    r"(\d+(?:\.\d+)?\s*(?:g|ml|kg|l|m)?)\s*당\s*([\d,]+)\s*원", re.IGNORECASE
+    r"(\d+(?:\.\d+)?\s*(?:g|ml|kg|l|m|정|적|캡슐|포|병|팩|롤|입|매|개)?)\s*당\s*([\d,]+)\s*원",
+    re.IGNORECASE,
 )
+
+# "392원/개", "233원/100 ml"처럼 "단가"라는 글자도, "~당~원" 문구도 없이
+# 그냥 "금액원/단위" 형태로 한 줄에 통째로 찍히는 세제류 카드도 있다. 같은
+# 정보를 "1개당"/"1회당"처럼 두 단위로 중복 표기해서 이런 줄이 두 개 나오는
+# 경우도 실사진에서 확인됐다("392원/개"와 "392원/회") - 카드에 먼저(=더
+# 위쪽에) 인쇄된 줄을 대표값으로 쓴다.
+_STANDALONE_UNIT_PRICE_RE = re.compile(r"^([\d,]+)\s*원\s*/\s*(.+)$")
+
+
+def _find_standalone_unit_price(lines: list) -> str:
+    for line in lines:
+        m = _STANDALONE_UNIT_PRICE_RE.match(line)
+        if m:
+            unit = m.group(2).replace(" ", "")
+            return f"{m.group(1)}원/{unit}"
+    return ""
+
 
 # 건강기능식품류는 무게(g/ml/kg 등) 대신 "80포", "180정", "1,000MG × 180정"처럼
 # 개수만으로 규격을 나타내는 경우가 많다 - WEIGHT_PATTERN이 다루는 단위가 아니라
 # 지금까지는 그냥 제품명에 붙은 채로 남아있었다. "정"을 OCR이 "적"으로 잘못
-# 읽는 경우가 실제로 있어서("112적") 같이 받아준다. "입"(개당 낱개 수를 세는
-# 아주 흔한 단위, "3입"/"12입"/"6입")도 마찬가지라 같이 받는다.
+# 읽는 경우가 실제로 있어서("112적") 같이 받아준다. "입"/"매"(개당 낱개 수를
+# 세는 아주 흔한 단위, "3입"/"12입"/"6입", "145매")도 마찬가지라 같이 받는다.
+# "30캡슐× 3EA"처럼 개수 단위 뒤에 "× 3EA"류 배수 표기가 한 번 더 붙는
+# 경우도 있어("캡슐개수 × 낱개묶음수"), 있으면 그 배수까지 통째로 포함한다.
+# "160매 / 대형"처럼 개수 단위 뒤에 "/ 대형"류 크기 설명이 한 번 더 붙는
+# 경우도 실사진에서 확인됐다(지퍼백 등 크기가 여러 종류인 제품) - 있으면
+# 그 크기 설명까지 규격에 포함해서 통째로 뗀다.
+# "청소용브러쉬세트 4종"처럼 낱개 수가 아니라 "종류 수"로 구성을 세는
+# 세트 상품도 있다 - "종"도 개수 단위에 같이 포함한다. "62개입"처럼 "낱개
+# 수 + 입"이 붙어 다니는 표기("OO개입")도 있어("아로퓸 캡슐세제 62개입")
+# 하나의 단위로 같이 받는다.
 _TRAILING_COUNT_RE = re.compile(
-    r"((?:[\d,]+\s*(?:MG|mg|G|g)\s*[×xX]\s*)?\d{1,4}\s*(?:정|적|캡슐|포|병|팩|롤|입))\s*$"
+    r"((?:[\d,]+\s*(?:MG|mg|G|g)\s*[×xX]\s*)?\d{1,4}\s*(?:정|적|캡슐|포|병|팩|롤|입|매|종|개입)"
+    r"(?:\s*[×xX*]\s*\d+\s*(?:EA|ea|Ea|개)?)?"
+    r"(?:\s*/\s*(?:대형|중형|소형|특대형))?)\s*$"
 )
 
 # "쉬크 하이드로5 스킨 프로텍트 기*2+날*14", "질레트 프로글라이드 파워
@@ -845,7 +918,11 @@ def _is_skippable_interleaved_noise(line: str) -> bool:
 # 내용과 뒤섞인다. 그래서 우선순위를 둔다: "-•·"만으로 뭔가 찾아지면 그걸로
 # 끝내고, 하나도 못 찾을 때만 "▶"를 추가해서 다시 시도하고, 그래도 없으면
 # "*"까지 추가해서 마지막으로 시도한다.
-_BULLET_MARKER_TIERS = ("-•·", "-•·▶", "-•·▶*")
+# 인쇄된 하이픈을 Azure가 en dash(–)/em dash(—)/마이너스 기호(−)로 잘못
+# 읽는 경우도 있다 - 사람 눈엔 다 "-"로 보이는 모양이 거의 같은 글자들이라
+# 첫 등급부터 같이 받는다(예전 등급에 없어서 이런 사진은 셀링포인트가 통째로
+# 안 뽑히는 문제가 있었다).
+_BULLET_MARKER_TIERS = ("-–—−•·", "-–—−•·▶", "-–—−•·▶*")
 
 
 def _extract_selling_points_with_markers(lines, markers):
@@ -904,7 +981,40 @@ def extract_selling_points(text: str) -> str:
         points = _extract_selling_points_with_markers(lines, markers)
         if points:
             return "- " + points[0] + "".join(f"\n - {p}" for p in points[1:])
+    fallback = _find_unmarked_description(lines)
+    if fallback:
+        return "- " + fallback
     return ""
+
+
+# 베이커리류 카드는 셀링포인트에 "-"/"▶" 같은 불릿 표시가 아예 없이, 영문
+# 제품명 바로 다음에 화면 폭 때문에 여러 줄로 줄바꿈된 순수 설명 문장 하나만
+# 있는 경우가 실사진에서 확인됐다(신라명과 탕종식빵, 삼립 토마토피자브레드
+# 등). 불릿 기반 추출(위 세 등급)이 전부 아무것도 못 찾았을 때만 쓰는 마지막
+# 폴백으로, 영문 제품명 줄(대문자 2단어 이상 - english_idx와 같은 조건) 바로
+# 다음부터 노이즈(가격/단가/코드/정형문구 등)가 나오거나 한글이 없는 줄이
+# 나오기 전까지 이어지는 줄들을 통째로 한 문장으로 합친다.
+def _find_unmarked_description(lines: list) -> str:
+    english_idx = None
+    for i, line in enumerate(lines):
+        if (
+            re.fullmatch(r"[A-Z0-9 .,'&×\-]{4,}", line)
+            and re.search(r"[A-Z]{2,}", line)
+            and len(line.split()) >= 2
+        ):
+            english_idx = i
+            break
+    if english_idx is None:
+        return ""
+
+    desc_lines = []
+    for line in lines[english_idx + 1:]:
+        if not re.search(r"[가-힣]", line):
+            break
+        if _is_skippable_interleaved_noise(line) or _is_selling_point_noise(line):
+            break
+        desc_lines.append(line)
+    return " ".join(desc_lines).strip()
 
 
 # 코드 바로 다음에 진짜 제품명이 아니라 "14.970", "15,990+"처럼 순수 숫자/기호
@@ -927,13 +1037,17 @@ def _normalize_bare_code(line: str) -> str:
     """OCR이 코드 숫자 중간에 공백을 잘못 끼워넣는 경우가 실제로 있다
     ("196 987" - 진짜 코드는 "196987"). 이러면 원래 fullmatch(r"\\d{4,8}")가
     실패해서 코드 자체를 못 찾고, 그 뒤로 코드가 없는 것처럼 처리되어 배경
-    잡음까지 제품명에 다 딸려 들어간다. 공백을 뺀 값이 4~8자리 숫자면 코드로
+    잡음까지 제품명에 다 딸려 들어간다. 공백을 뺀 값이 6~8자리 숫자면 코드로
     인정하고 그 공백 없는 값을 돌려준다 - 공백이 둘 이상이면(진짜 코드가 아닐
-    가능성이 높은 문장류) 코드로 인정하지 않는다. 코드가 아니면 빈 문자열."""
+    가능성이 높은 문장류) 코드로 인정하지 않는다. 코드가 아니면 빈 문자열.
+    (하한을 6자리로 둔 이유: 실제 운영 데이터의 모든 코스트코 상품코드는
+    6~7자리였고, 유일한 5자리 "코드"는 사진에 같이 찍힌 스펙 플래카드의
+    "50 000"(진짜 상품카드가 아닌 배경 물체)가 잘못 코드로 인식된
+    경우였다 - 5자리 이하는 애초에 진짜 상품코드일 가능성이 없다.)"""
     if line.count(" ") > 1:
         return ""
     compact = line.replace(" ", "")
-    return compact if re.fullmatch(r"\d{4,8}", compact) else ""
+    return compact if re.fullmatch(r"\d{6,8}", compact) else ""
 
 
 # 사람들이 Drive 폴더에 상품카드(가격표) 사진뿐 아니라 제품 뒷면(영양정보/
@@ -943,22 +1057,29 @@ def _normalize_bare_code(line: str) -> str:
 #   1) 가격(콤마 형식 판매가 줄)이 아예 없다 - 상품카드엔 반드시 있다.
 #   2) 제조/판매/수입하는 기업 표기가 있다 - 뒷면엔 법적 표기로 항상 있고,
 #      상품카드엔 나오지 않는다. 다만 이 표기의 용어는 적용 법령(화장품법/
-#      식품위생법/생활화학제품법 등)마다 제각각이라(화장품책임판매업자,
-#      식품제조업자, 제조원/판매원, 생활화학제품의 제조자/판매자/수입자 등)
-#      개별 단어를 나열하는 대신 (제조/판매/수입/유통/공급) + (원/자/처/업자/
-#      업체/회사/사) 조합을 통째로 잡는다.
+#      식품위생법/생활화학제품법/위생용품 관리법 등)마다 제각각이라(화장품책임
+#      판매업자, 식품제조업자, 제조원/판매원, 생활화학제품의 제조자/판매자/
+#      수입자, 위생용품의 제조업소/수입업소 등) 개별 단어를 나열하는 대신
+#      (제조/판매/수입/유통/공급) + (원/자/처/업자/업체/업소/회사/사) 조합을
+#      통째로 잡는다.
 # 두 조건이 "그리고"(AND)로 다 맞아야 뒷면으로 판단한다 - Azure가 상품카드의
 # 가격 줄만 어쩌다 놓쳐도(이번 세션에서 실제로 있었던 문제), 그 카드엔
 # 기업 표기 자체가 없으므로 조건 2에서 걸러져 오분류를 막아준다.
 _BACK_LABEL_MANUFACTURER_PATTERN = re.compile(
-    r"(?:제조|판매|수입|유통|공급)(?:원|자|처|업자|업체|회사|사)"
+    r"(?:제조|판매|수입|유통|공급)(?:원|자|처|업자|업체|업소|회사|사)"
 )
 
 
 def is_back_label(lines: list) -> bool:
     has_price_line = any(PRICE_LINE_PATTERN.match(l) for l in lines)
+    # 뒷면 사진 중엔 실제로 사진에 찍힌 범위가 좁아서(라벨 아래쪽이 프레임
+    # 밖으로 잘리는 등) 제조/판매 기업 표기 자체가 통째로 안 찍히는 경우가
+    # 있다 - 그런 사진은 조건 2를 못 만족해 앞면으로 오분류된다. "전성분:"
+    # (화장품 전 성분표)은 뒷면에서만 나오고 상품카드엔 절대 안 나오는
+    # 또 다른 법정 고정 문구라, 기업 표기가 안 잡혀도 이걸로 보조 판정한다.
     has_manufacturer_info = any(
-        _BACK_LABEL_MANUFACTURER_PATTERN.search(line) for line in lines
+        _BACK_LABEL_MANUFACTURER_PATTERN.search(line) or "전성분" in line
+        for line in lines
     )
     return not has_price_line and has_manufacturer_info
 
@@ -1010,6 +1131,14 @@ def parse_price_fields(text: str) -> dict:
          파편이 섞여 들어간 구간은 이 기준으로 걸러진다.
       3) 그래도 동점이면 가장 먼저 나온 구간(대개 사진이 겨냥한 목표 가격표)을
          채택한다.
+
+    실사진에서 확인된 함정: 진짜 카드 뒤쪽(제품 포장 자체의 장식 문구 등)에
+    우연히 숫자 4~8자리처럼 보이는 잡음이 하나 더 있으면, 그 잡음이 "다음
+    코드"로 오인되어 진짜 카드의 구간을 정가 줄 도달 전에 끊어버린다. 실제
+    카드는 항상 "코드 -> ... -> 단가 -> 정가" 순서이므로, 구간 안에 "단가"
+    문구가 이미 나왔는데 아직 정가(콤마 가격 줄)를 못 찾았다면 다음 코드
+    후보 하나쯤은 진짜 코드가 아니라 잡음일 가능성이 높다고 보고 구간을
+    그 다음 경계까지 넓힌다 - 그래야 뒤에 이어지는 진짜 정가를 놓치지 않는다.
     """
     lines = [l.strip() for l in text.split("\n") if l.strip()]
     code_indices = [i for i, l in enumerate(lines) if _normalize_bare_code(l)]
@@ -1019,7 +1148,15 @@ def parse_price_fields(text: str) -> dict:
 
     best_fields, best_score = None, None
     for idx, code_i in enumerate(code_indices):
-        end = code_indices[idx + 1] if idx + 1 < len(code_indices) else len(lines)
+        end_idx = idx + 1
+        end = code_indices[end_idx] if end_idx < len(code_indices) else len(lines)
+        while (
+            end_idx < len(code_indices)
+            and any("단가" in lines[k] for k in range(code_i, end))
+            and not any(PRICE_LINE_PATTERN.match(lines[k]) for k in range(code_i, end))
+        ):
+            end_idx += 1
+            end = code_indices[end_idx] if end_idx < len(code_indices) else len(lines)
         segment_fields = _parse_fields_from_lines(lines[code_i:end])
         name = segment_fields.get("제품명(한국어)") or ""
         base = (1 if name else 0) + (1 if segment_fields.get("가격") else 0)
@@ -1167,9 +1304,10 @@ def _parse_fields_from_lines(lines: list) -> dict:
     danga_price = ""
     danga_price_line_idx = None  # 가격 탐색에서 이 줄은 다시 쓰지 않도록 인덱스로 기억
     if danga_idx is not None:
-        # OCR이 "/" 구분자를 세로줄 모양이 비슷한 "ㅣ"(한글 자모)로 잘못 읽는
-        # 경우가 실제로 있다("단가 ㅣ 개") - 둘 다 받아준다.
-        unit_match = re.search(r"단가\s*[/ㅣ]\s*(\S+)", lines[danga_idx])
+        # OCR이 "/" 구분자를 모양이 비슷한 다른 문자로 잘못 읽는 경우가 실제로
+        # 있다 - 세로줄 모양의 "ㅣ"(한글 자모, "단가 ㅣ 개")와 "!"(느낌표,
+        # "단가 ! 장") 둘 다 확인됐다. 셋 다 받아준다.
+        unit_match = re.search(r"단가\s*[/ㅣ!]\s*(\S+)", lines[danga_idx])
         unit = unit_match.group(1) if unit_match else ""
         for offset, line in enumerate(lines[danga_idx:danga_idx + 3]):
             m = re.search(r"[\d,]{2,}\s*원", line)
@@ -1186,6 +1324,10 @@ def _parse_fields_from_lines(lines: list) -> dict:
         if unit_price_match:
             unit = unit_price_match.group(1).replace(" ", "")
             result["단가"] = f"{unit_price_match.group(2)}원/{unit}"
+    if not result["단가"]:
+        # "단가"라는 글자도 "~당~원" 문구도 없이 "392원/개"처럼 통째로 한 줄에
+        # 찍히는 경우도 있다.
+        result["단가"] = _find_standalone_unit_price(lines)
 
     # 가격은 "12,990원"처럼 천단위 콤마가 있는 큰 금액이다. Azure OCR이 "원" 글자를
     # 가끔 다른 문자(예: "z")로 잘못 읽는 경우가 있어("7,990z"), "원" 글자 자체보다
@@ -1220,7 +1362,7 @@ def _parse_fields_from_lines(lines: list) -> dict:
         # "899원" 조각까지 후보로 잡히면 진짜 가격을 못 찾았을 때 이 단가
         # 조각을 엉뚱하게 채택해버리므로 먼저 지운다.
         text_without_unit_price = UNIT_PRICE_PATTERN.sub("", "\n".join(lines))
-        all_prices = [m.group(0) for m in re.finditer(r"[\d,]{2,}\s*원", text_without_unit_price)]
+        all_prices = [m.group(0) for m in re.finditer(r"[\d,.]{2,}\s*원", text_without_unit_price)]
         remaining_prices = [p for p in all_prices if p != danga_price]
         if remaining_prices:
             result["가격"] = max(remaining_prices, key=lambda p: int(re.sub(r"[^\d]", "", p) or "0"))
@@ -1300,6 +1442,8 @@ def parse_traders_fields(text: str) -> dict:
     if danga_match:
         unit = danga_match.group(1).replace(" ", "")
         result["단가"] = f"{danga_match.group(2)}원/{unit}"
+    if not result["단가"]:
+        result["단가"] = _find_standalone_unit_price(lines)
 
     code_idx = None
     for i, line in enumerate(lines):
@@ -1333,7 +1477,7 @@ def parse_traders_fields(text: str) -> dict:
         # 뒷부분을 Azure가 통째로 못 읽은 카드에서 "100g당 428원"의 428원이
         # 가격 칸에 들어감). 단위당가격 문구는 먼저 지우고 나서 찾는다.
         text_without_unit_price = UNIT_PRICE_PATTERN.sub("", text)
-        all_prices = [m.group(0) for m in re.finditer(r"[\d,]{2,}\s*원", text_without_unit_price)]
+        all_prices = [m.group(0) for m in re.finditer(r"[\d,.]{2,}\s*원", text_without_unit_price)]
         if all_prices:
             result["가격"] = max(all_prices, key=lambda p: int(re.sub(r"[^\d]", "", p) or "0"))
 
@@ -1528,6 +1672,22 @@ def _col_letter(col: int) -> str:
     return letters
 
 
+# USER_ENTERED로 쓰는 값이 "+"/"-"/"="/"@"로 시작하면 구글 시트가 그 셀을
+# 수식으로 해석하려다 실패해서 "#ERROR!"로 뜬다(실사진에서 확인됨 - OCR로
+# 뽑은 제품명이 우연히 "+1 정밀 트리머"처럼 "+"로 시작한 경우). 앞에 작은따옴표
+# 하나를 붙이면 시트가 "이 뒤는 그냥 텍스트"로 인식해서 수식으로 해석하지
+# 않고, 화면에 보일 때도 작은따옴표 자체는 안 보인다(수식 입력줄에서만 보임).
+# 시트에 쓰는 모든 값(RAW/정리본/매칭 갱신)에 공통으로 적용한다.
+_FORMULA_TRIGGER_CHARS = ("=", "+", "-", "@")
+
+
+def _sheet_safe(value):
+    text = str(value)
+    if text.startswith(_FORMULA_TRIGGER_CHARS):
+        return "'" + text
+    return value
+
+
 def _scan_category_blocks(values: list):
     """제품군정리 시트의 현재 내용(get_all_values() 결과)을 읽어서
     {제품군명: {"title_row": 제목 행, "field_rows": {항목명: 행번호}, "next_col": 다음 빈 열}}
@@ -1575,7 +1735,7 @@ def update_category_sheet(sheet, row_dicts: list):
             block = {"title_row": title_row, "field_rows": field_rows, "next_col": 2}
             blocks[category] = block
             next_new_row = title_row + 1 + len(CATEGORY_ROW_LABELS) + 2
-            updates.append({"range": f"A{title_row}", "values": [[category]]})
+            updates.append({"range": f"A{title_row}", "values": [[_sheet_safe(category)]]})
             updates.append({
                 "range": f"A{title_row + 1}:A{title_row + len(CATEGORY_ROW_LABELS)}",
                 "values": [[label] for label in CATEGORY_ROW_LABELS],
@@ -1586,7 +1746,7 @@ def update_category_sheet(sheet, row_dicts: list):
         for label, source_key in CATEGORY_FIELD_MAP.items():
             value = row_dict.get(source_key) or ""
             row = block["field_rows"][label]
-            updates.append({"range": f"{col_letter}{row}", "values": [[value]]})
+            updates.append({"range": f"{col_letter}{row}", "values": [[_sheet_safe(value)]]})
         max_col_used = max(max_col_used, block["next_col"])
         block["next_col"] += 1
 
@@ -1683,14 +1843,14 @@ def resync_card_back_matches(sheet):
             continue
         new_value = ", ".join(matches.get(file_id, []))
         if new_value and new_value != columns["매칭파일ID"][i]:
-            updates.append({"range": f"{match_col_letter}{i + 2}", "values": [[new_value]]})
+            updates.append({"range": f"{match_col_letter}{i + 2}", "values": [[_sheet_safe(new_value)]]})
     if updates:
         sheet.batch_update(updates, value_input_option="USER_ENTERED")
     return len(updates)
 
 
 def append_rows_to_sheet(sheet, row_dicts):
-    rows = [[row_dict.get(col, "") for col in COLUMN_ORDER] for row_dict in row_dicts]
+    rows = [[_sheet_safe(row_dict.get(col, "")) for col in COLUMN_ORDER] for row_dict in row_dicts]
     with sheet_lock:
         # table_range를 A1로 명시하지 않으면 gspread가 시트 전체를 스캔해서
         # "표"의 위치를 스스로 추측하는데, 헤더와 실제로 append하는 행의 폭이
