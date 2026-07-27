@@ -14,6 +14,15 @@
      코드가 좋아졌다"는 이 경우엔 덮어쓰는 게 맞다.
   3. is_back_label()로 다시 판별했을 때 뒷면으로 바뀐 상품(정리본에 잘못
      들어가 있던 경우)은 정리본에서 제거하고 RAW에 뒷면여부를 표시한다.
+  4. 카드 행인데 아직 "정리본위치"가 비어있으면(이 컬럼이 생기기 전에 이미
+     정리본에 기록됐던 과거 카드들) 지금 정리본 대조로 위치를 알아낸 김에
+     같이 채워 넣는다. 그래야 그 카드의 뒷면 사진이 있을 때
+     `main.sync_back_sourcing()`이 소싱형태/병입원산지를 그 칸에 반영할 수
+     있다 - 이 스크립트는 그 함수도 이어서 호출해서, 새 사진 없이도
+     소싱형태/병입원산지 소급 반영을 버튼 하나로 재실행할 수 있게 한다
+     (원래 main.py의 run_once()는 새 사진이 하나도 없으면 이 단계 자체를
+     안 돌기 때문에, 과거 데이터에 대해서는 이 스크립트가 유일한 재실행
+     경로다).
 
 새 사진을 읽거나(Azure) Drive에 접근하는 부분은 전혀 없다 - 이미 시트에 있는
 텍스트만 다시 읽는, 비용이 들지 않는 재검토다. 그래서 재OCR로만 고칠 수 있는
@@ -43,12 +52,14 @@ DRY_RUN = os.environ.get("DRY_RUN", "").lower() in ("1", "true", "yes")
 RETAILERS = [
     {
         "label": "코스트코",
+        "retailer_key": "costco",
         "raw_sheet_name": main.SHEET_NAME,
         "category_sheet_name": main.CATEGORY_SHEET_NAME_COSTCO,
         "parse_fn": main.parse_price_fields,
     },
     {
         "label": "트레이더스",
+        "retailer_key": "traders",
         "raw_sheet_name": main.TRADERS_SHEET_NAME,
         "category_sheet_name": main.CATEGORY_SHEET_NAME_TRADERS,
         "parse_fn": main.parse_traders_fields,
@@ -71,9 +82,15 @@ def require_config():
         sys.exit(1)
 
 
-def review_retailer(spreadsheet, label, raw_sheet_name, category_sheet_name, parse_fn):
+def review_retailer(spreadsheet, label, retailer_key, raw_sheet_name, category_sheet_name, parse_fn):
     raw_ws = spreadsheet.worksheet(raw_sheet_name)
     cat_ws = spreadsheet.worksheet(category_sheet_name)
+
+    # "정리본위치" 컬럼이 아직 없는 시트(이 기능이 생기기 전부터 있던 RAW
+    # 탭)일 수 있으니, 읽기 전에 헤더를 최신 COLUMN_ORDER 기준으로 맞춘다.
+    # 기존 데이터 행은 안 밀리게 안전하게 새 컬럼만 끼워 넣는다.
+    if not DRY_RUN:
+        main.ensure_header(raw_ws)
 
     raw_values = raw_ws.get_all_values()
     header = raw_values[0]
@@ -96,6 +113,7 @@ def review_retailer(spreadsheet, label, raw_sheet_name, category_sheet_name, par
 
     raw_updates = []
     cat_updates = []
+    backfilled_positions = 0
     filled_items = []          # (category, product_name, [채운 필드])
     renamed_items = []         # (category, old_name, new_name)
     reclassified_items = []    # (category, product_name)
@@ -147,6 +165,16 @@ def review_retailer(spreadsheet, label, raw_sheet_name, category_sheet_name, par
                 })
                 renamed_items.append((category, product_name, current_raw_name))
 
+            position_idx = idx.get("정리본위치")
+            if position_idx is not None:
+                current_position = row[position_idx] if len(row) > position_idx else ""
+                if not current_position:
+                    raw_updates.append({
+                        "range": f"{main._col_letter(position_idx + 1)}{row_num}",
+                        "values": [[f"{col_letter}{block['title_row']}"]],
+                    })
+                    backfilled_positions += 1
+
             recomputed = parse_fn(raw_text)
             recomputed["셀링포인트"] = main.extract_selling_points(raw_text)
 
@@ -180,11 +208,16 @@ def review_retailer(spreadsheet, label, raw_sheet_name, category_sheet_name, par
             if still_missing:
                 still_needs_review.append((category, product_name, still_missing))
 
+    sourcing_filled = None  # None = 실행 안 함(DRY RUN), 정수 = 실제로 채운 칸 수
     if not DRY_RUN:
         if raw_updates:
             raw_ws.batch_update(raw_updates, value_input_option="USER_ENTERED")
         if cat_updates:
             cat_ws.batch_update(cat_updates, value_input_option="USER_ENTERED")
+        # 정리본위치를 방금 다 써넣은 뒤에 호출해야, 이번에 새로 채운 위치의
+        # 뒷면도 바로 소급 반영된다. main.py의 run_once()와 똑같은 함수를
+        # 그대로 재사용한다 - 새 사진 없이도 전체 이력을 다시 훑는다.
+        sourcing_filled = main.sync_back_sourcing(raw_ws, cat_ws, retailer_key)
 
     return {
         "label": label,
@@ -195,6 +228,8 @@ def review_retailer(spreadsheet, label, raw_sheet_name, category_sheet_name, par
         "unmatched_items": unmatched_items,
         "raw_update_count": len(raw_updates),
         "cat_update_count": len(cat_updates),
+        "backfilled_positions": backfilled_positions,
+        "sourcing_filled": sourcing_filled,
     }
 
 
@@ -223,6 +258,12 @@ def format_report(results):
             lines.append(f"- RAW에서 이름이 안 맞아 대조 못 함: {len(r['unmatched_items'])}건")
             for category, name in r["unmatched_items"]:
                 lines.append(f"  - [{category}] {name!r}")
+        if r["backfilled_positions"]:
+            lines.append(f"- 정리본위치 새로 채움(과거 카드 소급 태깅): {r['backfilled_positions']}건")
+        if r["sourcing_filled"] is None:
+            lines.append("- 소싱형태/병입원산지 소급 반영: DRY RUN이라 실행 안 함")
+        else:
+            lines.append(f"- 소싱형태/병입원산지 소급 반영: {r['sourcing_filled']}칸")
     return "\n".join(lines)
 
 
@@ -236,6 +277,7 @@ def run_once():
         review_retailer(
             spreadsheet,
             r["label"],
+            r["retailer_key"],
             r["raw_sheet_name"],
             r["category_sheet_name"],
             r["parse_fn"],

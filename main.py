@@ -1145,7 +1145,12 @@ _FIELD_BOUNDARY_PATTERN = re.compile(
     r"[\[\n•▪]|" + _BACK_LABEL_MANUFACTURER_PATTERN.pattern + r"|원산지|제조국"
 )
 
-_ORIGIN_LABEL_PATTERN = re.compile(r"(?:원산지|제조국)\s*[\]:：]*\s*([가-힣]{1,10})")
+# "제조국"만 찾으면 "제조국명"(더 흔한 표기)의 "제조국"까지만 매치되고 바로
+# 뒤의 "명" 한 글자가 국가명 자리에 캡처되는 오탐이 실제로 있었다("제조국명:
+# 베트남" -> "명"). 알파벳 순서상 "제조국명"을 "제조국"보다 먼저 두어(둘 다
+# 매치 가능한 위치에서 더 긴 쪽이 우선 시도되도록) 이 라벨도 통째로 먼저
+# 소비하게 한다.
+_ORIGIN_LABEL_PATTERN = re.compile(r"(?:원산지|제조국명|제조국)\s*[\]:：]*\s*([가-힣]{1,10})")
 _MADE_IN_PATTERN = re.compile(r"made\s+in\s+([A-Za-z]+)", re.IGNORECASE)
 
 _COUNTRY_NAMES_KO = (
@@ -1215,7 +1220,17 @@ def extract_origin(text: str) -> str:
     m = _ORIGIN_LABEL_PATTERN.search(text)
     if m:
         value = m.group(1)
-        return "국내" if value in ("대한민국", "한국") else value
+        if value in ("대한민국", "한국"):
+            return "국내"
+        # 실제 국가명은 항상 2글자 이상이다 - 1글자만 캡처됐으면(줄바꿈 등으로
+        # 값이 중간에 잘린 경우, 예: "[원산지] 태"만 잡히고 "국"이 다음
+        # 줄로 넘어간 경우) 이 라벨 매치를 신뢰하지 않고 아래 다른 방식으로
+        # 계속 찾는다. _COUNTRY_NAMES_KO 목록에 없는 나라(예: 콜롬비아)도
+        # 실제 라벨 값이면 그대로 믿는다 - 목록은 라벨이 아예 없을 때 쓰는
+        # ③번 폴백 전용이라, 여기서 목록에 없다고 버리면 라벨이 명확히 있는
+        # 값을 오히려 못 믿게 되는 역효과가 난다.
+        if len(value) >= 2:
+            return value
 
     m = _MADE_IN_PATTERN.search(text)
     if m:
@@ -1823,6 +1838,13 @@ _FORMULA_TRIGGER_CHARS = ("=", "+", "-", "@")
 def _sheet_safe(value):
     text = str(value)
     if text.startswith(_FORMULA_TRIGGER_CHARS):
+        return "'" + text
+    # 앞자리 0이 있는 순수 숫자 문자열("0033200975939" 같은 바코드/상품코드)도
+    # USER_ENTERED가 숫자로 해석해버리면 앞자리 0이 통째로 사라진다(실사진
+    # 대조로 확인됨 - 트레이더스 상품코드 3건이 "0033200975939" ->
+    # "33200975939"로 저장돼 있었음). int로 왕복했을 때 원래 문자열과
+    # 달라지면(=앞자리 0을 잃으면) 강제 텍스트로 escape한다.
+    if text.isdigit() and len(text) > 1 and str(int(text)) != text:
         return "'" + text
     return value
 
