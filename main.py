@@ -44,7 +44,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 import gspread
-from PIL import Image
+from PIL import Image, ImageOps
 import pillow_heif
 
 pillow_heif.register_heif_opener()  # PIL이 HEIC/HEIF 파일도 열 수 있도록 등록 (아이폰 기본 사진 포맷)
@@ -178,8 +178,6 @@ def load_processed_ids(sheet):
 
 
 # ---------------- Drive: 전체 이미지 조회 (페이지네이션 포함) ----------------
-HEIC_MIME_TYPES = ("image/heic", "image/heif")
-
 def list_all_images(drive_service, folder_id):
     query = (
         f"'{folder_id}' in parents and "
@@ -256,10 +254,24 @@ def download_image(drive_service, file_id):
     return buf.getvalue()
 
 
-def convert_heic_to_jpeg(image_bytes: bytes) -> bytes:
-    """Azure Read API는 HEIC/HEIF를 지원하지 않으므로(아이폰 기본 사진 포맷),
-    OCR에 보내기 전에 JPEG로 변환한다."""
+def normalize_image_for_ocr(image_bytes: bytes) -> bytes:
+    """Azure Read API로 보내기 전에 두 가지를 항상 맞춘다.
+
+    1) HEIC/HEIF(아이폰 기본 사진 포맷)는 Azure가 지원하지 않으므로 JPEG로
+       변환한다.
+    2) 휴대폰 카메라는 센서가 담은 원본 픽셀을 항상 가로로 저장하고 "실제로는
+       이만큼 돌려서 봐야 한다"는 EXIF 방향 정보만 따로 붙이는 경우가 많다.
+       사진 뷰어/갤러리 앱은 이 태그를 자동으로 반영해서 똑바로 보여주지만,
+       Azure Read API는 이 태그를 반영하지 않고 원본 픽셀 그대로 받아들인다
+       (Microsoft 공식 문서에도 나온 알려진 제약) - 그래서 사람 눈엔 멀쩡한
+       사진도 OCR 엔진에는 옆으로 누운 채로 전달되어 인식률이 떨어질 수 있다.
+       ImageOps.exif_transpose()로 픽셀 자체를 세우고 방향 태그는 지운
+       뒤(그래야 아래에서 새로 저장할 때 이중으로 안 돌아간다) 보낸다.
+
+    HEIC든 JPEG/PNG든 상관없이 항상 거친다 - 방향이 이미 정상인 사진은
+    exif_transpose()가 그대로 돌려주므로 아무 변화가 없다."""
     image = Image.open(io.BytesIO(image_bytes))
+    image = ImageOps.exif_transpose(image)
     out = io.BytesIO()
     image.convert("RGB").save(out, format="JPEG", quality=92)
     return out.getvalue()
@@ -288,7 +300,7 @@ def extract_capture_time(image_bytes: bytes, filename: str):
     메신저를 거치며 메타데이터가 지워진 사진) 삼성 파일명의 날짜_시각
     패턴을 2순위로 쓴다. 아이폰 HEIC도 pillow_heif가 등록한 오프너를 통해
     JPEG와 동일하게 EXIF를 읽는다. 변환 전 원본 바이트에서 읽어야 한다 -
-    convert_heic_to_jpeg()로 재인코딩하면 EXIF가 보존되지 않는다. 둘 다
+    normalize_image_for_ocr()로 재인코딩하면 방향 태그가 지워진다. 둘 다
     없으면 순서를 알 수 없다는 뜻이므로 None을 돌려주고, 그 사진은 앞뒤
     매칭 대상에서 빠진다(데이터 자체는 RAW 시트에 그대로 남는다)."""
     try:
@@ -314,12 +326,6 @@ def extract_capture_time(image_bytes: bytes, filename: str):
         except ValueError:
             pass
     return None
-
-
-def is_heic(file_info: dict) -> bool:
-    if file_info.get("mimeType") in HEIC_MIME_TYPES:
-        return True
-    return file_info.get("name", "").lower().endswith((".heic", ".heif"))
 
 
 # ---------------- Azure Read API OCR (재시도 포함) ----------------
@@ -1674,13 +1680,12 @@ def process_one_file(creds, sheets, file_info, archive_folder_id, retailer, sour
     name, file_id = file_info["name"], file_info["id"]
     drive_service = get_thread_drive_service(creds)
     image_bytes = download_image(drive_service, file_id)
-    # 앞뒤 사진 매칭용 신호. HEIC->JPEG 변환은 EXIF를 보존하지 않으므로
-    # 반드시 변환 전 원본 바이트에서 촬영시각을 읽어야 한다. owners는
-    # Drive 목록 조회 시점에 이미 받아온 값(list_all_images 참고).
+    # 앞뒤 사진 매칭용 신호. normalize_image_for_ocr()는 방향 태그를 지우고
+    # 재인코딩하므로 반드시 그 전 원본 바이트에서 촬영시각을 읽어야 한다.
+    # owners는 Drive 목록 조회 시점에 이미 받아온 값(list_all_images 참고).
     capture_time = extract_capture_time(image_bytes, name)
     uploader = (file_info.get("owners") or [{}])[0].get("emailAddress", "")
-    if is_heic(file_info):
-        image_bytes = convert_heic_to_jpeg(image_bytes)
+    image_bytes = normalize_image_for_ocr(image_bytes)
     text, confidences = ocr_image_azure(image_bytes)
     low_confidence = needs_review(confidences)
     lines = [l.strip() for l in text.split("\n") if l.strip()]
