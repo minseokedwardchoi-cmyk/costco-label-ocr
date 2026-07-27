@@ -111,7 +111,7 @@ PRICE_FIELDS = CORE_PRICE_FIELDS + OPTIONAL_PRICE_FIELDS
 
 COLUMN_ORDER = (
     ["파일ID", "파일명", "처리일시", "원문텍스트"] + PRICE_FIELDS
-    + ["업로더", "뒷면여부", "매칭파일ID"]
+    + ["업로더", "뒷면여부", "촬영시각", "매칭파일ID"]
 )
 
 
@@ -1490,7 +1490,7 @@ def update_category_sheet(sheet, row_dicts: list):
 sheet_lock = threading.Lock()  # gspread 동시 append 충돌 방지
 
 
-def build_row_dict(file_id, filename, fields, raw_text, uploader, is_back):
+def build_row_dict(file_id, filename, fields, raw_text, uploader, is_back, capture_time):
     row_dict = {
         "파일ID": file_id,
         "파일명": filename,
@@ -1501,30 +1501,74 @@ def build_row_dict(file_id, filename, fields, raw_text, uploader, is_back):
         "셀링포인트": extract_selling_points(raw_text),
         "업로더": uploader,
         "뒷면여부": "뒷면" if is_back else "",
-        # 이 시점엔 아직 이 배치의 다른 사진들과 비교해보기 전이라 매칭을
-        # 모른다 - 병렬 처리가 다 끝난 뒤 apply_match_results()가 채운다.
+        "촬영시각": capture_time.strftime("%Y-%m-%d %H:%M:%S") if capture_time else "",
+        # 이 시점엔 아직 시트에 쌓인 다른 사진들과 비교해보기 전이라 매칭을
+        # 모른다 - resync_card_back_matches()가 별도로 채운다.
         "매칭파일ID": "",
     }
     row_dict.update(fields)  # 상품코드/제품명(한국어)/가격
     return row_dict
 
 
-def apply_match_results(sheet, match_by_file_id: dict):
-    """match_card_back_pairs()가 계산한 매칭 결과를 이미 append된 RAW 시트
-    행에 반영한다. 행을 append할 때는 아직 이 배치의 다른 파일들과 비교해
-    보기 전이라 매칭파일ID를 빈 칸으로 써두므로, 병렬 처리가 다 끝나고
-    한 번에 계산한 뒤 파일ID로 실제 행 번호를 찾아 그 칸만 채운다."""
-    if not match_by_file_id:
-        return
-    col_letter = _col_letter(COLUMN_ORDER.index("매칭파일ID") + 1)
-    file_ids = sheet.col_values(1)
-    updates = [
-        {"range": f"{col_letter}{row_num}", "values": [[", ".join(match_by_file_id[fid])]]}
-        for row_num, fid in enumerate(file_ids[1:], start=2)
-        if fid in match_by_file_id
-    ]
+def resync_card_back_matches(sheet):
+    """RAW 시트에 지금까지 기록된 모든 사진(이번 실행분은 물론, 과거에 실행
+    버튼을 눌렀을 때 처리된 사진까지 전부)을 다시 훑어서 상품카드<->뒷면
+    매칭을 재계산하고, 값이 바뀐 칸만 시트에 반영한다.
+
+    이 파이프라인은 정해진 시각에 자동으로 도는 게 아니라 대시보드
+    "업데이트" 버튼을 누를 때마다 한 번씩 실행되는 구조라, 카드 사진과
+    그 뒷면 사진이 서로 다른 실행 회차에 나뉘어 올라올 수 있다(뒷면을
+    깜빡하고 나중에 올리는 등). 이번 실행에서 새로 처리된 사진끼리만
+    비교하면 이런 경우를 놓치므로, 매칭은 항상 시트에 쌓인 전체 이력을
+    기준으로 다시 계산한다 - 시트 자체가 실행 회차를 넘나드는 유일한
+    영속 저장소이기 때문이다. 매번 전체를 다시 계산하지만 실제로
+    값이 바뀐 칸만 쓰기 때문에, 이미 정착된 과거 매칭까지 매번 다시
+    쓰지는 않는다.
+
+    다만 이 컬럼들(업로더/뒷면여부/촬영시각)이 생기기 전에 이미 처리된
+    과거 행은 촬영시각이 비어있어 매칭 대상이 될 수 없다 - 새로 배포된
+    이후 처리되는 사진부터 소급 매칭이 적용된다."""
+    idx = {name: COLUMN_ORDER.index(name) for name in ("파일ID", "업로더", "뒷면여부", "촬영시각", "매칭파일ID")}
+    columns = {name: sheet.col_values(i + 1)[1:] for name, i in idx.items()}  # 헤더 제외
+    row_count = len(columns["파일ID"])
+    for name in columns:
+        # gspread의 col_values()는 그 열의 마지막 값이 있는 행까지만 돌려주므로,
+        # 뒤쪽 행에서 특정 컬럼만 비어있으면(흔한 경우) 열마다 길이가 다를 수
+        # 있다 - 파일ID 기준 행 수에 맞춰 빈 문자열로 채워 인덱스를 맞춘다.
+        if len(columns[name]) < row_count:
+            columns[name] += [""] * (row_count - len(columns[name]))
+
+    entries = []
+    for i in range(row_count):
+        file_id = columns["파일ID"][i]
+        if not file_id:
+            continue
+        capture_time = None
+        raw_time = columns["촬영시각"][i]
+        if raw_time:
+            try:
+                capture_time = datetime.datetime.strptime(raw_time, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                capture_time = None
+        entries.append({
+            "file_id": file_id,
+            "uploader": columns["업로더"][i],
+            "capture_time": capture_time,
+            "is_back": columns["뒷면여부"][i] == "뒷면",
+        })
+
+    matches = match_card_back_pairs(entries)
+    match_col_letter = _col_letter(idx["매칭파일ID"] + 1)
+    updates = []
+    for i, file_id in enumerate(columns["파일ID"]):
+        if not file_id:
+            continue
+        new_value = ", ".join(matches.get(file_id, []))
+        if new_value and new_value != columns["매칭파일ID"][i]:
+            updates.append({"range": f"{match_col_letter}{i + 2}", "values": [[new_value]]})
     if updates:
         sheet.batch_update(updates, value_input_option="USER_ENTERED")
+    return len(updates)
 
 
 def append_rows_to_sheet(sheet, row_dicts):
@@ -1634,7 +1678,7 @@ def process_one_file(creds, sheets, file_info, archive_folder_id, retailer, sour
     if not is_back and (not fields.get("가격") or not fields.get("제품명(한국어)")):
         low_confidence = True
 
-    row_dict = build_row_dict(file_id, name, fields, text, uploader, is_back)
+    row_dict = build_row_dict(file_id, name, fields, text, uploader, is_back, capture_time)
     append_rows_to_sheet(sheet, [row_dict])
 
     # 시트 기록이 끝난 뒤에 사진을 '처리완료' 폴더로 옮긴다. 이동이 실패해도
@@ -1646,7 +1690,7 @@ def process_one_file(creds, sheets, file_info, archive_folder_id, retailer, sour
     except Exception as e:
         print(f"  경고: '{name}' 보관 폴더 이동 실패 (시트 기록은 완료됨): {e}")
 
-    return name, fields.get("제품명(한국어)") or "", low_confidence, row_dict, retailer, is_back, uploader, capture_time
+    return name, fields.get("제품명(한국어)") or "", low_confidence, row_dict, retailer, is_back
 
 
 # ---------------- 메인 실행 ----------------
@@ -1709,10 +1753,6 @@ def run_once():
     success_count = 0
     failed = []
     processed_row_dicts = {"costco": [], "traders": []}
-    # 앞뒤 매칭용 - 뒷면 사진도 포함해서(processed_row_dicts와 달리) 이 배치
-    # 안에서 실제로 처리된 모든 사진을 모아둔다. 매칭은 이 배치의 다른
-    # 사진들과 비교해야 해서 병렬 처리가 다 끝난 뒤에만 계산할 수 있다.
-    match_entries = {"costco": [], "traders": []}
 
     with ThreadPoolExecutor(max_workers=CONCURRENT_WORKERS) as executor:
         futures = {
@@ -1725,7 +1765,7 @@ def run_once():
         for future in as_completed(futures):
             f = futures[future]
             try:
-                name, product, flag, row_dict, retailer, is_back, uploader, capture_time = future.result()
+                name, product, flag, row_dict, retailer, is_back = future.result()
                 success_count += 1
                 # 제품 뒷면 사진은 RAW 시트엔 그대로 기록되지만(위에서 이미 끝남),
                 # 제품군정리(정리본)에는 상품카드에서 이미 뽑은 내용을 중복으로
@@ -1733,12 +1773,6 @@ def run_once():
                 # 이 사진을 위한 새 열 자체를 만들지 않는다.
                 if not is_back:
                     processed_row_dicts[retailer].append(row_dict)
-                match_entries[retailer].append({
-                    "file_id": row_dict["파일ID"],
-                    "uploader": uploader,
-                    "capture_time": capture_time,
-                    "is_back": is_back,
-                })
                 flag_str = " [검토필요]" if flag else ""
                 back_str = " [뒷면]" if is_back else ""
                 print(f"  완료: {name} -> {product or '(제품명 인식 실패)'}{flag_str}{back_str}")
@@ -1754,15 +1788,16 @@ def run_once():
         except Exception as e:
             print(f"경고: {retailer} 제품군정리 시트 갱신 실패 (원본 시트 기록은 정상 완료됨): {e}")
 
-    # 상품카드 <-> 뒷면 매칭도 이 배치 안의 모든 사진이 다 모인 뒤에만 계산할
-    # 수 있으므로 여기서 한 번에 처리한다. 실패해도 원본 시트 기록 자체는
-    # 이미 끝난 뒤라 데이터 유실은 아니다.
-    for retailer, entries in match_entries.items():
+    # 상품카드 <-> 뒷면 매칭은 이번 실행분만으로는 계산하지 않는다 - 대시보드
+    # "업데이트" 버튼을 누를 때마다 한 번씩 도는 구조라 카드와 뒷면이 서로
+    # 다른 실행 회차에 나뉘어 올라올 수 있고, 그러면 이번 실행분끼리만
+    # 비교해서는 놓친다. RAW 시트 전체(과거 실행분 포함)를 기준으로 매번
+    # 다시 계산해서, 뒤늦게 올라온 사진도 다음 실행 때 소급 매칭되게 한다.
+    for retailer, sheet in sheets.items():
         try:
-            matches = match_card_back_pairs(entries)
-            apply_match_results(sheets[retailer], matches)
-            if matches:
-                print(f"  {retailer}: 앞뒤 매칭 {len(matches)}건 반영")
+            updated = resync_card_back_matches(sheet)
+            if updated:
+                print(f"  {retailer}: 앞뒤 매칭 {updated}건 반영(과거 실행분 포함)")
         except Exception as e:
             print(f"경고: {retailer} 앞뒤 매칭 반영 실패 (원본 시트 기록은 정상 완료됨): {e}")
 
