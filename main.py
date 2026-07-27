@@ -29,6 +29,7 @@ GitHub Actions에서는 리포지토리 Secrets 값이 환경변수로 주입된
 """
 
 import datetime
+import hashlib
 import io
 import os
 import re
@@ -71,6 +72,12 @@ TRADERS_SHEET_NAME = os.environ.get("TRADERS_SHEET_NAME", "트레이더스")
 # 제품군 블록도 원본 시트와 마찬가지로 리테일러별로 따로 둔다.
 CATEGORY_SHEET_NAME_COSTCO = os.environ.get("CATEGORY_SHEET_NAME_COSTCO", "제품군정리(코스트코)")
 CATEGORY_SHEET_NAME_TRADERS = os.environ.get("CATEGORY_SHEET_NAME_TRADERS", "제품군정리(트레이더스)")
+
+# 정리본은 이제 촬영월별로 시트를 나눈다("제품군정리(코스트코)_2026-07"처럼
+# 위 이름 뒤에 월을 붙인 제목을 씀 - run_once의 get_category_sheet 참고).
+# 월별 분리 이전에 이미 기록된 "정리본위치" 값(시트제목 없이 "C15"만 있음)은
+# 그 시절 유일했던 시트 이름으로 찾아야 하므로 sync_back_sourcing()에서 쓴다.
+_LEGACY_CATEGORY_SHEET_TITLE = {"costco": CATEGORY_SHEET_NAME_COSTCO, "traders": CATEGORY_SHEET_NAME_TRADERS}
 
 # 자사 상품 카탈로그(MCH1/MC/상품명) 기반 제품군 분류용. 거래처/공급사 이름까지
 # 들어있는 사외비 데이터라 이 공개 저장소에는 절대 커밋하지 않고, 서비스
@@ -115,7 +122,7 @@ PRICE_FIELDS = CORE_PRICE_FIELDS + OPTIONAL_PRICE_FIELDS
 # 뒷면 사진(소싱형태/병입원산지)을 나중에 그 칸에 소급 반영할 수 있게 해준다.
 COLUMN_ORDER = (
     ["파일ID", "파일명", "처리일시", "원문텍스트"] + PRICE_FIELDS
-    + ["업로더", "뒷면여부", "촬영시각", "매칭파일ID", "정리본위치"]
+    + ["업로더", "뒷면여부", "촬영시각", "사진해시", "매칭파일ID", "정리본위치"]
 )
 
 
@@ -179,6 +186,37 @@ def load_processed_ids(sheet):
     """구글 시트의 '파일ID' 열(1번 컬럼)에 이미 기록된 값들을 처리 완료 목록으로 삼는다."""
     ids = sheet.col_values(1)[1:]  # 헤더 제외
     return set(ids)
+
+
+# 같은 날 촬영된 완전히 동일한 사진이 실수로 두 번 업로드되는 경우를 걸러내기
+# 위한 락. same_day_hashes 집합(리테일러별로 하나씩)은 시트에서 미리 읽어온
+# 과거 기록에 이번 실행 중 새로 처리한 사진의 (해시, 촬영 날짜)를 스레드
+# 여러 개가 동시에 더해가는 구조라 잠금이 필요하다.
+same_day_hash_lock = threading.Lock()
+
+
+def load_same_day_hashes(sheet):
+    """시트에 이미 기록된 사진들 중 '사진해시'와 '촬영시각'이 둘 다 있는 행을
+    (해시, 촬영 날짜) 쌍의 집합으로 돌려준다. 파일ID(Drive가 업로드마다 새로
+    부여하는 값)만으로는 "내용이 완전히 같은 사진을 실수로 두 번 올린 경우"를
+    못 잡아내므로, 여기서는 사진 내용(해시)까지 같은지 본다. 다만 날짜까지
+    같아야만 중복으로 치므로, 다음 달에 같은 상품을 재촬영해 올리는 경우처럼
+    날짜가 다르면 해시가 같아도(예: 우연히 똑같이 나온 사진) 걸리지 않는다 -
+    시기별로 SKU 이력을 새로 쌓으려는 목적과 어긋나지 않게 하기 위함이다."""
+    idx = {name: COLUMN_ORDER.index(name) for name in ("파일ID", "촬영시각", "사진해시")}
+    columns = {name: sheet.col_values(i + 1)[1:] for name, i in idx.items()}  # 헤더 제외
+    row_count = len(columns["파일ID"])
+    for name in columns:
+        if len(columns[name]) < row_count:
+            columns[name] += [""] * (row_count - len(columns[name]))
+
+    pairs = set()
+    for i in range(row_count):
+        capture_time = columns["촬영시각"][i]
+        image_hash = columns["사진해시"][i]
+        if capture_time and image_hash:
+            pairs.add((image_hash, capture_time[:10]))
+    return pairs
 
 
 # ---------------- Drive: 전체 이미지 조회 (페이지네이션 포함) ----------------
@@ -1879,10 +1917,12 @@ def update_category_sheet(sheet, row_dicts: list):
     계산하면 충돌하므로, OCR 병렬 처리가 다 끝난 뒤 이 함수 하나만 단일
     스레드로 호출한다. 같은 상품코드가 다시 나와도 항상 새 열을 만든다.
 
-    돌려주는 값은 {파일ID: "C15"} 형태로, 각 카드가 어느 칸(열+제목행)에
-    기록됐는지를 나타낸다 - 뒷면 사진이 나중에 도착했을 때 소싱형태/
-    병입원산지를 그 칸에 소급 반영하려면(sync_back_sourcing 참고) 이 위치를
-    RAW 시트의 "정리본위치" 컬럼에 남겨둬야 하기 때문이다."""
+    돌려주는 값은 {파일ID: "시트제목!C15"} 형태로, 각 카드가 어느 정리본
+    시트의 어느 칸(열+제목행)에 기록됐는지를 나타낸다 - 뒷면 사진이 나중에
+    도착했을 때 소싱형태/병입원산지를 그 칸에 소급 반영하려면
+    (sync_back_sourcing 참고) 이 위치를 RAW 시트의 "정리본위치" 컬럼에
+    남겨둬야 하기 때문이다. 정리본이 촬영월별로 여러 시트로 나뉘어 있으므로
+    시트 제목까지 같이 남긴다."""
     if not row_dicts:
         return {}
 
@@ -1917,7 +1957,10 @@ def update_category_sheet(sheet, row_dicts: list):
         max_col_used = max(max_col_used, block["next_col"])
         file_id = row_dict.get("파일ID")
         if file_id:
-            positions[file_id] = f"{col_letter}{block['title_row']}"
+            # 정리본이 촬영월별로 여러 시트로 나뉘어 있어(아래 run_once 참고),
+            # 어느 시트의 칸인지도 같이 남겨야 sync_back_sourcing()이 나중에
+            # 정확한 시트를 다시 찾을 수 있다.
+            positions[file_id] = f"{sheet.title}!{col_letter}{block['title_row']}"
         block["next_col"] += 1
 
     if updates:
@@ -1940,7 +1983,7 @@ def update_category_sheet(sheet, row_dicts: list):
 sheet_lock = threading.Lock()  # gspread 동시 append 충돌 방지
 
 
-def build_row_dict(file_id, filename, fields, raw_text, uploader, is_back, capture_time):
+def build_row_dict(file_id, filename, fields, raw_text, uploader, is_back, capture_time, image_hash):
     row_dict = {
         "파일ID": file_id,
         "파일명": filename,
@@ -1952,6 +1995,9 @@ def build_row_dict(file_id, filename, fields, raw_text, uploader, is_back, captu
         "업로더": uploader,
         "뒷면여부": "뒷면" if is_back else "",
         "촬영시각": capture_time.strftime("%Y-%m-%d %H:%M:%S") if capture_time else "",
+        # 같은 날 찍힌 동일 사진의 실수 재업로드를 걸러내는 데 쓰는 사진
+        # 내용물 해시. load_same_day_hashes() 참고.
+        "사진해시": image_hash,
         # 이 시점엔 아직 시트에 쌓인 다른 사진들과 비교해보기 전이라 매칭을
         # 모른다 - resync_card_back_matches()가 별도로 채운다.
         "매칭파일ID": "",
@@ -2041,10 +2087,18 @@ def _write_category_positions(sheet, positions: dict):
         sheet.batch_update(updates, value_input_option="USER_ENTERED")
 
 
-def sync_back_sourcing(sheet, category_sheet, retailer: str) -> int:
+def sync_back_sourcing(sheet, retailer: str, resolve_category_sheet) -> int:
     """RAW 시트 전체 이력을 훑어, 상품카드<->뒷면 매칭이 되어 있고 그 카드가
     이미 제품군정리 시트에 칸을 가지고 있는(정리본위치가 채워진) 경우에
     한해 소싱형태/병입원산지를 계산해서 그 칸에 채운다.
+
+    정리본이 촬영월별로 여러 시트로 나뉘어 있어(run_once 참고), "정리본위치"에는
+    "시트제목!C15"처럼 어느 정리본 시트인지도 같이 적혀 있다. resolve_category_sheet(title)는
+    그 제목의 gspread Worksheet를 열어 돌려주는 함수로, 카드가 속한 달의
+    정리본이 이번 실행에서 한 번도 열리지 않았어도(예: 몇 달 전 카드에 뒷면
+    사진이 뒤늦게 도착한 경우) 필요할 때마다 그 시트를 연다. 월별 분리
+    이전에 이미 기록된 옛 형식(시트제목 없이 "C15"만 있음)은 그 시절엔
+    정리본이 리테일러당 하나뿐이었던 시절의 이름으로 대신 찾는다.
 
     resync_card_back_matches()와 마찬가지로 매번 전체 이력을 다시 계산한다 -
     뒷면이 카드보다 늦게(심지어 다른 실행 회차에) 올라와도 소급 반영되어야
@@ -2085,7 +2139,7 @@ def sync_back_sourcing(sheet, category_sheet, retailer: str) -> int:
     by_id = {e["file_id"]: e for e in entries}
     matches = match_card_back_pairs(entries)
 
-    candidates = []  # (셀주소, 값)
+    candidates_by_title = {}  # 정리본 시트 제목 -> [(셀주소, 값), ...]
     for card in entries:
         if card["is_back"] or not card["position"]:
             continue
@@ -2093,29 +2147,36 @@ def sync_back_sourcing(sheet, category_sheet, retailer: str) -> int:
         back_text = "\n".join(by_id[bid]["text"] for bid in back_ids if bid in by_id)
         if not back_text:
             continue
-        m = re.match(r"^([A-Z]+)(\d+)$", card["position"])
+        if "!" in card["position"]:
+            title, cell_ref = card["position"].split("!", 1)
+        else:
+            title, cell_ref = _LEGACY_CATEGORY_SHEET_TITLE[retailer], card["position"]
+        m = re.match(r"^([A-Z]+)(\d+)$", cell_ref)
         if not m:
             continue
         col, title_row = m.group(1), int(m.group(2))
         sourcing, origin = determine_sourcing(card["product_name"], retailer, back_text)
         sourcing_row = title_row + CATEGORY_ROW_LABELS.index("소싱형태") + 1
         origin_row = title_row + CATEGORY_ROW_LABELS.index("병입원산지") + 1
-        candidates.append((f"{col}{sourcing_row}", sourcing))
-        candidates.append((f"{col}{origin_row}", origin))
+        candidates_by_title.setdefault(title, []).append((f"{col}{sourcing_row}", sourcing))
+        candidates_by_title.setdefault(title, []).append((f"{col}{origin_row}", origin))
 
-    candidates = [(cell, value) for cell, value in candidates if value]
-    if not candidates:
-        return 0
-
-    current = category_sheet.batch_get([cell for cell, _ in candidates])
-    updates = []
-    for (cell, value), grid in zip(candidates, current):
-        existing = grid[0][0] if grid and grid[0] else ""
-        if not existing:
-            updates.append({"range": cell, "values": [[value]]})
-    if updates:
-        category_sheet.batch_update(updates, value_input_option="USER_ENTERED")
-    return len(updates)
+    total_updates = 0
+    for title, candidates in candidates_by_title.items():
+        candidates = [(cell, value) for cell, value in candidates if value]
+        if not candidates:
+            continue
+        category_sheet = resolve_category_sheet(title)
+        current = category_sheet.batch_get([cell for cell, _ in candidates])
+        updates = []
+        for (cell, value), grid in zip(candidates, current):
+            existing = grid[0][0] if grid and grid[0] else ""
+            if not existing:
+                updates.append({"range": cell, "values": [[value]]})
+        if updates:
+            category_sheet.batch_update(updates, value_input_option="USER_ENTERED")
+        total_updates += len(updates)
+    return total_updates
 
 
 def append_rows_to_sheet(sheet, row_dicts):
@@ -2188,7 +2249,7 @@ def get_thread_drive_service(creds):
     return _thread_local.drive_service
 
 
-def process_one_file(creds, sheets, file_info, archive_folder_id, retailer, source_folder_id):
+def process_one_file(creds, sheets, file_info, archive_folder_id, retailer, source_folder_id, same_day_hashes):
     name, file_id = file_info["name"], file_info["id"]
     drive_service = get_thread_drive_service(creds)
     image_bytes = download_image(drive_service, file_id)
@@ -2197,6 +2258,24 @@ def process_one_file(creds, sheets, file_info, archive_folder_id, retailer, sour
     # owners는 Drive 목록 조회 시점에 이미 받아온 값(list_all_images 참고).
     capture_time = extract_capture_time(image_bytes, name)
     uploader = (file_info.get("owners") or [{}])[0].get("emailAddress", "")
+    image_hash = hashlib.sha256(image_bytes).hexdigest()
+
+    # 같은 날 찍힌 완전히 같은 사진이 실수로 두 번 업로드된 경우만 걸러낸다.
+    # 촬영시각을 모르는 사진(EXIF도 파일명 패턴도 없음)은 "같은 날"을 판단할
+    # 근거가 없으므로 걸러내지 않고 원래대로 처리한다 - 날짜가 다르면(예:
+    # 다음 달 재촬영) 해시가 같아도 절대 걸리지 않으니, 시기별 SKU 이력이
+    # 끊기는 일은 없다.
+    if capture_time:
+        dedup_key = (image_hash, capture_time.strftime("%Y-%m-%d"))
+        with same_day_hash_lock:
+            if dedup_key in same_day_hashes:
+                try:
+                    archive_file(drive_service, file_id, archive_folder_id, source_folder_id)
+                except Exception as e:
+                    print(f"  경고: '{name}' 중복 사진 보관 이동 실패: {e}")
+                return name, None, False, None, retailer, False, True
+            same_day_hashes.add(dedup_key)
+
     image_bytes = normalize_image_for_ocr(image_bytes)
     text, confidences = ocr_image_azure(image_bytes)
     low_confidence = needs_review(confidences)
@@ -2224,7 +2303,7 @@ def process_one_file(creds, sheets, file_info, archive_folder_id, retailer, sour
     if not is_back and (not fields.get("가격") or not fields.get("제품명(한국어)")):
         low_confidence = True
 
-    row_dict = build_row_dict(file_id, name, fields, text, uploader, is_back, capture_time)
+    row_dict = build_row_dict(file_id, name, fields, text, uploader, is_back, capture_time, image_hash)
     append_rows_to_sheet(sheet, [row_dict])
 
     # 시트 기록이 끝난 뒤에 사진을 '처리완료' 폴더로 옮긴다. 이동이 실패해도
@@ -2236,7 +2315,7 @@ def process_one_file(creds, sheets, file_info, archive_folder_id, retailer, sour
     except Exception as e:
         print(f"  경고: '{name}' 보관 폴더 이동 실패 (시트 기록은 완료됨): {e}")
 
-    return name, fields.get("제품명(한국어)") or "", low_confidence, row_dict, retailer, is_back
+    return name, fields.get("제품명(한국어)") or "", low_confidence, row_dict, retailer, is_back, False
 
 
 # ---------------- 메인 실행 ----------------
@@ -2267,11 +2346,22 @@ def run_once():
         ensure_header(sheet)
     # 제품군정리는 코스트코/트레이더스 원본과 완전히 다른(블록형) 구조라
     # COLUMN_ORDER 기반 ensure_header 대상이 아니다. 원본 시트와 마찬가지로
-    # 리테일러별로 따로 둔다.
-    category_sheets = {
-        "costco": open_or_create_sheet(CATEGORY_SHEET_NAME_COSTCO),
-        "traders": open_or_create_sheet(CATEGORY_SHEET_NAME_TRADERS),
-    }
+    # 리테일러별로 따로 두되, 이제 촬영월별로도 나눈다 - "언제 OCR을 돌렸는지"가
+    # 아니라 "언제 찍힌 사진인지" 기준으로 그 시기의 코스트코/트레이더스
+    # 상품 스냅샷을 보여주기 위함이라, 같은 상품을 다른 달에 다시 촬영해도
+    # 중복 제거되지 않고 그 달의 정리본에 새로 쌓인다. 시트는 실제로 필요한
+    # 순간(카드가 그 달에 처리되거나, 그 달 카드에 뒷면이 뒤늦게 매칭될 때)에만
+    # 열거나 새로 만든다.
+    category_sheet_cache = {}  # 시트 제목 -> Worksheet 객체 (매 실행마다 한 번씩만 열기)
+
+    def category_sheet_title(retailer, month_key):
+        base_name = CATEGORY_SHEET_NAME_COSTCO if retailer == "costco" else CATEGORY_SHEET_NAME_TRADERS
+        return f"{base_name}_{month_key}"
+
+    def get_category_sheet(title):
+        if title not in category_sheet_cache:
+            category_sheet_cache[title] = open_or_create_sheet(title)
+        return category_sheet_cache[title]
 
     # 코스트코/트레이더스는 이제 서로 다른 Drive 폴더에서 온다 - 어느 폴더에서
     # 조회했는지가 곧 리테일러이므로, 신규 파일 목록도 시트별로 각자의 폴더에서
@@ -2279,11 +2369,13 @@ def run_once():
     folder_ids = {"costco": DRIVE_FOLDER_ID_COSTCO, "traders": DRIVE_FOLDER_ID_TRADERS}
     new_files = {}
     archive_folder_ids = {}
+    same_day_hashes = {}
     for retailer, folder_id in folder_ids.items():
         processed_ids = load_processed_ids(sheets[retailer])
         all_files = list_all_images(drive_service, folder_id)
         new_files[retailer] = [f for f in all_files if f["id"] not in processed_ids]
         archive_folder_ids[retailer] = get_or_create_archive_folder(drive_service, folder_id)
+        same_day_hashes[retailer] = load_same_day_hashes(sheets[retailer])
 
     total_new = sum(len(files) for files in new_files.values())
     if total_new == 0:
@@ -2298,12 +2390,16 @@ def run_once():
 
     success_count = 0
     failed = []
-    processed_row_dicts = {"costco": [], "traders": []}
+    duplicate_count = 0
+    # 리테일러 -> {촬영월(YYYY-MM): [row_dict, ...]} - 정리본을 월별로 나누기
+    # 위한 그룹화(아래 update_category_sheet 호출부 참고).
+    processed_row_dicts = {"costco": {}, "traders": {}}
 
     with ThreadPoolExecutor(max_workers=CONCURRENT_WORKERS) as executor:
         futures = {
             executor.submit(
-                process_one_file, creds, sheets, f, archive_folder_ids[retailer], retailer, folder_ids[retailer]
+                process_one_file, creds, sheets, f, archive_folder_ids[retailer], retailer,
+                folder_ids[retailer], same_day_hashes[retailer],
             ): f
             for retailer, files in new_files.items()
             for f in files
@@ -2311,14 +2407,25 @@ def run_once():
         for future in as_completed(futures):
             f = futures[future]
             try:
-                name, product, flag, row_dict, retailer, is_back = future.result()
+                name, product, flag, row_dict, retailer, is_back, is_duplicate = future.result()
                 success_count += 1
+                if is_duplicate:
+                    duplicate_count += 1
+                    print(f"  건너뜀: {name} -> 같은 날 찍힌 동일 사진이 이미 등록돼 있어 중복 처리하지 않음")
+                    continue
                 # 제품 뒷면 사진은 RAW 시트엔 그대로 기록되지만(위에서 이미 끝남),
                 # 제품군정리(정리본)에는 상품카드에서 이미 뽑은 내용을 중복으로
                 # 넣지 않도록 애초에 이 목록에 넣지 않는다 - 그러면 update_category_sheet()가
                 # 이 사진을 위한 새 열 자체를 만들지 않는다.
                 if not is_back:
-                    processed_row_dicts[retailer].append(row_dict)
+                    # 정리본을 어느 달 시트에 넣을지는 촬영시각 기준이다 - OCR을
+                    # 언제 돌렸는지가 아니라 실제로 언제 찍힌 사진인지로 나눠야
+                    # "그 시기에 있었던 상품" 스냅샷이 되기 때문이다. 촬영시각을
+                    # 알 수 없는 사진(EXIF도 파일명 패턴도 없음)만 예외적으로
+                    # 이번 실행 시각(처리월) 기준으로 넣는다.
+                    capture_str = row_dict.get("촬영시각") or ""
+                    month_key = capture_str[:7] if capture_str else time.strftime("%Y-%m")
+                    processed_row_dicts[retailer].setdefault(month_key, []).append(row_dict)
                 flag_str = " [검토필요]" if flag else ""
                 back_str = " [뒷면]" if is_back else ""
                 print(f"  완료: {name} -> {product or '(제품명 인식 실패)'}{flag_str}{back_str}")
@@ -2327,16 +2434,18 @@ def run_once():
                 print(f"  실패: {f['name']} -> {e}")
 
     # 제품군 블록에 열 번호를 매기는 작업은 동시에 하면 충돌하므로, 병렬
-    # 처리가 다 끝난 뒤 단일 스레드로 한 번에 처리한다.
-    for retailer, row_dicts in processed_row_dicts.items():
-        try:
-            positions = update_category_sheet(category_sheets[retailer], row_dicts)
-            # 방금 만든 칸의 위치를 RAW 시트에 남겨둔다 - 뒷면 사진이 나중에
-            # (심지어 다음 실행 회차에) 도착했을 때 그 칸을 다시 찾아 소싱형태/
-            # 병입원산지를 채우려면 필요하다 (sync_back_sourcing 참고).
-            _write_category_positions(sheets[retailer], positions)
-        except Exception as e:
-            print(f"경고: {retailer} 제품군정리 시트 갱신 실패 (원본 시트 기록은 정상 완료됨): {e}")
+    # 처리가 다 끝난 뒤 단일 스레드로 한 번에, 그리고 월별 시트 단위로 처리한다.
+    for retailer, by_month in processed_row_dicts.items():
+        for month_key, row_dicts in by_month.items():
+            try:
+                sheet_for_month = get_category_sheet(category_sheet_title(retailer, month_key))
+                positions = update_category_sheet(sheet_for_month, row_dicts)
+                # 방금 만든 칸의 위치를 RAW 시트에 남겨둔다 - 뒷면 사진이 나중에
+                # (심지어 다음 실행 회차에) 도착했을 때 그 칸을 다시 찾아 소싱형태/
+                # 병입원산지를 채우려면 필요하다 (sync_back_sourcing 참고).
+                _write_category_positions(sheets[retailer], positions)
+            except Exception as e:
+                print(f"경고: {retailer} {month_key} 제품군정리 시트 갱신 실패 (원본 시트 기록은 정상 완료됨): {e}")
 
     # 상품카드 <-> 뒷면 매칭은 이번 실행분만으로는 계산하지 않는다 - 대시보드
     # "업데이트" 버튼을 누를 때마다 한 번씩 도는 구조라 카드와 뒷면이 서로
@@ -2353,13 +2462,13 @@ def run_once():
         # 앞뒤 매칭이 갱신된 뒤에 소싱형태/병입원산지를 반영해야, 이번 실행에서
         # 막 매칭된 카드<->뒷면 쌍도 바로 반영된다.
         try:
-            filled = sync_back_sourcing(sheet, category_sheets[retailer], retailer)
+            filled = sync_back_sourcing(sheet, retailer, get_category_sheet)
             if filled:
                 print(f"  {retailer}: 소싱형태/병입원산지 {filled}건 반영")
         except Exception as e:
             print(f"경고: {retailer} 소싱형태/병입원산지 반영 실패 (원본 시트 기록은 정상 완료됨): {e}")
 
-    print(f"\n완료: {success_count}건 성공, {len(failed)}건 실패")
+    print(f"\n완료: {success_count - duplicate_count}건 등록, {duplicate_count}건 중복 건너뜀, {len(failed)}건 실패")
     if failed:
         print("실패 목록 (다음 실행 시 자동 재시도됩니다 - 시트에 기록되지 않은 파일ID는 신규로 취급됨):")
         for name, err in failed:
