@@ -28,6 +28,7 @@ Azure Read API는 무료 티어(F0)에서 월 5,000건까지 완전 무료로 �
 GitHub Actions에서는 리포지토리 Secrets 값이 환경변수로 주입된다.
 """
 
+import datetime
 import io
 import os
 import re
@@ -43,7 +44,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 import gspread
-from PIL import Image
+from PIL import Image, ImageOps
 import pillow_heif
 
 pillow_heif.register_heif_opener()  # PIL이 HEIC/HEIF 파일도 열 수 있도록 등록 (아이폰 기본 사진 포맷)
@@ -108,7 +109,10 @@ CORE_PRICE_FIELDS = ["상품코드", "제품명(한국어)", "가격"]
 OPTIONAL_PRICE_FIELDS = ["제품명(영어)", "중량", "단가"]
 PRICE_FIELDS = CORE_PRICE_FIELDS + OPTIONAL_PRICE_FIELDS
 
-COLUMN_ORDER = ["파일ID", "파일명", "처리일시", "원문텍스트"] + PRICE_FIELDS
+COLUMN_ORDER = (
+    ["파일ID", "파일명", "처리일시", "원문텍스트"] + PRICE_FIELDS
+    + ["업로더", "뒷면여부", "촬영시각", "매칭파일ID"]
+)
 
 
 def require_config():
@@ -174,8 +178,6 @@ def load_processed_ids(sheet):
 
 
 # ---------------- Drive: 전체 이미지 조회 (페이지네이션 포함) ----------------
-HEIC_MIME_TYPES = ("image/heic", "image/heif")
-
 def list_all_images(drive_service, folder_id):
     query = (
         f"'{folder_id}' in parents and "
@@ -188,7 +190,11 @@ def list_all_images(drive_service, folder_id):
     while True:
         results = drive_service.files().list(
             q=query,
-            fields="nextPageToken, files(id, name, mimeType)",
+            # owners(emailAddress): 앞뒤 사진 매칭에 쓸 "누가 올렸는지" 신호.
+            # 개인 Drive 폴더(공유 드라이브 아님)에 각자 계정으로 올리는
+            # 구조라 업로드한 사람 소유로 파일이 생성되므로 이 필드에 실제
+            # 업로더 이메일이 찍힌다.
+            fields="nextPageToken, files(id, name, mimeType, owners(emailAddress))",
             pageSize=1000,
             pageToken=page_token,
         ).execute()
@@ -248,19 +254,78 @@ def download_image(drive_service, file_id):
     return buf.getvalue()
 
 
-def convert_heic_to_jpeg(image_bytes: bytes) -> bytes:
-    """Azure Read API는 HEIC/HEIF를 지원하지 않으므로(아이폰 기본 사진 포맷),
-    OCR에 보내기 전에 JPEG로 변환한다."""
+def normalize_image_for_ocr(image_bytes: bytes) -> bytes:
+    """Azure Read API로 보내기 전에 두 가지를 항상 맞춘다.
+
+    1) HEIC/HEIF(아이폰 기본 사진 포맷)는 Azure가 지원하지 않으므로 JPEG로
+       변환한다.
+    2) 휴대폰 카메라는 센서가 담은 원본 픽셀을 항상 가로로 저장하고 "실제로는
+       이만큼 돌려서 봐야 한다"는 EXIF 방향 정보만 따로 붙이는 경우가 많다.
+       사진 뷰어/갤러리 앱은 이 태그를 자동으로 반영해서 똑바로 보여주지만,
+       Azure Read API는 이 태그를 반영하지 않고 원본 픽셀 그대로 받아들인다
+       (Microsoft 공식 문서에도 나온 알려진 제약) - 그래서 사람 눈엔 멀쩡한
+       사진도 OCR 엔진에는 옆으로 누운 채로 전달되어 인식률이 떨어질 수 있다.
+       ImageOps.exif_transpose()로 픽셀 자체를 세우고 방향 태그는 지운
+       뒤(그래야 아래에서 새로 저장할 때 이중으로 안 돌아간다) 보낸다.
+
+    HEIC든 JPEG/PNG든 상관없이 항상 거친다 - 방향이 이미 정상인 사진은
+    exif_transpose()가 그대로 돌려주므로 아무 변화가 없다."""
     image = Image.open(io.BytesIO(image_bytes))
+    image = ImageOps.exif_transpose(image)
     out = io.BytesIO()
     image.convert("RGB").save(out, format="JPEG", quality=92)
     return out.getvalue()
 
 
-def is_heic(file_info: dict) -> bool:
-    if file_info.get("mimeType") in HEIC_MIME_TYPES:
-        return True
-    return file_info.get("name", "").lower().endswith((".heic", ".heif"))
+# EXIF DateTimeOriginal(0x9003)은 최상위 IFD가 아니라 "Exif" 서브 IFD(0x8769)
+# 안에 있다 - Image.getexif()만으로는 안 보이고 get_ifd()로 한 번 더 들어가야
+# 한다. DateTimeDigitized(0x9004)는 촬영 직후 자동 백업 등으로 아주 드물게
+# DateTimeOriginal이 비어있을 때의 보조값.
+_EXIF_IFD_EXIF = 0x8769
+_EXIF_DATETIME_ORIGINAL = 0x9003
+_EXIF_DATETIME_DIGITIZED = 0x9004
+_EXIF_DATETIME_FALLBACK = 0x0132  # 최상위 IFD의 DateTime(파일 수정시각에 가까움, 최후 보조값)
+
+# 삼성 카메라 기본 파일명(20260713_111558.jpg)에 박힌 촬영시각. EXIF가 없는
+# 드문 경우의 2순위 폴백 - 아이폰의 IMG_1234류 일련번호는 절대시각이 아니라서
+# (기기 안에서만 유효한 카운터) 파싱 대상에 넣지 않는다.
+_FILENAME_TIMESTAMP_PATTERN = re.compile(r"(20\d{2})(\d{2})(\d{2})[_-](\d{2})(\d{2})(\d{2})")
+
+
+def extract_capture_time(image_bytes: bytes, filename: str):
+    """사람별로 사진을 촬영 순서대로 정렬하기 위한 시각을 구한다. Drive
+    업로드 완료 시각(createdTime)은 파일 크기·네트워크 상태에 따라 완료
+    순서가 실제 촬영 순서와 달라질 수 있어 쓰지 않는다 - 카메라가 셔터를
+    누른 순간 자동으로 남기는 EXIF 촬영시각을 1순위로, 그마저 없으면(예:
+    메신저를 거치며 메타데이터가 지워진 사진) 삼성 파일명의 날짜_시각
+    패턴을 2순위로 쓴다. 아이폰 HEIC도 pillow_heif가 등록한 오프너를 통해
+    JPEG와 동일하게 EXIF를 읽는다. 변환 전 원본 바이트에서 읽어야 한다 -
+    normalize_image_for_ocr()로 재인코딩하면 방향 태그가 지워진다. 둘 다
+    없으면 순서를 알 수 없다는 뜻이므로 None을 돌려주고, 그 사진은 앞뒤
+    매칭 대상에서 빠진다(데이터 자체는 RAW 시트에 그대로 남는다)."""
+    try:
+        image = Image.open(io.BytesIO(image_bytes))
+        exif = image.getexif()
+        raw = None
+        if exif:
+            exif_ifd = exif.get_ifd(_EXIF_IFD_EXIF)
+            raw = (
+                exif_ifd.get(_EXIF_DATETIME_ORIGINAL)
+                or exif_ifd.get(_EXIF_DATETIME_DIGITIZED)
+                or exif.get(_EXIF_DATETIME_FALLBACK)
+            )
+        if raw:
+            return datetime.datetime.strptime(raw.strip(), "%Y:%m:%d %H:%M:%S")
+    except Exception:
+        pass
+
+    m = _FILENAME_TIMESTAMP_PATTERN.search(filename)
+    if m:
+        try:
+            return datetime.datetime(*(int(g) for g in m.groups()))
+        except ValueError:
+            pass
+    return None
 
 
 # ---------------- Azure Read API OCR (재시도 포함) ----------------
@@ -371,8 +436,19 @@ def _defer_offcolumn_price_tokens(positioned):
 # 전체(제품명 등)가 통째로 버려지는 심각한 회귀로 이어졌다. 그래서 간격은
 # 색이 실제로 다를 때만 분리 근거로 쓴다 - 색이 같으면(같은 흰 바탕 가격표
 # 안이라는 뜻) 간격이 아무리 커도 절대 분리하지 않는다.
+#
+# "색이 실제로 다르다"만으로는 아직 부족했다 - 같은 흰 가격표라도 태그
+# 홀더의 그림자나 조명 반사(글레어) 때문에 본문 쪽과 가격 쪽의 밝기가 크게
+# 차이나는 경우가 실사진 대부분에서 확인됐다(예: (153,159,163) vs
+# (219,223,225), 유클리드 거리 110 - 위 60 기준을 훌쩍 넘는데도 둘 다
+# 채도는 0.06/0.03으로 사실상 무채색). 그림자/글레어는 R/G/B 세 채널을
+# 거의 같은 비율로 밝게 또는 어둡게 만들 뿐이라 색 자체(채도)는 그대로
+# 무채색에 가깝게 남는다 - 실제로 다른 색 포장/라벨(카드 밖 다른 물체)만
+# 뚜렷한 채도 차이를 만든다. 그래서 유클리드 거리가 크더라도 두 색 다
+# 무채색이면(채도가 낮으면) "밝기 차이일 뿐"으로 보고 분리하지 않는다.
 _CLUSTER_GAP_RATIO = 1.2      # 이 배수 이상 벌어지면서 색도 다르면 분리
 _CLUSTER_COLOR_DISTANCE = 60  # RGB 유클리드 거리 기준
+_CLUSTER_MIN_SATURATION = 0.15  # 이 미만이면 무채색(흰/회/검)으로 간주
 
 
 def _orient_image_to_match(image, expected_width, expected_height):
@@ -417,6 +493,24 @@ def _color_distance(c1, c2):
     return sum((a - b) ** 2 for a, b in zip(c1, c2)) ** 0.5
 
 
+def _saturation(c):
+    """0(완전 무채색: 흰/회/검)~1(뚜렷한 색) 범위로, RGB 세 채널이 서로
+    얼마나 벌어져 있는지를 본다. 그림자/글레어는 세 채널을 거의 같은 비율로
+    밝게/어둡게 만들 뿐이라 채도는 낮게 유지되고, 실제로 다른 색 물체만
+    채도가 뚜렷하게 올라간다."""
+    mx, mn = max(c), min(c)
+    return (mx - mn) / mx if mx else 0.0
+
+
+def _is_different_background(c1, c2):
+    """유클리드 거리만으로는 흰 가격표 위의 밝기 차이(그림자/글레어)와 실제로
+    다른 색 물체를 구분하지 못한다 - 둘 다 채도가 낮으면(무채색이면) 거리가
+    아무리 커도 조명 차이일 뿐 다른 물체가 아니라고 본다."""
+    if _saturation(c1) < _CLUSTER_MIN_SATURATION and _saturation(c2) < _CLUSTER_MIN_SATURATION:
+        return False
+    return _color_distance(c1, c2) >= _CLUSTER_COLOR_DISTANCE
+
+
 def _cluster_lines_by_layout(positioned):
     """세로 간격(+ 보조적으로 배경색)을 보고 줄들을 물리적 덩어리로 나눈다."""
     if not positioned:
@@ -431,7 +525,7 @@ def _cluster_lines_by_layout(positioned):
 
         should_break = False
         if gap_ratio >= _CLUSTER_GAP_RATIO and prev.get("color") and cur.get("color"):
-            should_break = _color_distance(prev["color"], cur["color"]) >= _CLUSTER_COLOR_DISTANCE
+            should_break = _is_different_background(prev["color"], cur["color"])
 
         if should_break:
             clusters.append([cur])
@@ -575,8 +669,17 @@ def _select_regular_price(prices, discount):
 # "포"처럼 짧은 수량 표시만 더 있고 그걸로 줄이 끝나면, 그 지점부터를 전부
 # 중량 쪽으로 떼어낸다. "1L(퓨어)"처럼 단위 뒤에 짧은 괄호 설명만 붙는 경우도
 # 마찬가지로 허용한다.
+#
+# "츠바키 ... 180g*2+리필 150g+펌프"처럼, 중량 조각 사이/뒤에 "리필"/"펌프"
+# 같은 짧은 한글 설명이 끼어드는 콤보도 실사진에서 확인됐다 - 단순 접속기호
+# (+,x,×)만 허용하던 기존 이음새로는 이 한글 단어에서 막혀 버렸다. 이음새에
+# 곱셈 배수(*2 등)와 짧은 한글 단어(4자 이하)를 같이 허용해서, 중량 조각들
+# 사이(뒤에서 볼 때는 앞으로 병합, 앞에서 볼 때는 뒤로 확장) 모두에 쓴다.
+_SPEC_JOIN_RE = r"(?:[*xX×]\s*\d+)?[\s+xX×,]*[가-힣]{0,4}[\s+xX×,]*"
+
 _TRAILING_QUANTITY_RE = re.compile(
-    r"^[\sx×X*]*\d*\s*(개|포|입|병|팩|ea|EA|Ea)?\.?\s*(\([^)]{1,10}\))?$"
+    r"^[\sx×X*]*\d*\s*(개|포|입|병|팩|ea|EA|Ea)?\.?\s*(\([^)]{1,10}\))?"
+    r"(?:" + _SPEC_JOIN_RE + r")*$"
 )
 
 # "100g당 899원"처럼 "단가"라는 글자 없이 "N단위당 M원" 형태로만 찍히는 경우도
@@ -586,19 +689,51 @@ UNIT_PRICE_PATTERN = re.compile(
     r"(\d+(?:\.\d+)?\s*(?:g|ml|kg|l|m)?)\s*당\s*([\d,]+)\s*원", re.IGNORECASE
 )
 
+# 건강기능식품류는 무게(g/ml/kg 등) 대신 "80포", "180정", "1,000MG × 180정"처럼
+# 개수만으로 규격을 나타내는 경우가 많다 - WEIGHT_PATTERN이 다루는 단위가 아니라
+# 지금까지는 그냥 제품명에 붙은 채로 남아있었다. "정"을 OCR이 "적"으로 잘못
+# 읽는 경우가 실제로 있어서("112적") 같이 받아준다. "입"(개당 낱개 수를 세는
+# 아주 흔한 단위, "3입"/"12입"/"6입")도 마찬가지라 같이 받는다.
+_TRAILING_COUNT_RE = re.compile(
+    r"((?:[\d,]+\s*(?:MG|mg|G|g)\s*[×xX]\s*)?\d{1,4}\s*(?:정|적|캡슐|포|병|팩|롤|입))\s*$"
+)
+
+# "쉬크 하이드로5 스킨 프로텍트 기*2+날*14", "질레트 프로글라이드 파워
+# (면도기1+날8)"처럼, 무게 단위도 개수 단위도 아니라 "부품명+숫자"를 "+"로
+# 이어 붙인 구성품 목록으로 규격을 나타내는 카드도 실사진에서 확인됐다(면도기
+# 종류에 많음 - 손잡이/면도날처럼 세트 구성이 다양해서). 앞의 두 방식(무게/
+# 개수 단위)으로 못 걸러지므로 별도 패턴이 필요하다. 부품명 하나짜리는(예:
+# 제품명 끝의 우연한 "숫자") 오탐 위험이 있어 최소 두 조각(부품+숫자가 "+"로
+# 두 번 이상) 이어진 경우만 인정한다.
+_COMPONENT_COMBO_RE = re.compile(
+    r"(?:^|\s)([가-힣]{1,4}\*?\d{1,3}(?:\s*\+\s*[가-힣]{1,4}\*?\d{1,3})+)\s*$"
+)
+
+
+def _is_spec_combo(text: str) -> bool:
+    """중량/개수/구성 콤보 규격 중 하나에라도 해당하는지 확인한다. 괄호로
+    통째로 감싸인 규격 표기를 뗄 때, 안의 내용이 어떤 종류의 규격이든 다
+    인식하기 위해 세 가지를 한 번에 확인한다."""
+    text = text.strip()
+    return bool(
+        WEIGHT_PATTERN.search(text)
+        or _TRAILING_COUNT_RE.fullmatch(text)
+        or _COMPONENT_COMBO_RE.fullmatch(text)
+    )
+
 
 def _split_trailing_weight(name: str) -> tuple:
     """제품명 문자열 끝에 중량이 붙어있으면 (중량 뗀 제품명, 중량)을 돌려주고,
     없으면 (원래 이름, "")을 그대로 돌려준다."""
     # "에어프라이어 4L+1.5L"처럼 규격 전체가 괄호로 감싸인 채 나오는 경우가
     # 아니라, "(48g * 12입)"처럼 규격 표기 전체가 괄호 하나로 감싸인 채 붙는
-    # 경우도 있다. 괄호 안에 중량 패턴이 있으면 괄호 전체를 그대로 중량으로
-    # 떼어낸다 - 안에서 "48g * 12입"처럼 콤보로 이어져도 낱개로 다시 쪼갤
-    # 필요 없이 그대로 살린다. (괄호 안에 중량이 없는 "1L(퓨어)" 같은 경우는
-    # 여기 해당 없이 아래 일반 로직으로 넘어간다.)
+    # 경우도 있다. 괄호 안이 어떤 종류든 규격으로 인식되면 괄호 전체를 중량
+    # 자리로 떼어낸다 - 괄호(와 안의 콤보 구조)는 버리고 내용만 남긴다.
+    # (괄호 안에 규격이 없는 "1L(퓨어)" 같은 경우는 여기 해당 없이 아래 일반
+    # 로직으로 넘어간다.)
     paren_match = re.search(r"\(([^()]*)\)\s*$", name)
-    if paren_match and WEIGHT_PATTERN.search(paren_match.group(1)):
-        return name[:paren_match.start()].strip(), name[paren_match.start():].strip()
+    if paren_match and _is_spec_combo(paren_match.group(1)):
+        return name[:paren_match.start()].strip(), paren_match.group(1).strip()
 
     matches = list(WEIGHT_PATTERN.finditer(name))
     if not matches:
@@ -608,26 +743,17 @@ def _split_trailing_weight(name: str) -> tuple:
     if not _TRAILING_QUANTITY_RE.match(rest):
         return name, ""
     start = last.start()
-    # "에어프라이어 4L+1.5L"처럼 콤보 규격이 "+" 같은 짧은 연결자로 이어진
-    # 경우, 맨 뒤 조각("1.5L")만 떼면 앞 조각("4L")을 잃어버린다. 바로 앞
-    # 중량 조각과의 사이가 연결자뿐이면 그 조각까지 같이 묶어서 중량으로
-    # 인정한다.
+    # "에어프라이어 4L+1.5L"처럼 콤보 규격이 "+" 같은 짧은 연결자(+ 곱셈 배수,
+    # + 짧은 한글 설명)로 이어진 경우, 맨 뒤 조각("1.5L")만 떼면 앞 조각
+    # ("4L")을 잃어버린다. 바로 앞 중량 조각과의 사이가 이음새뿐이면 그
+    # 조각까지 같이 묶어서 중량으로 인정한다.
     for prev in reversed(matches[:-1]):
         gap = name[prev.end():start]
-        if re.fullmatch(r"[\s+xX×,]{1,3}", gap):
+        if re.fullmatch(_SPEC_JOIN_RE, gap):
             start = prev.start()
         else:
             break
     return name[:start].strip(), name[start:].strip()
-
-
-# 건강기능식품류는 무게(g/ml/kg 등) 대신 "80포", "180정", "1,000MG × 180정"처럼
-# 개수만으로 규격을 나타내는 경우가 많다 - WEIGHT_PATTERN이 다루는 단위가 아니라
-# 지금까지는 그냥 제품명에 붙은 채로 남아있었다. "정"을 OCR이 "적"으로 잘못
-# 읽는 경우가 실제로 있어서("112적") 같이 받아준다.
-_TRAILING_COUNT_RE = re.compile(
-    r"((?:[\d,]+\s*(?:MG|mg|G|g)\s*[×xX]\s*)?\d{1,4}\s*(?:정|적|캡슐|포|병|팩|롤))\s*$"
-)
 
 
 def _split_trailing_count(name: str) -> tuple:
@@ -637,6 +763,37 @@ def _split_trailing_count(name: str) -> tuple:
     if not m:
         return name, ""
     return name[:m.start()].strip(), m.group(1).strip()
+
+
+def _split_trailing_component_combo(name: str) -> tuple:
+    """제품명 문자열 끝에 "부품명+숫자"를 "+"로 이어 붙인 구성품 목록(무게도
+    개수 단위도 아닌 규격)이 붙어있으면 (규격 뗀 제품명, 규격)을 돌려주고,
+    없으면 (원래 이름, "")을 그대로 돌려준다."""
+    m = _COMPONENT_COMBO_RE.search(name)
+    if not m:
+        return name, ""
+    return name[:m.start(1)].strip(), m.group(1).strip()
+
+
+# "덴티스테 플러스 화이트 치약 세트" 같은 세트 상품은 제품명 자체엔 규격이
+# 전혀 안 붙고, 대신 셀링포인트 줄에 "- 구성: 치약 160g*2+60g*1+20g*2"처럼
+# 별도로 규격이 나온다 - 위 세 방법은 전부 제품명 문자열 끝에서만 찾으므로
+# 이 경우를 못 잡는다. "구성:" 문구가 있는 줄을 따로 찾아서 그 안에서
+# 중량 패턴이 시작하는 지점부터 끝까지를 규격으로 본다("치약" 같은 품목명
+# 접두어는 중량이 없는 부분이라 자연히 잘려나간다).
+_COMPOSITION_LABEL_RE = re.compile(r"구성\s*[:：]\s*(.+)$")
+
+
+def _find_composition_spec(lines: list) -> str:
+    for line in lines:
+        m = _COMPOSITION_LABEL_RE.search(line)
+        if not m:
+            continue
+        content = m.group(1).strip()
+        spec_match = WEIGHT_PATTERN.search(content)
+        if spec_match:
+            return content[spec_match.start():].strip()
+    return ""
 
 
 # "신세계포인트", "Global Product", "적립", "행사기간"처럼 셀링포인트 문구가
@@ -784,23 +941,56 @@ def _normalize_bare_code(line: str) -> str:
 # 구분할 수 없고, 내용을 봐야 한다. 실사진 두 장(도브 뷰티 크림바 뒷면 vs
 # 상품카드) 비교로 확인한 두 조건을 그대로 쓴다:
 #   1) 가격(콤마 형식 판매가 줄)이 아예 없다 - 상품카드엔 반드시 있다.
-#   2) 제조원/판매업자류 문구가 있다 - 뒷면엔 법적 표기로 항상 있고,
-#      상품카드엔 나오지 않는다.
+#   2) 제조/판매/수입하는 기업 표기가 있다 - 뒷면엔 법적 표기로 항상 있고,
+#      상품카드엔 나오지 않는다. 다만 이 표기의 용어는 적용 법령(화장품법/
+#      식품위생법/생활화학제품법 등)마다 제각각이라(화장품책임판매업자,
+#      식품제조업자, 제조원/판매원, 생활화학제품의 제조자/판매자/수입자 등)
+#      개별 단어를 나열하는 대신 (제조/판매/수입/유통/공급) + (원/자/처/업자/
+#      업체/회사/사) 조합을 통째로 잡는다.
 # 두 조건이 "그리고"(AND)로 다 맞아야 뒷면으로 판단한다 - Azure가 상품카드의
 # 가격 줄만 어쩌다 놓쳐도(이번 세션에서 실제로 있었던 문제), 그 카드엔
-# 제조원류 문구 자체가 없으므로 조건 2에서 걸러져 오분류를 막아준다.
-_BACK_LABEL_MANUFACTURER_KEYWORDS = (
-    "제조원", "판매원", "판매업자", "유통업자", "수입원",
-    "화장품책임판매업자", "식품제조업자", "제조판매업자",
+# 기업 표기 자체가 없으므로 조건 2에서 걸러져 오분류를 막아준다.
+_BACK_LABEL_MANUFACTURER_PATTERN = re.compile(
+    r"(?:제조|판매|수입|유통|공급)(?:원|자|처|업자|업체|회사|사)"
 )
 
 
 def is_back_label(lines: list) -> bool:
     has_price_line = any(PRICE_LINE_PATTERN.match(l) for l in lines)
     has_manufacturer_info = any(
-        kw in line for line in lines for kw in _BACK_LABEL_MANUFACTURER_KEYWORDS
+        _BACK_LABEL_MANUFACTURER_PATTERN.search(line) for line in lines
     )
     return not has_price_line and has_manufacturer_info
+
+
+def match_card_back_pairs(entries: list) -> dict:
+    """상품카드와 그 뒷면 사진을 짝지어 {파일ID: [매칭된 파일ID, ...]}로
+    돌려준다. entries의 각 항목은 {"file_id", "uploader", "capture_time",
+    "is_back"}. 업로더가 같은(=같은 사람이 찍은) 사진들만 서로 비교하고,
+    그 안에서 촬영시각(capture_time, extract_capture_time() 결과) 순으로
+    정렬한 뒤 카드 바로 다음에 연달아 나오는 뒷면들을 그 카드에 붙인다 -
+    뒷면을 여러 장(정면+측면 등) 찍을 수 있어 "다음 카드가 나오기 전까지"를
+    한 묶음으로 본다. 업로더를 모르거나(owners 필드 없음) 촬영시각을
+    모르는(EXIF도 파일명도 없음) 사진은 순서를 신뢰할 수 없으므로 애초에
+    비교 대상에서 뺀다 - 그 사진 자체는 RAW 시트에 매칭 없이 그대로
+    남을 뿐 데이터가 사라지지는 않는다."""
+    by_uploader = {}
+    for e in entries:
+        if not e["uploader"] or e["capture_time"] is None:
+            continue
+        by_uploader.setdefault(e["uploader"], []).append(e)
+
+    result = {}
+    for group in by_uploader.values():
+        group.sort(key=lambda e: e["capture_time"])
+        pending_card = None
+        for e in group:
+            if not e["is_back"]:
+                pending_card = e
+            elif pending_card is not None:
+                result.setdefault(pending_card["file_id"], []).append(e["file_id"])
+                result.setdefault(e["file_id"], []).append(pending_card["file_id"])
+    return result
 
 
 # ---------------- 항목 파싱: 상품코드 / 한국어 제품명 / 가격 ----------------
@@ -1048,6 +1238,19 @@ def _parse_fields_from_lines(lines: list) -> dict:
         if trailing_count:
             result["제품명(한국어)"] = cleaned_name
             result["중량"] = trailing_count
+    # 무게도 개수 단위도 아니라 "부품명+숫자" 구성품 목록으로 규격을 나타내는
+    # 카드("기*2+날*14", "면도기1+날8")도 마찬가지로 보정한다.
+    if not result["중량"] and result["제품명(한국어)"]:
+        cleaned_name, trailing_combo = _split_trailing_component_combo(result["제품명(한국어)"])
+        if trailing_combo:
+            result["제품명(한국어)"] = cleaned_name
+            result["중량"] = trailing_combo
+    # 세트 상품은 제품명 자체엔 규격이 안 붙고 "- 구성: 치약 160g*2+60g*1+20g*2"
+    # 처럼 별도 셀링포인트 줄에 규격이 나오기도 한다. 위 세 방법 다 제품명
+    # 문자열 끝에서만 찾으므로 이 경우를 못 잡는다 - 마지막으로 "구성:" 문구가
+    # 있는 줄을 뒤진다.
+    if not result["중량"]:
+        result["중량"] = _find_composition_spec(lines)
 
     return result
 
@@ -1146,6 +1349,13 @@ def parse_traders_fields(text: str) -> dict:
         if trailing_count:
             result["제품명(한국어)"] = cleaned_name
             result["중량"] = trailing_count
+    if not result["중량"] and result["제품명(한국어)"]:
+        cleaned_name, trailing_combo = _split_trailing_component_combo(result["제품명(한국어)"])
+        if trailing_combo:
+            result["제품명(한국어)"] = cleaned_name
+            result["중량"] = trailing_combo
+    if not result["중량"]:
+        result["중량"] = _find_composition_spec(lines)
 
     return result
 
@@ -1398,7 +1608,7 @@ def update_category_sheet(sheet, row_dicts: list):
 sheet_lock = threading.Lock()  # gspread 동시 append 충돌 방지
 
 
-def build_row_dict(file_id, filename, fields, raw_text):
+def build_row_dict(file_id, filename, fields, raw_text, uploader, is_back, capture_time):
     row_dict = {
         "파일ID": file_id,
         "파일명": filename,
@@ -1407,9 +1617,76 @@ def build_row_dict(file_id, filename, fields, raw_text):
         # RAW 시트 컬럼(COLUMN_ORDER)엔 없는 값이라 원본 로그에는 안 보이고,
         # 제품군정리(카테고리) 시트의 "셀링" 행에만 쓰인다.
         "셀링포인트": extract_selling_points(raw_text),
+        "업로더": uploader,
+        "뒷면여부": "뒷면" if is_back else "",
+        "촬영시각": capture_time.strftime("%Y-%m-%d %H:%M:%S") if capture_time else "",
+        # 이 시점엔 아직 시트에 쌓인 다른 사진들과 비교해보기 전이라 매칭을
+        # 모른다 - resync_card_back_matches()가 별도로 채운다.
+        "매칭파일ID": "",
     }
     row_dict.update(fields)  # 상품코드/제품명(한국어)/가격
     return row_dict
+
+
+def resync_card_back_matches(sheet):
+    """RAW 시트에 지금까지 기록된 모든 사진(이번 실행분은 물론, 과거에 실행
+    버튼을 눌렀을 때 처리된 사진까지 전부)을 다시 훑어서 상품카드<->뒷면
+    매칭을 재계산하고, 값이 바뀐 칸만 시트에 반영한다.
+
+    이 파이프라인은 정해진 시각에 자동으로 도는 게 아니라 대시보드
+    "업데이트" 버튼을 누를 때마다 한 번씩 실행되는 구조라, 카드 사진과
+    그 뒷면 사진이 서로 다른 실행 회차에 나뉘어 올라올 수 있다(뒷면을
+    깜빡하고 나중에 올리는 등). 이번 실행에서 새로 처리된 사진끼리만
+    비교하면 이런 경우를 놓치므로, 매칭은 항상 시트에 쌓인 전체 이력을
+    기준으로 다시 계산한다 - 시트 자체가 실행 회차를 넘나드는 유일한
+    영속 저장소이기 때문이다. 매번 전체를 다시 계산하지만 실제로
+    값이 바뀐 칸만 쓰기 때문에, 이미 정착된 과거 매칭까지 매번 다시
+    쓰지는 않는다.
+
+    다만 이 컬럼들(업로더/뒷면여부/촬영시각)이 생기기 전에 이미 처리된
+    과거 행은 촬영시각이 비어있어 매칭 대상이 될 수 없다 - 새로 배포된
+    이후 처리되는 사진부터 소급 매칭이 적용된다."""
+    idx = {name: COLUMN_ORDER.index(name) for name in ("파일ID", "업로더", "뒷면여부", "촬영시각", "매칭파일ID")}
+    columns = {name: sheet.col_values(i + 1)[1:] for name, i in idx.items()}  # 헤더 제외
+    row_count = len(columns["파일ID"])
+    for name in columns:
+        # gspread의 col_values()는 그 열의 마지막 값이 있는 행까지만 돌려주므로,
+        # 뒤쪽 행에서 특정 컬럼만 비어있으면(흔한 경우) 열마다 길이가 다를 수
+        # 있다 - 파일ID 기준 행 수에 맞춰 빈 문자열로 채워 인덱스를 맞춘다.
+        if len(columns[name]) < row_count:
+            columns[name] += [""] * (row_count - len(columns[name]))
+
+    entries = []
+    for i in range(row_count):
+        file_id = columns["파일ID"][i]
+        if not file_id:
+            continue
+        capture_time = None
+        raw_time = columns["촬영시각"][i]
+        if raw_time:
+            try:
+                capture_time = datetime.datetime.strptime(raw_time, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                capture_time = None
+        entries.append({
+            "file_id": file_id,
+            "uploader": columns["업로더"][i],
+            "capture_time": capture_time,
+            "is_back": columns["뒷면여부"][i] == "뒷면",
+        })
+
+    matches = match_card_back_pairs(entries)
+    match_col_letter = _col_letter(idx["매칭파일ID"] + 1)
+    updates = []
+    for i, file_id in enumerate(columns["파일ID"]):
+        if not file_id:
+            continue
+        new_value = ", ".join(matches.get(file_id, []))
+        if new_value and new_value != columns["매칭파일ID"][i]:
+            updates.append({"range": f"{match_col_letter}{i + 2}", "values": [[new_value]]})
+    if updates:
+        sheet.batch_update(updates, value_input_option="USER_ENTERED")
+    return len(updates)
 
 
 def append_rows_to_sheet(sheet, row_dicts):
@@ -1486,8 +1763,12 @@ def process_one_file(creds, sheets, file_info, archive_folder_id, retailer, sour
     name, file_id = file_info["name"], file_info["id"]
     drive_service = get_thread_drive_service(creds)
     image_bytes = download_image(drive_service, file_id)
-    if is_heic(file_info):
-        image_bytes = convert_heic_to_jpeg(image_bytes)
+    # 앞뒤 사진 매칭용 신호. normalize_image_for_ocr()는 방향 태그를 지우고
+    # 재인코딩하므로 반드시 그 전 원본 바이트에서 촬영시각을 읽어야 한다.
+    # owners는 Drive 목록 조회 시점에 이미 받아온 값(list_all_images 참고).
+    capture_time = extract_capture_time(image_bytes, name)
+    uploader = (file_info.get("owners") or [{}])[0].get("emailAddress", "")
+    image_bytes = normalize_image_for_ocr(image_bytes)
     text, confidences = ocr_image_azure(image_bytes)
     low_confidence = needs_review(confidences)
     lines = [l.strip() for l in text.split("\n") if l.strip()]
@@ -1514,7 +1795,7 @@ def process_one_file(creds, sheets, file_info, archive_folder_id, retailer, sour
     if not is_back and (not fields.get("가격") or not fields.get("제품명(한국어)")):
         low_confidence = True
 
-    row_dict = build_row_dict(file_id, name, fields, text)
+    row_dict = build_row_dict(file_id, name, fields, text, uploader, is_back, capture_time)
     append_rows_to_sheet(sheet, [row_dict])
 
     # 시트 기록이 끝난 뒤에 사진을 '처리완료' 폴더로 옮긴다. 이동이 실패해도
@@ -1623,6 +1904,19 @@ def run_once():
             update_category_sheet(category_sheets[retailer], row_dicts)
         except Exception as e:
             print(f"경고: {retailer} 제품군정리 시트 갱신 실패 (원본 시트 기록은 정상 완료됨): {e}")
+
+    # 상품카드 <-> 뒷면 매칭은 이번 실행분만으로는 계산하지 않는다 - 대시보드
+    # "업데이트" 버튼을 누를 때마다 한 번씩 도는 구조라 카드와 뒷면이 서로
+    # 다른 실행 회차에 나뉘어 올라올 수 있고, 그러면 이번 실행분끼리만
+    # 비교해서는 놓친다. RAW 시트 전체(과거 실행분 포함)를 기준으로 매번
+    # 다시 계산해서, 뒤늦게 올라온 사진도 다음 실행 때 소급 매칭되게 한다.
+    for retailer, sheet in sheets.items():
+        try:
+            updated = resync_card_back_matches(sheet)
+            if updated:
+                print(f"  {retailer}: 앞뒤 매칭 {updated}건 반영(과거 실행분 포함)")
+        except Exception as e:
+            print(f"경고: {retailer} 앞뒤 매칭 반영 실패 (원본 시트 기록은 정상 완료됨): {e}")
 
     print(f"\n완료: {success_count}건 성공, {len(failed)}건 실패")
     if failed:
