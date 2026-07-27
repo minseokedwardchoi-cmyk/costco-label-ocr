@@ -291,9 +291,19 @@ _EXIF_DATETIME_DIGITIZED = 0x9004
 _EXIF_DATETIME_FALLBACK = 0x0132  # 최상위 IFD의 DateTime(파일 수정시각에 가까움, 최후 보조값)
 
 # 삼성 카메라 기본 파일명(20260713_111558.jpg)에 박힌 촬영시각. EXIF가 없는
-# 드문 경우의 2순위 폴백 - 아이폰의 IMG_1234류 일련번호는 절대시각이 아니라서
-# (기기 안에서만 유효한 카운터) 파싱 대상에 넣지 않는다.
+# 드문 경우의 2순위 폴백.
 _FILENAME_TIMESTAMP_PATTERN = re.compile(r"(20\d{2})(\d{2})(\d{2})[_-](\d{2})(\d{2})(\d{2})")
+# 아이폰 기본 파일명(IMG_1234.HEIC)의 일련번호 - 절대시각이 아니라 기기
+# 안에서만(사진 라이브러리 전체 기준으로) 유효한 카운터지만, 촬영 순서와는
+# 항상 일치한다. 원래는 이 이유로 순서 판별 대상에서 뺐었는데, 남이 전달해준
+# 사진처럼 EXIF가 아예 없고 YYYYMMDD_HHMMSS 형식도 아닌 경우(아이폰 원본
+# 파일명 그대로 전달됨)엔 이거라도 없으면 순서를 전혀 알 수 없어서 3순위
+# 폴백으로 추가한다. 실제 시각이 아니라 "상대적 순서"만 의미있으므로 임의
+# 기준 시점(2000-01-01)에 번호(초)를 더한 가짜 시각으로 바꿔서 돌려준다 -
+# 같은 배치 안에서는 정렬이 맞지만, 이 폴백을 쓴 사진과 진짜 EXIF/2순위
+# 파일명 패턴을 쓴 사진이 한 그룹에 섞이면(같은 업로더가 올린 사진 중 일부만
+# EXIF가 없는 경우) 상대적 순서가 깨질 수 있다는 한계가 있다.
+_FILENAME_IMG_SEQUENCE_PATTERN = re.compile(r"IMG[_-]?(\d{3,6})", re.IGNORECASE)
 
 
 def extract_capture_time(image_bytes: bytes, filename: str):
@@ -302,11 +312,12 @@ def extract_capture_time(image_bytes: bytes, filename: str):
     순서가 실제 촬영 순서와 달라질 수 있어 쓰지 않는다 - 카메라가 셔터를
     누른 순간 자동으로 남기는 EXIF 촬영시각을 1순위로, 그마저 없으면(예:
     메신저를 거치며 메타데이터가 지워진 사진) 삼성 파일명의 날짜_시각
-    패턴을 2순위로 쓴다. 아이폰 HEIC도 pillow_heif가 등록한 오프너를 통해
-    JPEG와 동일하게 EXIF를 읽는다. 변환 전 원본 바이트에서 읽어야 한다 -
-    normalize_image_for_ocr()로 재인코딩하면 방향 태그가 지워진다. 둘 다
-    없으면 순서를 알 수 없다는 뜻이므로 None을 돌려주고, 그 사진은 앞뒤
-    매칭 대상에서 빠진다(데이터 자체는 RAW 시트에 그대로 남는다)."""
+    패턴을 2순위로, 그것도 아니면 아이폰 IMG_1234류 일련번호를 3순위로
+    쓴다. 아이폰 HEIC도 pillow_heif가 등록한 오프너를 통해 JPEG와 동일하게
+    EXIF를 읽는다. 변환 전 원본 바이트에서 읽어야 한다 - normalize_image_for_ocr()로
+    재인코딩하면 방향 태그가 지워진다. 셋 다 없으면 순서를 알 수 없다는
+    뜻이므로 None을 돌려주고, 그 사진은 앞뒤 매칭 대상에서 빠진다(데이터
+    자체는 RAW 시트에 그대로 남는다)."""
     try:
         image = Image.open(io.BytesIO(image_bytes))
         exif = image.getexif()
@@ -329,6 +340,11 @@ def extract_capture_time(image_bytes: bytes, filename: str):
             return datetime.datetime(*(int(g) for g in m.groups()))
         except ValueError:
             pass
+
+    m = _FILENAME_IMG_SEQUENCE_PATTERN.search(filename)
+    if m:
+        return datetime.datetime(2000, 1, 1) + datetime.timedelta(seconds=int(m.group(1)))
+
     return None
 
 
