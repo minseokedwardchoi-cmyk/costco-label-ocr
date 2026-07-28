@@ -134,7 +134,7 @@ PRICE_FIELDS = CORE_PRICE_FIELDS + OPTIONAL_PRICE_FIELDS
 # 뒷면 사진(소싱형태/병입원산지)을 나중에 그 칸에 소급 반영할 수 있게 해준다.
 COLUMN_ORDER = (
     ["파일ID", "파일명", "처리일시", "원문텍스트"] + PRICE_FIELDS
-    + ["업로더", "뒷면여부", "촬영시각", "사진해시", "매칭파일ID", "정리본위치"]
+    + ["업로더", "뒷면여부", "촬영시각", "사진해시", "매칭파일ID", "매칭파일명", "정리본위치"]
 )
 
 
@@ -2582,6 +2582,7 @@ def build_row_dict(file_id, filename, fields, raw_text, uploader, is_back, captu
         # 이 시점엔 아직 시트에 쌓인 다른 사진들과 비교해보기 전이라 매칭을
         # 모른다 - resync_card_back_matches()가 별도로 채운다.
         "매칭파일ID": "",
+        "매칭파일명": "",
         # 카드가 제품군정리 시트에 기록될 때(update_category_sheet) 채워진다.
         # 뒷면 사진 자체는 이 값이 끝까지 빈 칸으로 남는다.
         "정리본위치": "",
@@ -2607,8 +2608,18 @@ def resync_card_back_matches(sheet):
 
     다만 이 컬럼들(업로더/뒷면여부/촬영시각)이 생기기 전에 이미 처리된
     과거 행은 촬영시각이 비어있어 매칭 대상이 될 수 없다 - 새로 배포된
-    이후 처리되는 사진부터 소급 매칭이 적용된다."""
-    idx = {name: COLUMN_ORDER.index(name) for name in ("파일ID", "업로더", "뒷면여부", "촬영시각", "매칭파일ID")}
+    이후 처리되는 사진부터 소급 매칭이 적용된다.
+
+    "매칭파일ID"(구글 드라이브 파일ID)만으로는 MD가 매칭이 잘못됐는지
+    확인하려 할 때 그 뒷면 사진을 구글 드라이브에서 찾기 불편하다 -
+    파일ID로는 드라이브 검색이 안 되고 URL로 직접 열어야 한다. 파일명
+    ("20260101_000231.jpg" 등)은 드라이브 검색창에 그대로 붙여넣으면
+    바로 찾아지므로, "매칭파일명"에 같은 순서로 같이 남겨서 RAW 시트만
+    보고도 앞뒤 사진을 빠르게 대조할 수 있게 한다."""
+    idx = {
+        name: COLUMN_ORDER.index(name)
+        for name in ("파일ID", "파일명", "업로더", "뒷면여부", "촬영시각", "매칭파일ID", "매칭파일명")
+    }
     columns = {name: sheet.col_values(i + 1)[1:] for name, i in idx.items()}  # 헤더 제외
     row_count = len(columns["파일ID"])
     for name in columns:
@@ -2617,6 +2628,10 @@ def resync_card_back_matches(sheet):
         # 있다 - 파일ID 기준 행 수에 맞춰 빈 문자열로 채워 인덱스를 맞춘다.
         if len(columns[name]) < row_count:
             columns[name] += [""] * (row_count - len(columns[name]))
+
+    filename_by_id = {
+        fid: fname for fid, fname in zip(columns["파일ID"], columns["파일명"]) if fid
+    }
 
     entries = []
     for i in range(row_count):
@@ -2638,14 +2653,19 @@ def resync_card_back_matches(sheet):
         })
 
     matches = match_card_back_pairs(entries)
-    match_col_letter = _col_letter(idx["매칭파일ID"] + 1)
+    match_id_col_letter = _col_letter(idx["매칭파일ID"] + 1)
+    match_name_col_letter = _col_letter(idx["매칭파일명"] + 1)
     updates = []
     for i, file_id in enumerate(columns["파일ID"]):
         if not file_id:
             continue
-        new_value = ", ".join(matches.get(file_id, []))
+        matched_ids = matches.get(file_id, [])
+        new_value = ", ".join(matched_ids)
         if new_value and new_value != columns["매칭파일ID"][i]:
-            updates.append({"range": f"{match_col_letter}{i + 2}", "values": [[_sheet_safe(new_value)]]})
+            updates.append({"range": f"{match_id_col_letter}{i + 2}", "values": [[_sheet_safe(new_value)]]})
+        new_name_value = ", ".join(filename_by_id.get(mid, mid) for mid in matched_ids)
+        if new_name_value and new_name_value != columns["매칭파일명"][i]:
+            updates.append({"range": f"{match_name_col_letter}{i + 2}", "values": [[_sheet_safe(new_name_value)]]})
     if updates:
         _batch_update_chunked(sheet, updates, value_input_option="USER_ENTERED")
     return len(updates)
