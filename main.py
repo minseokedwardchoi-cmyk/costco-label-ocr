@@ -194,9 +194,18 @@ def get_credentials():
     )
 
 
+# RAW 시트(코스트코/트레이더스)는 헤더가 두 줄이다: 1행은 "상품카드"/
+# "제품 뒷면"처럼 관련 컬럼을 묶어 보여주는 그룹 라벨(병합 셀), 2행이
+# COLUMN_ORDER 순서 그대로의 실제 컬럼명이다. MD가 시트를 훑어볼 때 어느
+# 컬럼이 상품카드 내용이고 어느 컬럼이 뒷면 관련 내용인지 한눈에 보이게
+# 하려고 도입했다. 실제 데이터는 3행부터 시작한다 - 아래 모든 col_values
+# 슬라이싱/행 번호 계산이 이 두 줄을 기준으로 한다.
+RAW_HEADER_ROW_COUNT = 2
+
+
 def load_processed_ids(sheet):
     """구글 시트의 '파일ID' 열(1번 컬럼)에 이미 기록된 값들을 처리 완료 목록으로 삼는다."""
-    ids = sheet.col_values(1)[1:]  # 헤더 제외
+    ids = sheet.col_values(1)[RAW_HEADER_ROW_COUNT:]  # 헤더 2줄 제외
     return set(ids)
 
 
@@ -216,7 +225,7 @@ def load_same_day_hashes(sheet):
     날짜가 다르면 해시가 같아도(예: 우연히 똑같이 나온 사진) 걸리지 않는다 -
     시기별로 SKU 이력을 새로 쌓으려는 목적과 어긋나지 않게 하기 위함이다."""
     idx = {name: COLUMN_ORDER.index(name) for name in ("파일ID", "촬영시각", "사진해시")}
-    columns = {name: sheet.col_values(i + 1)[1:] for name, i in idx.items()}  # 헤더 제외
+    columns = {name: sheet.col_values(i + 1)[RAW_HEADER_ROW_COUNT:] for name, i in idx.items()}  # 헤더 2줄 제외
     row_count = len(columns["파일ID"])
     for name in columns:
         if len(columns[name]) < row_count:
@@ -2620,7 +2629,7 @@ def resync_card_back_matches(sheet):
         name: COLUMN_ORDER.index(name)
         for name in ("파일ID", "파일명", "업로더", "뒷면여부", "촬영시각", "매칭파일ID", "매칭파일명")
     }
-    columns = {name: sheet.col_values(i + 1)[1:] for name, i in idx.items()}  # 헤더 제외
+    columns = {name: sheet.col_values(i + 1)[RAW_HEADER_ROW_COUNT:] for name, i in idx.items()}  # 헤더 2줄 제외
     row_count = len(columns["파일ID"])
     for name in columns:
         # gspread의 col_values()는 그 열의 마지막 값이 있는 행까지만 돌려주므로,
@@ -2659,13 +2668,14 @@ def resync_card_back_matches(sheet):
     for i, file_id in enumerate(columns["파일ID"]):
         if not file_id:
             continue
+        row_num = i + RAW_HEADER_ROW_COUNT + 1
         matched_ids = matches.get(file_id, [])
         new_value = ", ".join(matched_ids)
         if new_value and new_value != columns["매칭파일ID"][i]:
-            updates.append({"range": f"{match_id_col_letter}{i + 2}", "values": [[_sheet_safe(new_value)]]})
+            updates.append({"range": f"{match_id_col_letter}{row_num}", "values": [[_sheet_safe(new_value)]]})
         new_name_value = ", ".join(filename_by_id.get(mid, mid) for mid in matched_ids)
         if new_name_value and new_name_value != columns["매칭파일명"][i]:
-            updates.append({"range": f"{match_name_col_letter}{i + 2}", "values": [[_sheet_safe(new_name_value)]]})
+            updates.append({"range": f"{match_name_col_letter}{row_num}", "values": [[_sheet_safe(new_name_value)]]})
     if updates:
         _batch_update_chunked(sheet, updates, value_input_option="USER_ENTERED")
     return len(updates)
@@ -2679,11 +2689,12 @@ def _write_category_positions(sheet, positions: dict):
         return
     file_id_col = COLUMN_ORDER.index("파일ID") + 1
     pos_col_letter = _col_letter(COLUMN_ORDER.index("정리본위치") + 1)
-    file_ids = sheet.col_values(file_id_col)[1:]  # 헤더 제외
+    file_ids = sheet.col_values(file_id_col)[RAW_HEADER_ROW_COUNT:]  # 헤더 2줄 제외
     updates = []
     for i, file_id in enumerate(file_ids):
         if file_id in positions:
-            updates.append({"range": f"{pos_col_letter}{i + 2}", "values": [[positions[file_id]]]})
+            row_num = i + RAW_HEADER_ROW_COUNT + 1
+            updates.append({"range": f"{pos_col_letter}{row_num}", "values": [[positions[file_id]]]})
     if updates:
         _batch_update_chunked(sheet, updates, value_input_option="USER_ENTERED")
 
@@ -2710,7 +2721,7 @@ def sync_back_sourcing(sheet, retailer: str, resolve_category_sheet) -> int:
         name: COLUMN_ORDER.index(name)
         for name in ("파일ID", "업로더", "뒷면여부", "촬영시각", "원문텍스트", "제품명(한국어)", "정리본위치")
     }
-    columns = {name: sheet.col_values(i + 1)[1:] for name, i in idx.items()}
+    columns = {name: sheet.col_values(i + 1)[RAW_HEADER_ROW_COUNT:] for name, i in idx.items()}
     row_count = len(columns["파일ID"])
     for name in columns:
         if len(columns[name]) < row_count:
@@ -2821,10 +2832,58 @@ def _find_missing_columns(existing, column_order):
     return missing
 
 
+# RAW 시트 1행(그룹 라벨)에 표시할 묶음 - "상품카드"는 사진/원문 식별 정보부터
+# 가격표에서 뽑은 값까지, "제품 뒷면"은 뒷면 판별/매칭 관련 컬럼까지. 완전히
+# 새 시트를 만들 때만 쓰인다(기존 시트의 그룹 라벨은 사람이 관리하는 영역이라
+# 컬럼이 추가되는 경우에도 자동으로 다시 그리지 않는다 - 아래 ensure_header 참고).
+_GROUP_HEADER_SPECS = [
+    ("상품카드", "파일ID", "단가"),
+    ("제품 뒷면", "뒷면여부", "매칭파일명"),
+]
+
+
+def _apply_default_group_header(sheet):
+    sheet_id = sheet.id
+    requests = []
+    for label, start_name, end_name in _GROUP_HEADER_SPECS:
+        start_idx = COLUMN_ORDER.index(start_name)
+        end_idx = COLUMN_ORDER.index(end_name) + 1  # 배타적 끝 인덱스
+        cell_range = {
+            "sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1,
+            "startColumnIndex": start_idx, "endColumnIndex": end_idx,
+        }
+        requests.append({"mergeCells": {"range": cell_range, "mergeType": "MERGE_ALL"}})
+        requests.append({
+            "updateCells": {
+                "range": cell_range,
+                "rows": [{"values": [{
+                    "userEnteredValue": {"stringValue": label},
+                    "userEnteredFormat": {"horizontalAlignment": "CENTER", "textFormat": {"bold": True}},
+                }]}],
+                "fields": "userEnteredValue,userEnteredFormat(horizontalAlignment,textFormat)",
+            }
+        })
+    requests.append({
+        "updateSheetProperties": {
+            "properties": {"sheetId": sheet_id, "gridProperties": {"frozenRowCount": RAW_HEADER_ROW_COUNT}},
+            "fields": "gridProperties.frozenRowCount",
+        }
+    })
+    sheet.spreadsheet.batch_update({"requests": requests})
+
+
 def ensure_header(sheet):
-    existing = sheet.row_values(1)
+    """RAW 시트는 헤더가 두 줄이다: 1행은 "상품카드"/"제품 뒷면"처럼 관련
+    컬럼을 묶어 보여주는 그룹 라벨(병합 셀), 2행이 COLUMN_ORDER 그대로의
+    실제 컬럼명이다(RAW_HEADER_ROW_COUNT 참고). 완전히 새 시트일 때만 그룹
+    라벨까지 같이 만들고, 기존 시트에 컬럼만 추가되는 경우엔 2행만 맞추고
+    1행(그룹 라벨)은 건드리지 않는다 - 병합 범위를 자동으로 다시 그리다가
+    사람이 이미 조정해둔 배치를 망가뜨릴 수 있어서다."""
+    existing = sheet.row_values(RAW_HEADER_ROW_COUNT)
     if not existing:
+        sheet.append_row([""] * len(COLUMN_ORDER), value_input_option="USER_ENTERED")
         sheet.append_row(COLUMN_ORDER, value_input_option="USER_ENTERED")
+        _apply_default_group_header(sheet)
         return
     if existing == COLUMN_ORDER:
         return
@@ -2838,13 +2897,14 @@ def ensure_header(sheet):
         for col_idx, _name in sorted(missing, key=lambda x: -x[0]):
             if col_idx < len(existing):
                 sheet.insert_cols([[]], col=col_idx + 1)
-        sheet.update(values=[COLUMN_ORDER], range_name="A1")
+        sheet.update(values=[COLUMN_ORDER], range_name=f"A{RAW_HEADER_ROW_COUNT}")
         added = [name for _, name in missing]
-        print(f"시트 헤더에 새 컬럼 {len(added)}개를 추가했습니다: {', '.join(added)}")
+        print(f"시트 헤더에 새 컬럼 {len(added)}개를 추가했습니다: {', '.join(added)}. "
+              "1행 그룹 라벨(상품카드/제품 뒷면) 병합 범위가 이 컬럼과 어긋나지 않는지 확인해주세요.")
     else:
         # 컬럼 순서가 바뀌었거나 삭제된 경우 - 자동으로 지우면 기존 데이터가 밀릴 수
         # 있으므로 건드리지 않는다. 헤더 행을 수동으로 맞춰주세요.
-        print("경고: 시트 1행 헤더가 COLUMN_ORDER와 다릅니다. 데이터 보호를 위해 자동으로 지우지 않았으니, "
+        print(f"경고: 시트 {RAW_HEADER_ROW_COUNT}행 헤더가 COLUMN_ORDER와 다릅니다. 데이터 보호를 위해 자동으로 지우지 않았으니, "
               "헤더 행을 아래 순서로 직접 맞춰주세요:")
         print("  " + " | ".join(COLUMN_ORDER))
 

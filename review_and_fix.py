@@ -130,14 +130,16 @@ def review_retailer(spreadsheet, label, retailer_key, raw_sheet_name, category_s
         main.ensure_header(raw_ws)
 
     raw_values = raw_ws.get_all_values()
-    header = raw_values[0]
+    # RAW 시트는 헤더가 두 줄이다 - 1행은 "상품카드"/"제품 뒷면" 그룹 라벨,
+    # 2행이 실제 컬럼명(main.RAW_HEADER_ROW_COUNT 참고). 데이터는 3행부터.
+    header = raw_values[main.RAW_HEADER_ROW_COUNT - 1]
     idx = {h: i for i, h in enumerate(header)}
     # 같은 이름이 여러 번 나오면 첫 매치를 쓴다 (기존 진단 스크립트와 동일한 규칙).
     # 정리본이 촬영월별로 여러 탭에 나뉘어 있어도, RAW는 여전히 리테일러당
     # 하나뿐이라 이 매칭 풀은 모든 탭에 공통으로 쓴다.
     by_name = {}
     by_combined_name = {}
-    for i, row in enumerate(raw_values[1:], start=2):
+    for i, row in enumerate(raw_values[main.RAW_HEADER_ROW_COUNT:], start=main.RAW_HEADER_ROW_COUNT + 1):
         name = row[idx["제품명(한국어)"]] if len(row) > idx["제품명(한국어)"] else ""
         if name and name not in by_name:
             by_name[name] = (i, row)
