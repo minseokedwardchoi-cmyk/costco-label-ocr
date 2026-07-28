@@ -489,65 +489,92 @@ def _reorder_two_column_block(entries):
     "가격 숫자 하나가 끼어드는" 경우와 달리) 두 단의 줄이 위에서부터 통째로
     번갈아 섞여 두 문장이 뒤죽박죽 하나로 합쳐진다("왼쪽줄1, 오른쪽줄1,
     왼쪽줄2, 오른쪽줄2, ..." 순서로 나와서 셀링포인트 파싱이 엉뚱한 문구를
-    만들어냄). 카드 폭 전체를 쓰는 줄(코드/제품명/가격처럼)은 원래부터 한
-    줄 전체를 차지하므로 이 문제와 무관해서 그대로 두고, 폭이 좁아 한쪽에만
-    있는 줄들만 좌/우로 클러스터링해서 "왼쪽 단을 위→아래로 다 읽은 뒤
-    오른쪽 단을 위→아래로" 순서로 재배열한다. 순수 숫자 가격 줄은
-    _defer_offcolumn_price_tokens()가 이미 별도로 다루는 영역이라 여기서는
-    후보에서 제외해 서로 간섭하지 않게 한다.
+    만들어냄).
 
-    뚜렷한 2단 구조(폭 15% 이상 벌어진 간격, 양쪽 모두 2줄 이상)가 안 보이면
-    원래 순서를 그대로 돌려준다 - 대부분의 카드는 이 함수가 사실상 아무것도
-    바꾸지 않는 단일 컬럼 레이아웃이다."""
+    실사진(BelGioioso 모짜렐라)으로 확인해보니, 사진에 배경 물체(옆에 붙어
+    있는 같은 상품의 박스 더미 등)가 가격표와 거의 붙어서 같이 찍히면
+    _cluster_lines_by_layout()의 간격/색상 분리가 항상 성공하는 건 아니라
+    그 배경 텍스트까지 같은 목록에 섞여 들어온다. 이때 "카드 폭"을 사진
+    전체(entries 전부)의 min/max로 계산하면, 배경 물체의 훨씬 넓게 퍼진
+    텍스트가 폭 기준을 왜곡해서(예: 실제로는 크게 벌어진 2단 간격이 부풀려진
+    "전체 폭"의 15%에 못 미치는 것처럼 보임) 진짜 2단 카드조차 인식하지
+    못하는 문제가 있었다. 그래서 순수 숫자 가격 줄(_PRICE_TOKEN_RE)을
+    경계로 사진을 여러 구간으로 나누고, 각 구간의 폭은 그 구간 자체의
+    줄들로만 계산한다 - 실제 카드 내용(코드~단가 안내)과 그 뒤에 이어지는
+    배경 물체 텍스트가 보통 가격 줄 하나 이상을 사이에 두고 떨어져 있어서,
+    이렇게 구간을 나누면 배경 물체의 폭이 실제 카드 구간의 폭 계산을 더 이상
+    왜곡하지 않는다.
+
+    각 구간 안에서는, 폭이 좁아 한쪽에만 있는 줄들만 좌/우로 클러스터링해서
+    "왼쪽 단을 위→아래로 다 읽은 뒤 오른쪽 단을 위→아래로" 순서로 재배열한다.
+    뚜렷한 2단 구조(그 구간 폭의 15% 이상 벌어진 간격, 양쪽 모두 2줄 이상)가
+    안 보이면 그 구간은 원래 순서를 그대로 유지한다 - 대부분의 카드는 이
+    함수가 사실상 아무것도 바꾸지 않는 단일 컬럼 레이아웃이다."""
     if len(entries) < 4:
         return entries
 
-    min_left = min(e["left_x"] for e in entries)
-    max_right = max(e["right_x"] for e in entries)
-    total_width = max_right - min_left
-    if total_width <= 0:
-        return entries
+    result = []
+    i = 0
+    n = len(entries)
+    while i < n:
+        j = i
+        while j < n and not _PRICE_TOKEN_RE.match(entries[j]["text"].strip()):
+            j += 1
+        result.extend(_reorder_segment_if_two_column(entries[i:j]))
+        if j < n:
+            result.append(entries[j])  # 가격 줄 자체는 그대로 이어붙인다
+        i = j + 1
+    return result
 
-    narrow = [
-        e for e in entries
-        if (e["right_x"] - e["left_x"]) < total_width * 0.6
-        and not _PRICE_TOKEN_RE.match(e["text"].strip())
-    ]
+
+def _reorder_segment_if_two_column(segment):
+    """_reorder_two_column_block()이 가격 줄로 나눈 한 구간 안에서, 그
+    구간 자체의 폭을 기준으로 2단 구조를 판단해 재배열한다."""
+    if len(segment) < 4:
+        return segment
+
+    min_left = min(e["left_x"] for e in segment)
+    max_right = max(e["right_x"] for e in segment)
+    width = max_right - min_left
+    if width <= 0:
+        return segment
+
+    narrow = [e for e in segment if (e["right_x"] - e["left_x"]) < width * 0.6]
     if len(narrow) < 4:
-        return entries
+        return segment
 
     xs = sorted(e["left_x"] for e in narrow)
     gaps = [(xs[i + 1] - xs[i], i) for i in range(len(xs) - 1)]
     biggest_gap, split_i = max(gaps)
-    if biggest_gap < total_width * 0.15:
-        return entries  # 뚜렷한 2단 구분이 없음 - 원래 순서 유지
+    if biggest_gap < width * 0.15:
+        return segment  # 뚜렷한 2단 구분이 없음 - 원래 순서 유지
     boundary_x = (xs[split_i] + xs[split_i + 1]) / 2
 
     left_ids = {id(e) for e in narrow if e["left_x"] < boundary_x}
     right_ids = {id(e) for e in narrow if e["left_x"] >= boundary_x}
     if len(left_ids) < 2 or len(right_ids) < 2:
-        return entries
+        return segment
 
-    # 연속으로 이어지는 좌/우 후보 구간만 "왼쪽 전부 -> 오른쪽 전부"로
-    # 재배열한다 - 그 사이에 전체 폭 줄(가격 등)이 끼어 구간이 끊기면 거기서
-    # 새 구간으로 다시 시작해서, 서로 다른 2단 블록이 뒤섞이지 않게 한다.
+    # 연속으로 이어지는 좌/우 후보만 "왼쪽 전부 -> 오른쪽 전부"로 재배열한다 -
+    # 그 사이에 이 구간 폭 전체를 쓰는 줄이 끼면 거기서 새 구간으로 다시
+    # 시작해서, 서로 다른 2단 블록이 뒤섞이지 않게 한다.
     result = []
-    i = 0
-    while i < len(entries):
-        e = entries[i]
+    k = 0
+    while k < len(segment):
+        e = segment[k]
         if id(e) in left_ids or id(e) in right_ids:
-            j = i
+            m = k
             block = []
-            while j < len(entries) and (id(entries[j]) in left_ids or id(entries[j]) in right_ids):
-                block.append(entries[j])
-                j += 1
+            while m < len(segment) and (id(segment[m]) in left_ids or id(segment[m]) in right_ids):
+                block.append(segment[m])
+                m += 1
             left_block = [x for x in block if id(x) in left_ids]
             right_block = [x for x in block if id(x) in right_ids]
             result.extend(left_block + right_block)
-            i = j
+            k = m
         else:
             result.append(e)
-            i += 1
+            k += 1
     return result
 
 
@@ -1183,7 +1210,18 @@ def _find_unmarked_description(lines: list) -> str:
     for line in lines[english_idx + 1:]:
         if not re.search(r"[가-힣]", line):
             break
+        # "단가 / 10G"처럼 단가 라벨만 있는 줄과, 그 라벨과 짝을 이루는 순수
+        # 가격 숫자 줄("196원")은 그 자체로 셀링포인트 내용이 아니지만, 이런
+        # 줄 하나 때문에 문장 수집을 완전히 끝내버리면 안 된다 - 2단
+        # 레이아웃 카드에서 이 줄 뒤에 또 다른(오른쪽 단) 셀링 문구가
+        # 이어지는 경우가 실사진(벨지오이오조 모짜렐라)에서 확인됐다.
+        # "100g당 1,211원"처럼 실제 숫자 값이 있는 단가 표기는 예외 - 그건
+        # 진짜 값이 있는 줄이라 노이즈로 처리해 문장을 끊는 게 맞다.
         if _is_origin_label_line(line):
+            continue
+        if "단가" in line and not UNIT_PRICE_PATTERN.search(line):
+            continue
+        if _PRICE_TOKEN_RE.match(line.strip()):
             continue
         if _is_skippable_interleaved_noise(line) or _is_selling_point_noise(line):
             break
