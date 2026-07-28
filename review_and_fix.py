@@ -193,7 +193,7 @@ def review_retailer(spreadsheet, label, retailer_key, raw_sheet_name, category_s
                         backfilled_positions += 1
 
                 recomputed = parse_fn(raw_text)
-                recomputed["셀링포인트"] = main.extract_selling_points(raw_text)
+                recomputed["셀링포인트"] = main.extract_selling_points(raw_text, recomputed.get("상품코드", ""))
 
                 filled_fields = []
                 still_missing = []

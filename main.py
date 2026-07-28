@@ -1094,7 +1094,7 @@ def _extract_selling_points_with_markers(lines, markers):
     return points
 
 
-def extract_selling_points(text: str) -> str:
+def extract_selling_points(text: str, product_code: str = "") -> str:
     """
     "- 신선하고 품질이 좋은 ... 압착하여" 다음 줄에 "만든 오일"처럼, 대시로
     시작하는 셀링포인트 문구가 화면 폭 때문에 줄바꿈되어 여러 줄로 나뉘어
@@ -1104,8 +1104,22 @@ def extract_selling_points(text: str) -> str:
     거기서 끝난다. "- 2,000"처럼 할인액도 대시로 시작하므로, 대시 뒤에
     글자(한글/영문)가 하나도 없으면 애초에 항목 시작으로 인정하지 않는다.
     실사진으로 계속 검증하며 다듬어야 하는 초기 버전이다.
+
+    product_code(파싱된 상품코드)가 주어지면 그 코드가 적힌 줄 이후부터만
+    스캔한다. 사진에 다른 상품이 배경으로 같이 찍히면, 그 상품 포장의 "•"
+    불릿 문구가 실제 카드보다 먼저 나오면서 잘못 채택되는 경우가 실사진에서
+    확인됐다 - "개봉후 부패·변질될 우려가 있으니 냉장..."/"부정 불량식품
+    신고는 국번없이 1399" 같은 문구는 코스트코 라벨 대부분에 똑같이 들어가는
+    표준 문구라 배경 상품에도 거의 항상 있어서 특히 잘 걸린다. 코드를
+    못 찾았거나(뒷면 사진 등) product_code가 안 주어지면 전체 텍스트를
+    그대로 스캔한다(기존 동작과 동일).
     """
     lines = [l.strip() for l in text.split("\n") if l.strip()]
+    if product_code:
+        for i, line in enumerate(lines):
+            if _normalize_bare_code(line) == product_code:
+                lines = lines[i + 1:]
+                break
     for markers in _BULLET_MARKER_TIERS:
         points = _extract_selling_points_with_markers(lines, markers)
         if points:
@@ -1458,6 +1472,14 @@ def determine_sourcing(product_name: str, retailer: str, back_text: str) -> tupl
     return "", (origin or "국내")
 
 
+# 코드 다음에 오는 진짜 브랜드명 줄("ARLA", "RICOLA" 등)과, 배경의 다른
+# 상품 포장에서 새어 들어온 뜻 없는 대문자 낱말 파편("HEE", "CON" 등)을
+# 구분할 만한 확실한 기준은 없지만, 후자는 실사진에서 항상 2글자~8글자의
+# 짧은 단독 대문자 낱말이었다 - _parse_fields_from_lines()에서 이 낱말이
+# 연달아 여러 줄 나오는지로 노이즈 여부를 판단한다.
+_SHORT_CAPS_WORD_RE = re.compile(r"^[A-Z]{2,8}$")
+
+
 # ---------------- 항목 파싱: 상품코드 / 한국어 제품명 / 가격 ----------------
 def parse_price_fields(text: str) -> dict:
     """
@@ -1631,6 +1653,28 @@ def _parse_fields_from_lines(lines: list) -> dict:
     start = code_idx + 1 if code_idx is not None else 0
     end = min(boundary_candidates) if boundary_candidates else len(lines)
     korean_lines = lines[start:end]
+
+    # 사진에 다른 상품(배경 진열대의 다른 포장 박스 등)이 같이 찍히면, 그
+    # 포장에 적힌 작은 글자 파편이 "HEE"/"CON"처럼 뜻 없는 짧은 대문자 낱말
+    # 줄로 OCR되어 코드 바로 다음, 진짜 브랜드명 줄(예: "ARLA") 앞에 끼어드는
+    # 경우가 실사진에서 확인됐다("HEE"/"CON"/"ARLA" 세 줄이 연달아 나오고
+    # 그 뒤에야 한글 제품명이 시작됨 - 진짜 브랜드는 한글 바로 앞의 "ARLA"
+    # 뿐이고 앞 두 줄은 배경 소음). 위 클러스터링(_cluster_lines_by_layout)이
+    # 대부분의 배경 텍스트를 걸러내지만, 이렇게 실제 카드와 아주 가까운 위치에
+    # 있는 파편 몇 줄은 걸러지지 않고 새어 들어올 수 있다. 진짜 브랜드명 줄은
+    # 이 자리에 보통 하나만 오므로("RICOLA 레몬민트 허브캔디"의 "RICOLA"처럼),
+    # 한글 제품명이 시작되기 전에 이런 짧은 대문자 낱말 줄이 2개 이상 연달아
+    # 나오면 노이즈로 보고 한글 바로 앞의 마지막 한 줄만 브랜드명으로 남긴다.
+    # 그런 줄이 하나뿐이면(가장 흔한 정상 케이스) 원래대로 손대지 않는다.
+    leading_caps_run = []
+    for line in korean_lines:
+        if _SHORT_CAPS_WORD_RE.match(line):
+            leading_caps_run.append(line)
+        else:
+            break
+    if len(leading_caps_run) >= 2:
+        korean_lines = korean_lines[len(leading_caps_run) - 1:]
+
     joined_name = " ".join(korean_lines).strip()
     # 실사진에서 Azure가 카드의 제품명 구역을 통째로 못 읽고 "Global
     # Product"/가격/바코드 같은 아래쪽 정형 문구만 반환하는 경우가 확인됐다.
@@ -2143,7 +2187,7 @@ def build_row_dict(file_id, filename, fields, raw_text, uploader, is_back, captu
         "원문텍스트": raw_text,
         # RAW 시트 컬럼(COLUMN_ORDER)엔 없는 값이라 원본 로그에는 안 보이고,
         # 제품군정리(카테고리) 시트의 "셀링" 행에만 쓰인다.
-        "셀링포인트": extract_selling_points(raw_text),
+        "셀링포인트": extract_selling_points(raw_text, fields.get("상품코드", "")),
         "업로더": uploader,
         "뒷면여부": "뒷면" if is_back else "",
         "촬영시각": capture_time.strftime("%Y-%m-%d %H:%M:%S") if capture_time else "",
