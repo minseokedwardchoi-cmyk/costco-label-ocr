@@ -73,11 +73,19 @@ TRADERS_SHEET_NAME = os.environ.get("TRADERS_SHEET_NAME", "트레이더스")
 CATEGORY_SHEET_NAME_COSTCO = os.environ.get("CATEGORY_SHEET_NAME_COSTCO", "제품군정리(코스트코)")
 CATEGORY_SHEET_NAME_TRADERS = os.environ.get("CATEGORY_SHEET_NAME_TRADERS", "제품군정리(트레이더스)")
 
-# 정리본은 이제 촬영월별로 시트를 나눈다("제품군정리(코스트코)_2026-07"처럼
-# 위 이름 뒤에 월을 붙인 제목을 씀 - run_once의 get_category_sheet 참고).
 # 월별 분리 이전에 이미 기록된 "정리본위치" 값(시트제목 없이 "C15"만 있음)은
-# 그 시절 유일했던 시트 이름으로 찾아야 하므로 sync_back_sourcing()에서 쓴다.
+# 그 시절 유일했던 시트 이름(위 CATEGORY_SHEET_NAME_*)으로 찾아야 하므로
+# sync_back_sourcing()에서 쓴다 - 그 시절 데이터가 남아있는 옛 탭 이름일
+# 뿐이고, 지금 새로 만드는 월별 탭 이름과는 별개다(아래 참고).
 _LEGACY_CATEGORY_SHEET_TITLE = {"costco": CATEGORY_SHEET_NAME_COSTCO, "traders": CATEGORY_SHEET_NAME_TRADERS}
+
+# 정리본은 촬영월별로 시트를 나눈다("정리본(코스트코)_2026-07"처럼 이 이름
+# 뒤에 월을 붙인 제목을 씀 - run_once의 category_sheet_title 참고). 위
+# CATEGORY_SHEET_NAME_*(옛 "제품군정리(...)" 단일 시트, 월별 분리 이전
+# 데이터 전용)과는 별개의 이름을 쓴다 - 그래야 기존 데이터를 안 건드리고
+# 새 탭만 원하는 이름 규칙으로 만들 수 있다.
+MONTHLY_CATEGORY_SHEET_NAME_COSTCO = os.environ.get("MONTHLY_CATEGORY_SHEET_NAME_COSTCO", "정리본(코스트코)")
+MONTHLY_CATEGORY_SHEET_NAME_TRADERS = os.environ.get("MONTHLY_CATEGORY_SHEET_NAME_TRADERS", "정리본(트레이더스)")
 
 # 자사 상품 카탈로그(MCH1/MC/상품명) 기반 제품군 분류용. 거래처/공급사 이름까지
 # 들어있는 사외비 데이터라 이 공개 저장소에는 절대 커밋하지 않고, 서비스
@@ -473,6 +481,76 @@ def _defer_offcolumn_price_tokens(positioned):
     return main, deferred
 
 
+def _reorder_two_column_block(entries):
+    """셀링포인트(특징) 문구가 카드 하단에 좌/우 2단으로 나란히 배치된
+    레이아웃이 실사진에서 확인됐다(예: 왼쪽 "샌드위치, 피자토핑, ... 사용
+    가능합니다.", 오른쪽 "라이트와인, 과일과도 어울림. ..." 처럼 서로 다른
+    두 문장이 나란히 놓임). y좌표만으로 정렬하면(위 함수들이 처리하는
+    "가격 숫자 하나가 끼어드는" 경우와 달리) 두 단의 줄이 위에서부터 통째로
+    번갈아 섞여 두 문장이 뒤죽박죽 하나로 합쳐진다("왼쪽줄1, 오른쪽줄1,
+    왼쪽줄2, 오른쪽줄2, ..." 순서로 나와서 셀링포인트 파싱이 엉뚱한 문구를
+    만들어냄). 카드 폭 전체를 쓰는 줄(코드/제품명/가격처럼)은 원래부터 한
+    줄 전체를 차지하므로 이 문제와 무관해서 그대로 두고, 폭이 좁아 한쪽에만
+    있는 줄들만 좌/우로 클러스터링해서 "왼쪽 단을 위→아래로 다 읽은 뒤
+    오른쪽 단을 위→아래로" 순서로 재배열한다. 순수 숫자 가격 줄은
+    _defer_offcolumn_price_tokens()가 이미 별도로 다루는 영역이라 여기서는
+    후보에서 제외해 서로 간섭하지 않게 한다.
+
+    뚜렷한 2단 구조(폭 15% 이상 벌어진 간격, 양쪽 모두 2줄 이상)가 안 보이면
+    원래 순서를 그대로 돌려준다 - 대부분의 카드는 이 함수가 사실상 아무것도
+    바꾸지 않는 단일 컬럼 레이아웃이다."""
+    if len(entries) < 4:
+        return entries
+
+    min_left = min(e["left_x"] for e in entries)
+    max_right = max(e["right_x"] for e in entries)
+    total_width = max_right - min_left
+    if total_width <= 0:
+        return entries
+
+    narrow = [
+        e for e in entries
+        if (e["right_x"] - e["left_x"]) < total_width * 0.6
+        and not _PRICE_TOKEN_RE.match(e["text"].strip())
+    ]
+    if len(narrow) < 4:
+        return entries
+
+    xs = sorted(e["left_x"] for e in narrow)
+    gaps = [(xs[i + 1] - xs[i], i) for i in range(len(xs) - 1)]
+    biggest_gap, split_i = max(gaps)
+    if biggest_gap < total_width * 0.15:
+        return entries  # 뚜렷한 2단 구분이 없음 - 원래 순서 유지
+    boundary_x = (xs[split_i] + xs[split_i + 1]) / 2
+
+    left_ids = {id(e) for e in narrow if e["left_x"] < boundary_x}
+    right_ids = {id(e) for e in narrow if e["left_x"] >= boundary_x}
+    if len(left_ids) < 2 or len(right_ids) < 2:
+        return entries
+
+    # 연속으로 이어지는 좌/우 후보 구간만 "왼쪽 전부 -> 오른쪽 전부"로
+    # 재배열한다 - 그 사이에 전체 폭 줄(가격 등)이 끼어 구간이 끊기면 거기서
+    # 새 구간으로 다시 시작해서, 서로 다른 2단 블록이 뒤섞이지 않게 한다.
+    result = []
+    i = 0
+    while i < len(entries):
+        e = entries[i]
+        if id(e) in left_ids or id(e) in right_ids:
+            j = i
+            block = []
+            while j < len(entries) and (id(entries[j]) in left_ids or id(entries[j]) in right_ids):
+                block.append(entries[j])
+                j += 1
+            left_block = [x for x in block if id(x) in left_ids]
+            right_block = [x for x in block if id(x) in right_ids]
+            result.extend(left_block + right_block)
+            i = j
+        else:
+            result.append(e)
+            i += 1
+    return result
+
+
 # ---- 사진 한 장에 여러 물체(다른 상품 박스, 배경의 다른 가격표 등)가 같이
 # 찍혔을 때, 진짜 대상 상품카드가 아닌 것들을 걸러내기 위한 레이아웃 분석 ----
 # 같은 상품카드 안의 줄들은 세로 간격이 좁고 배경색도 일정하다. 다른 물체로
@@ -681,6 +759,7 @@ def _extract_text_and_confidence(result, image_bytes=None):
         except Exception as e:
             print(f"  경고: 레이아웃(배경색/간격) 분석 실패, 필터링 없이 진행: {e}")
 
+    positioned = _reorder_two_column_block(positioned)
     main_lines, deferred_lines = _defer_offcolumn_price_tokens(positioned)
     full_text = "\n".join(e["text"] for e in main_lines + deferred_lines + unpositioned)
     return full_text, confidences
@@ -968,6 +1047,15 @@ def _is_skippable_interleaved_noise(line: str) -> bool:
     return bool(_SIZE_TABLE_LINE_RE.match(line))
 
 
+def _is_origin_label_line(line: str) -> bool:
+    """상품카드(뒷면이 아니라 앞면) 자체에 "원산지 : 영국"처럼 원산지 표기가
+    셀링포인트 문구 자리에 별도 줄로 나오는 경우가 실사진에서 확인됐다. 이
+    값은 이제 _parse_fields_from_lines()가 병입원산지로 따로 뽑으므로,
+    셀링포인트 추출에는 안 섞이게 건너뛴다(끝내는 게 아니라 건너뛰는 이유:
+    이 줄 바로 다음에 진짜 셀링 문구가 이어지는 카드가 실사진에서 확인됨)."""
+    return bool(_ORIGIN_LABEL_PATTERN.search(line))
+
+
 # 대부분은 "-"/"•"/"·"로 시작하지만, 카드에 따라 "▶"(섹션 제목으로도 쓰이지만
 # "-" 불릿이 아예 없는 카드에서는 그 자체가 유일한 불릿 표시인 경우도 있다)나
 # "*"만 쓰는 경우도 실사진에서 확인됐다(에어프라이어, 청바지 카드 등). 다만
@@ -1011,7 +1099,7 @@ def _extract_selling_points_with_markers(lines, markers):
             break
         if current is None:
             continue
-        if _is_skippable_interleaved_noise(line):
+        if _is_skippable_interleaved_noise(line) or _is_origin_label_line(line):
             continue
         if _is_selling_point_noise(line):
             points.append(current.strip())
@@ -1023,7 +1111,7 @@ def _extract_selling_points_with_markers(lines, markers):
     return points
 
 
-def extract_selling_points(text: str) -> str:
+def extract_selling_points(text: str, product_code: str = "") -> str:
     """
     "- 신선하고 품질이 좋은 ... 압착하여" 다음 줄에 "만든 오일"처럼, 대시로
     시작하는 셀링포인트 문구가 화면 폭 때문에 줄바꿈되어 여러 줄로 나뉘어
@@ -1033,8 +1121,22 @@ def extract_selling_points(text: str) -> str:
     거기서 끝난다. "- 2,000"처럼 할인액도 대시로 시작하므로, 대시 뒤에
     글자(한글/영문)가 하나도 없으면 애초에 항목 시작으로 인정하지 않는다.
     실사진으로 계속 검증하며 다듬어야 하는 초기 버전이다.
+
+    product_code(파싱된 상품코드)가 주어지면 그 코드가 적힌 줄 이후부터만
+    스캔한다. 사진에 다른 상품이 배경으로 같이 찍히면, 그 상품 포장의 "•"
+    불릿 문구가 실제 카드보다 먼저 나오면서 잘못 채택되는 경우가 실사진에서
+    확인됐다 - "개봉후 부패·변질될 우려가 있으니 냉장..."/"부정 불량식품
+    신고는 국번없이 1399" 같은 문구는 코스트코 라벨 대부분에 똑같이 들어가는
+    표준 문구라 배경 상품에도 거의 항상 있어서 특히 잘 걸린다. 코드를
+    못 찾았거나(뒷면 사진 등) product_code가 안 주어지면 전체 텍스트를
+    그대로 스캔한다(기존 동작과 동일).
     """
     lines = [l.strip() for l in text.split("\n") if l.strip()]
+    if product_code:
+        for i, line in enumerate(lines):
+            if _normalize_bare_code(line) == product_code:
+                lines = lines[i + 1:]
+                break
     for markers in _BULLET_MARKER_TIERS:
         points = _extract_selling_points_with_markers(lines, markers)
         if points:
@@ -1053,8 +1155,20 @@ def extract_selling_points(text: str) -> str:
 # 다음부터 노이즈(가격/단가/코드/정형문구 등)가 나오거나 한글이 없는 줄이
 # 나오기 전까지 이어지는 줄들을 통째로 한 문장으로 합친다.
 def _find_unmarked_description(lines: list) -> str:
+    # "THE LAUGHING COW"처럼 브랜드명이 코드 바로 다음 줄에 대문자 2단어
+    # 이상으로 찍히는 경우가 있어서(_parse_fields_from_lines의 english_idx
+    # 판별과 같은 함정), 한글 줄을 하나도 못 봤으면 대문자 줄을 진짜 영문
+    # 제품명으로 인정하지 않는다 - 그러지 않으면 브랜드명 줄을 english_idx로
+    # 잘못 채택해서, 그 바로 다음에 오는 진짜 영문 제품명 줄(예: "BELCUBE
+    # PLAIN 250GX2")에서 한글이 없다는 이유로 스캔이 너무 일찍 끝나버리고,
+    # 정작 그 뒤에 이어지는 진짜 셀링 문구는 하나도 못 줍는다.
     english_idx = None
+    seen_korean_line = False
     for i, line in enumerate(lines):
+        if re.search(r"[가-힣]", line):
+            seen_korean_line = True
+        if not seen_korean_line:
+            continue
         if (
             re.fullmatch(r"[A-Z0-9 .,'&×\-]{4,}", line)
             and re.search(r"[A-Z]{2,}", line)
@@ -1069,6 +1183,8 @@ def _find_unmarked_description(lines: list) -> str:
     for line in lines[english_idx + 1:]:
         if not re.search(r"[가-힣]", line):
             break
+        if _is_origin_label_line(line):
+            continue
         if _is_skippable_interleaved_noise(line) or _is_selling_point_noise(line):
             break
         desc_lines.append(line)
@@ -1125,6 +1241,14 @@ def _normalize_bare_code(line: str) -> str:
 # 기업 표기 자체가 없으므로 조건 2에서 걸러져 오분류를 막아준다.
 _BACK_LABEL_MANUFACTURER_PATTERN = re.compile(
     r"(?:제조|판매|수입|유통|공급)(?:원|자|처|업자|업체|업소|회사|사)"
+    # 수입 완제품 중엔 뒷면이 한글 표기 없이 영문 라벨만 있는 경우도 있다
+    # (예: 영국산 클로티드크림 - "Manufacturer:"/"Imported By:"만 있고 한글
+    # 법정 표기가 아예 없음). 한글 라벨과 같은 역할을 하는 영문 표기
+    # ("Manufactured/Imported/Distributed by", "Manufacturer"/"Importer"/
+    # "Distributor")도 같이 인정한다.
+    r"|\b(?:manufactured|imported|distributed|packed|packaged)\s+by\b"
+    r"|\b(?:manufacturer|importer|distributor)\b",
+    re.IGNORECASE,
 )
 
 
@@ -1189,21 +1313,44 @@ _PB_NAME_PATTERN = re.compile(
 _ENTITY_SUFFIX = r"(?:원|자|처|업자|업체|업소|회사|사)"
 # 실사진에서 확인된 "수입" 라벨 표기가 다양하다: "수입업소"(가장 흔함, "판매"
 # 없이 바로 업소), "수입판매원"/"수입 판매원"(수입과 접미사 사이에 "판매"가
-# 낀 경우 - P&G/LG생활건강 라벨에 흔함), "수입 및 판매업소", "수입판매책임업자"
-# 등. "수입" 바로 뒤에 접미사가 오는 경우만 인정하면 이런 변형들을 다 놓친다.
-# "및"/가운뎃점/"판매"/"책임" 같은 흔한 연결어가 중간에 끼어도 인정하되,
-# "공식 수입 업체인" 같은 마케팅 문장(진짜 라벨이 아님)까지 걸리지 않도록
-# 연결어 목록은 실제 라벨에서 확인된 것들로만 한정한다.
+# 낀 경우 - P&G/LG생활건강 라벨에 흔함), "수입 및 판매업소", "수입판매책임업자",
+# 그리고 코스트코 자체 라벨에 흔한 접미사 없는 "수입"(바로 뒤에 "(주)..."나
+# ":"가 옴) 등. "수입" 바로 뒤에 접미사가 오는 경우만 인정하면 이런 변형들을
+# 다 놓친다. "및"/가운뎃점/"판매"/"책임" 같은 흔한 연결어가 중간에 끼어도
+# 인정하되, "공식 수입 업체인" 같은 마케팅 문장(진짜 라벨이 아님)까지 걸리지
+# 않도록 연결어 목록은 실제 라벨에서 확인된 것들로만 한정한다.
+#
+# 접미사 없는 "수입"까지 받아주면서 생긴 새 함정: "반품 및 교환장소: 구입처
+# 및 수입판매업소"처럼 식품 표시 고시 문구에 관용적으로 들어가는 문장에도
+# "수입판매업소"라는 글자가 그대로 나온다 - 이건 라벨이 아니라 그 갈피에 낀
+# 서술어라서, 진짜 "수입" 라벨(대개 그 문장보다 앞쪽에 있음)보다 이 가짜
+# 매치가 먼저 잡히면 안 된다. "및" 바로 뒤에 오는 "수입"은 이런 서술 문장의
+# 일부일 뿐 필드 라벨이 아니므로 부정형 후방탐색으로 제외한다(실제 라벨
+# 변형 중 "수입" 앞에 "및"이 붙는 경우는 없음 - "수입 및 판매업소"처럼 "및"은
+# 항상 "수입" 뒤에 온다).
 _IMPORTER_LABEL_PATTERN = re.compile(
-    rf"수입\s*(?:및\s*)?(?:[·・]\s*)?(?:판매\s*)?(?:책임\s*)?(?:{_ENTITY_SUFFIX}|판매업소)"
+    rf"(?<!및)(?<!및\s)수입\s*(?:"
+    rf"(?:및\s*)?(?:[·・]\s*)?(?:판매\s*)?(?:책임\s*)?(?:{_ENTITY_SUFFIX}|판매업소)"
+    rf"|(?=[:：(（])"
+    rf")"
+    # 한글 라벨이 아예 없이 영문 라벨만 있는 뒷면(수입 완제품에 흔함)을 위한
+    # 영문 표기 - "Imported By:"/"Importer:"/"Distributed by"/"Distributor".
+    rf"|\bimported\s+by\b|\bimporter\b|\bdistributed\s+by\b|\bdistributor\b",
+    re.IGNORECASE,
 )
-_MANUFACTURER_LABEL_PATTERN = re.compile(rf"(?:화장품)?제조\s*{_ENTITY_SUFFIX}")
+_MANUFACTURER_LABEL_PATTERN = re.compile(
+    rf"(?:화장품)?제조\s*{_ENTITY_SUFFIX}"
+    rf"|\bmanufactured\s+by\b|\bmanufacturer\b",
+    re.IGNORECASE,
+)
 # 라벨 뒤에 붙은 값을 어디까지 읽을지 정하는 경계 - 다음 항목 라벨(제조/판매/
 # 수입/유통/공급 계열, 원산지/제조국)이 나오거나, 줄바꿈/불릿/대괄호가 나오면
 # 거기서 값을 끊는다. 같은 줄에 라벨 여러 개가 붙어 나오는 경우(뒷면 라벨은
 # 항목이 다닥다닥 붙어 있는 경우가 많다)를 대비한 것.
 _FIELD_BOUNDARY_PATTERN = re.compile(
-    r"[\[\n•▪]|" + _BACK_LABEL_MANUFACTURER_PATTERN.pattern + r"|원산지|제조국"
+    r"[\[\n•▪]|" + _BACK_LABEL_MANUFACTURER_PATTERN.pattern
+    + r"|원산지|제조국|place\s+of\s+origin|country\s+of\s+origin",
+    re.IGNORECASE,
 )
 
 # "제조국"만 찾으면 "제조국명"(더 흔한 표기)의 "제조국"까지만 매치되고 바로
@@ -1211,7 +1358,15 @@ _FIELD_BOUNDARY_PATTERN = re.compile(
 # 베트남" -> "명"). 알파벳 순서상 "제조국명"을 "제조국"보다 먼저 두어(둘 다
 # 매치 가능한 위치에서 더 긴 쪽이 우선 시도되도록) 이 라벨도 통째로 먼저
 # 소비하게 한다.
-_ORIGIN_LABEL_PATTERN = re.compile(r"(?:원산지|제조국명|제조국)\s*[\]:：]*\s*([가-힣]{1,10})")
+_ORIGIN_LABEL_PATTERN = re.compile(
+    r"(?:원산지|제조국명|제조국)\s*[\]:：]*\s*([가-힣]{1,10})"
+    # 한글 라벨 없이 영문 라벨만 있는 뒷면(수입 완제품에 흔함)을 위한 영문
+    # 표기 - "Place of origin:"/"Country of origin:". 값은 한글이 아니라
+    # 영문(국가명)이라 별도 그룹으로 잡고, extract_origin()에서
+    # _COUNTRY_EN_TO_KO로 한글화한다.
+    r"|(?:place\s+of\s+origin|country\s+of\s+origin)\s*[\]:：]*\s*([A-Za-z][A-Za-z .]{1,30})",
+    re.IGNORECASE,
+)
 _MADE_IN_PATTERN = re.compile(r"made\s+in\s+([A-Za-z]+)", re.IGNORECASE)
 
 _COUNTRY_NAMES_KO = (
@@ -1240,6 +1395,11 @@ _COUNTRY_EN_TO_KO = {
     "PORTUGAL": "포르투갈", "AUSTRIA": "오스트리아", "IRELAND": "아일랜드",
     "ISRAEL": "이스라엘", "EGYPT": "이집트", "SINGAPORE": "싱가포르",
     "PERU": "페루", "ECUADOR": "에콰도르", "CROATIA": "크로아티아",
+    # 한글 라벨 없이 영문 라벨만 있는 뒷면에서 나라 이름이 축약형("UK") 대신
+    # 정식 명칭 그대로 적히는 경우("United Kingdom" 등)를 위한 보강.
+    "UNITED KINGDOM": "영국", "UNITED STATES": "미국",
+    "UNITED STATES OF AMERICA": "미국", "NEW ZEALAND": "뉴질랜드",
+    "SOUTH KOREA": "대한민국", "REPUBLIC OF KOREA": "대한민국",
 }
 
 _COSTCO_CHAIN_KEYWORDS = ("코스트코",)
@@ -1303,17 +1463,27 @@ def _country_in(text: str) -> str:
 
 def extract_origin(text: str) -> str:
     """뒷면 텍스트에서 병입원산지(제조국)를 뽑는다. 우선순위: ① "원산지:"/
-    "제조국:" 같은 명시적 라벨(값이 한글) -> ② 제조자/제조원 라벨 바로 뒤
-    주소에서 국가명을 찾음(라벨은 있는데 값이 영문 회사명+주소로만 끝나는
-    경우가 실사진에서 많이 확인됨 - "Colgate Sanxiao co., Ltd... China.",
-    "Johnson & Johnson (Thailand) Limited...BANGKOK, THAILAND") -> ③ "Made
-    in X" -> ④ 그 외엔 텍스트 전체에서 국가명을 찾는다. 아무 것도 못 찾으면
-    빈 문자열(수기 확인 필요)을 돌려준다."""
+    "제조국:"/"Place of origin:" 같은 명시적 라벨(값이 한글 또는 영문) -> ②
+    제조자/제조원 라벨 바로 뒤 주소에서 국가명을 찾음(라벨은 있는데 값이 영문
+    회사명+주소로만 끝나는 경우가 실사진에서 많이 확인됨 - "Colgate Sanxiao
+    co., Ltd... China.", "Johnson & Johnson (Thailand) Limited...BANGKOK,
+    THAILAND") -> ③ "Made in X" -> ④ 그 외엔 텍스트 전체에서 국가명을 찾는다.
+    아무 것도 못 찾으면 빈 문자열(수기 확인 필요)을 돌려준다."""
     m = _ORIGIN_LABEL_PATTERN.search(text)
     if m:
-        value = m.group(1)
+        # 그룹1은 한글 라벨("원산지:"/"제조국:")의 값, 그룹2는 영문 라벨
+        # ("Place of origin:")의 값이다 - 한 번에 매치되는 쪽은 항상 하나뿐.
+        value = m.group(1) or m.group(2)
         if value in ("대한민국", "한국"):
             return "국내"
+        if m.group(2):
+            # 영문 값은 알려진 국가명 사전으로 한글화한다 - 모르는 영문
+            # 국가명이면(사전에 없는 나라) 값을 신뢰하지 않고 아래 다른
+            # 방식으로 계속 찾는다(한글 값과 달리 임의의 영문 문자열을
+            # 그대로 "원산지"로 쓰면 회사명 등이 섞여 들어올 위험이 크다).
+            mapped = _COUNTRY_EN_TO_KO.get(value.strip().upper())
+            if mapped:
+                return "국내" if mapped == "대한민국" else mapped
         # 실제 국가명은 항상 2글자 이상이다 - 1글자만 캡처됐으면(줄바꿈 등으로
         # 값이 중간에 잘린 경우, 예: "[원산지] 태"만 잡히고 "국"이 다음
         # 줄로 넘어간 경우) 이 라벨 매치를 신뢰하지 않고 아래 다른 방식으로
@@ -1321,7 +1491,7 @@ def extract_origin(text: str) -> str:
         # 실제 라벨 값이면 그대로 믿는다 - 목록은 라벨이 아예 없을 때 쓰는
         # 폴백 전용이라, 여기서 목록에 없다고 버리면 라벨이 명확히 있는
         # 값을 오히려 못 믿게 되는 역효과가 난다.
-        if len(value) >= 2:
+        elif len(value) >= 2:
             return value
 
     # "원산지"/"제조국" 라벨 자체가 없거나 값이 한글이 아니어서(예: "[국외
@@ -1372,6 +1542,14 @@ def determine_sourcing(product_name: str, retailer: str, back_text: str) -> tupl
     # 쓰고("국내"로 덮어써 원산지 표기와 모순되는 값을 만들지 않는다),
     # 그런 표기가 전혀 없을 때만 국내산으로 간주해 "국내"를 채운다.
     return "", (origin or "국내")
+
+
+# 코드 다음에 오는 진짜 브랜드명 줄("ARLA", "RICOLA" 등)과, 배경의 다른
+# 상품 포장에서 새어 들어온 뜻 없는 대문자 낱말 파편("HEE", "CON" 등)을
+# 구분할 만한 확실한 기준은 없지만, 후자는 실사진에서 항상 2글자~8글자의
+# 짧은 단독 대문자 낱말이었다 - _parse_fields_from_lines()에서 이 낱말이
+# 연달아 여러 줄 나오는지로 노이즈 여부를 판단한다.
+_SHORT_CAPS_WORD_RE = re.compile(r"^[A-Z]{2,8}$")
 
 
 # ---------------- 항목 파싱: 상품코드 / 한국어 제품명 / 가격 ----------------
@@ -1458,8 +1636,35 @@ def _parse_fields_from_lines(lines: list) -> dict:
         # "100g당 1,211원"처럼 단위당가격 표기도 "100g"으로 시작해서 이 조건에
         # 걸리므로, UNIT_PRICE_PATTERN에 매칭되는 줄은 애초에 중량 후보에서 뺀다.
         if m and not line[:m.start()].strip() and not UNIT_PRICE_PATTERN.search(line):
-            result["중량"] = line
+            weight_value = line
+            # "170G원산지영국"처럼 원산지가 중량 줄 끝에 그대로 붙어 나오는
+            # 경우가 실사진에서 확인됐다 - 원산지는 아래에서 따로 뽑으므로,
+            # 중량 값엔 그 앞부분("170G")만 남긴다.
+            origin_in_weight = _ORIGIN_LABEL_PATTERN.search(line)
+            if origin_in_weight:
+                weight_value = line[:origin_in_weight.start()].strip()
+            result["중량"] = weight_value
             weight_idx = i
+            break
+
+    # 뒷면 사진이 매칭되지 않아도, 상품카드 자체에 "원산지:"/"원산지OO"가 직접
+    # 찍혀 있는 경우가 실사진에서 확인됐다("170G원산지영국"처럼 중량 줄
+    # 끝에 붙거나, "원산지 : 영국"처럼 셀링포인트 자리에 별도 줄로 나옴).
+    # 이럴 땐 뒷면 매칭을 기다릴 필요 없이 이 값을 바로 병입원산지로 채택한다
+    # (determine_sourcing()의 뒷면 기반 병입원산지 추정과 별개 경로 - 이미
+    # 채워진 칸은 sync_back_sourcing()이 덮어쓰지 않으므로 서로 충돌하지
+    # 않는다). extract_selling_points()도 이 줄을 셀링포인트로 잘못 삼키지
+    # 않도록 별도로 건너뛴다(_is_origin_label_line 참고).
+    for i, line in enumerate(lines):
+        if code_idx is not None and i <= code_idx:
+            continue
+        m = _ORIGIN_LABEL_PATTERN.search(line)
+        if not m:
+            continue
+        raw_value = (m.group(1) or m.group(2) or "").strip()
+        mapped = _COUNTRY_EN_TO_KO.get(raw_value.upper()) if m.group(2) else raw_value
+        if mapped and len(mapped) >= 2:
+            result["병입원산지"] = "국내" if mapped in ("대한민국", "한국") else mapped
             break
 
     danga_idx = next((i for i, line in enumerate(lines) if "단가" in line), None)
@@ -1547,6 +1752,28 @@ def _parse_fields_from_lines(lines: list) -> dict:
     start = code_idx + 1 if code_idx is not None else 0
     end = min(boundary_candidates) if boundary_candidates else len(lines)
     korean_lines = lines[start:end]
+
+    # 사진에 다른 상품(배경 진열대의 다른 포장 박스 등)이 같이 찍히면, 그
+    # 포장에 적힌 작은 글자 파편이 "HEE"/"CON"처럼 뜻 없는 짧은 대문자 낱말
+    # 줄로 OCR되어 코드 바로 다음, 진짜 브랜드명 줄(예: "ARLA") 앞에 끼어드는
+    # 경우가 실사진에서 확인됐다("HEE"/"CON"/"ARLA" 세 줄이 연달아 나오고
+    # 그 뒤에야 한글 제품명이 시작됨 - 진짜 브랜드는 한글 바로 앞의 "ARLA"
+    # 뿐이고 앞 두 줄은 배경 소음). 위 클러스터링(_cluster_lines_by_layout)이
+    # 대부분의 배경 텍스트를 걸러내지만, 이렇게 실제 카드와 아주 가까운 위치에
+    # 있는 파편 몇 줄은 걸러지지 않고 새어 들어올 수 있다. 진짜 브랜드명 줄은
+    # 이 자리에 보통 하나만 오므로("RICOLA 레몬민트 허브캔디"의 "RICOLA"처럼),
+    # 한글 제품명이 시작되기 전에 이런 짧은 대문자 낱말 줄이 2개 이상 연달아
+    # 나오면 노이즈로 보고 한글 바로 앞의 마지막 한 줄만 브랜드명으로 남긴다.
+    # 그런 줄이 하나뿐이면(가장 흔한 정상 케이스) 원래대로 손대지 않는다.
+    leading_caps_run = []
+    for line in korean_lines:
+        if _SHORT_CAPS_WORD_RE.match(line):
+            leading_caps_run.append(line)
+        else:
+            break
+    if len(leading_caps_run) >= 2:
+        korean_lines = korean_lines[len(leading_caps_run) - 1:]
+
     joined_name = " ".join(korean_lines).strip()
     # 실사진에서 Azure가 카드의 제품명 구역을 통째로 못 읽고 "Global
     # Product"/가격/바코드 같은 아래쪽 정형 문구만 반환하는 경우가 확인됐다.
@@ -1685,7 +1912,20 @@ def parse_traders_fields(text: str) -> dict:
     # 예전처럼 0번째 줄을 억지로 제품명으로 쓰면 "Global Product"나 "11,400"
     # 같은 걸 제품명으로 잘못 채택하게 된다. 한글 줄이 하나도 없으면 제품명은
     # 그냥 빈 채로 남긴다(실제로 못 읽은 것이므로).
-    korean_name_idx = next((i for i, l in enumerate(lines) if re.search(r"[가-힣]", l)), None)
+    # 첫 한글 줄이라고 다 제품명은 아니다 - "√ 탁월한 세척력*"/"- 스머커스
+    # 딸기, 오렌지, 블루베리맛..." 같은 불릿 셀링포인트나 "신세계포인트" 같은
+    # 정형 프로모션 문구가 진짜 제품명 줄보다 먼저 나오는 경우가 실사진에서
+    # 확인됐다(트레이더스는 카드 위쪽에 셀링/프로모션 문구가 먼저 오는 레이아웃이
+    # 있음). 불릿 문자로 시작하거나 알려진 프로모션 문구인 한글 줄은 건너뛰고,
+    # 그 다음 한글 줄을 제품명으로 삼는다.
+    def _is_traders_name_candidate(line: str) -> bool:
+        if not re.search(r"[가-힣]", line):
+            return False
+        if line[:1] in "-–—−•·▶*√":
+            return False
+        return not any(sub in line for sub in _SELLING_POINT_EXCLUDE_SUBSTRINGS)
+
+    korean_name_idx = next((i for i, l in enumerate(lines) if _is_traders_name_candidate(l)), None)
     if korean_name_idx is not None:
         result["제품명(한국어)"] = lines[korean_name_idx]
 
@@ -1761,6 +2001,16 @@ def parse_traders_fields(text: str) -> dict:
     if not result["중량"]:
         result["중량"] = _find_composition_spec(lines)
 
+    # 뒷면 사진 매칭 없이도 카드 자체에 "원산지:"가 찍혀 있으면 바로
+    # 병입원산지로 채택한다 - _parse_fields_from_lines()(코스트코)와 같은
+    # 근거(README 7절 참고).
+    m = _ORIGIN_LABEL_PATTERN.search(text)
+    if m:
+        raw_value = (m.group(1) or m.group(2) or "").strip()
+        mapped = _COUNTRY_EN_TO_KO.get(raw_value.upper()) if m.group(2) else raw_value
+        if mapped and len(mapped) >= 2:
+            result["병입원산지"] = "국내" if mapped in ("대한민국", "한국") else mapped
+
     return result
 
 
@@ -1803,11 +2053,12 @@ UNCATEGORIZED_LABEL = "미분류"
 # 제품군 블록 하나는 "제목 행" + 아래 11개 항목 행으로 구성된다. 상품은 이
 # 항목들을 세로로 채운 열 하나로 표현되고(카드형), 같은 제품군의 상품들이
 # 옆으로(B, C, D...) 나란히 쌓인다. OCR 상품카드에는 이 중 상품명/규격·단량/
-# 판매가/단위단가/셀링만 있으므로 CATEGORY_FIELD_MAP에 있는 행만 채우고
-# 나머지(사진/소싱형태/매출(연)/매총율/산도/병입원산지)는 빈 칸으로 남긴다 -
-# 수기로 채우거나 다른 소스에서 나중에 채워 넣을 몫이다. 상품코드/파일ID/
-# 원문텍스트는 여기 안 넣는다 - 이 시트는 사람이 보기 좋은 정리본이고, 그
-# 추적용 정보는 원본(RAW) 시트에 이미 행마다 남아있다.
+# 판매가/단위단가/병입원산지(카드 자체에 원산지가 찍혀 있을 때만)/셀링만
+# 있으므로 CATEGORY_FIELD_MAP에 있는 행만 채우고 나머지(사진/소싱형태/
+# 매출(연)/매총율/산도)는 빈 칸으로 남긴다 - 수기로 채우거나 다른 소스에서
+# 나중에 채워 넣을 몫이다. 상품코드/파일ID/원문텍스트는 여기 안 넣는다 -
+# 이 시트는 사람이 보기 좋은 정리본이고, 그 추적용 정보는 원본(RAW) 시트에
+# 이미 행마다 남아있다.
 CATEGORY_ROW_LABELS = [
     "사진", "상품명", "소싱형태", "매출(연)", "규격/단량", "판매가",
     "단위단가", "매총율", "산도", "병입원산지", "셀링",
@@ -1817,6 +2068,12 @@ CATEGORY_FIELD_MAP = {
     "규격/단량": "중량",
     "판매가": "가격",
     "단위단가": "단가",
+    # 뒷면 사진이 매칭돼야만 채워지던 값과 달리, 카드 자체에 원산지가 직접
+    # 찍혀 있을 때만 _parse_fields_from_lines()가 채운다 - 못 찾으면 빈
+    # 문자열이라 이 칸은 그대로 비워두고, sync_back_sourcing()이 나중에
+    # 뒷면 매칭으로 채울 수 있게 남겨둔다(이미 채워진 칸은 덮어쓰지 않으므로
+    # 서로 충돌하지 않는다).
+    "병입원산지": "병입원산지",
     "셀링": "셀링포인트",
 }
 
@@ -2051,7 +2308,13 @@ def update_category_sheet(sheet, row_dicts: list):
 sheet_lock = threading.Lock()  # gspread 동시 append 충돌 방지
 
 
-def build_row_dict(file_id, filename, fields, raw_text, uploader, is_back, capture_time, image_hash):
+def build_row_dict(file_id, filename, fields, raw_text, uploader, is_back, capture_time, image_hash, retailer):
+    # 상품코드 이후부터만 스캔하는 앵커(배경 상품의 "•" 표준 문구 오채택 방지,
+    # extract_selling_points 참고)는 "코드 -> ... -> 셀링" 순서인 코스트코
+    # 레이아웃에서만 유효하다. 트레이더스는 반대로 "셀링 -> ... -> 코드"
+    # 순서라("누텔라 스프레드" 카드처럼 셀링 문구가 바코드/코드보다 먼저 나옴)
+    # 코드로 앵커하면 진짜 셀링 문구가 스캔 범위 밖으로 밀려 못 잡힌다.
+    anchor_code = fields.get("상품코드", "") if retailer != "traders" else ""
     row_dict = {
         "파일ID": file_id,
         "파일명": filename,
@@ -2059,7 +2322,7 @@ def build_row_dict(file_id, filename, fields, raw_text, uploader, is_back, captu
         "원문텍스트": raw_text,
         # RAW 시트 컬럼(COLUMN_ORDER)엔 없는 값이라 원본 로그에는 안 보이고,
         # 제품군정리(카테고리) 시트의 "셀링" 행에만 쓰인다.
-        "셀링포인트": extract_selling_points(raw_text),
+        "셀링포인트": extract_selling_points(raw_text, anchor_code),
         "업로더": uploader,
         "뒷면여부": "뒷면" if is_back else "",
         "촬영시각": capture_time.strftime("%Y-%m-%d %H:%M:%S") if capture_time else "",
@@ -2371,7 +2634,7 @@ def process_one_file(creds, sheets, file_info, archive_folder_id, retailer, sour
     if not is_back and (not fields.get("가격") or not fields.get("제품명(한국어)")):
         low_confidence = True
 
-    row_dict = build_row_dict(file_id, name, fields, text, uploader, is_back, capture_time, image_hash)
+    row_dict = build_row_dict(file_id, name, fields, text, uploader, is_back, capture_time, image_hash, retailer)
     append_rows_to_sheet(sheet, [row_dict])
 
     # 시트 기록이 끝난 뒤에 사진을 '처리완료' 폴더로 옮긴다. 이동이 실패해도
@@ -2423,7 +2686,10 @@ def run_once():
     category_sheet_cache = {}  # 시트 제목 -> Worksheet 객체 (매 실행마다 한 번씩만 열기)
 
     def category_sheet_title(retailer, month_key):
-        base_name = CATEGORY_SHEET_NAME_COSTCO if retailer == "costco" else CATEGORY_SHEET_NAME_TRADERS
+        base_name = (
+            MONTHLY_CATEGORY_SHEET_NAME_COSTCO if retailer == "costco"
+            else MONTHLY_CATEGORY_SHEET_NAME_TRADERS
+        )
         return f"{base_name}_{month_key}"
 
     def get_category_sheet(title):

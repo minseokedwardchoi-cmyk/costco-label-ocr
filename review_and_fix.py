@@ -55,14 +55,19 @@ RETAILERS = [
         "label": "코스트코",
         "retailer_key": "costco",
         "raw_sheet_name": main.SHEET_NAME,
-        "category_sheet_name": main.CATEGORY_SHEET_NAME_COSTCO,
+        # 옛 단일 정리본 이름(월별 분리 이전 데이터)과, 지금 매달 새로 만드는
+        # 정리본 탭의 기본 이름은 서로 다르다(main.py의 CATEGORY_SHEET_NAME_*
+        # vs MONTHLY_CATEGORY_SHEET_NAME_* 참고) - 둘 다 훑어야 한다.
+        "legacy_category_sheet_name": main.CATEGORY_SHEET_NAME_COSTCO,
+        "monthly_category_sheet_name": main.MONTHLY_CATEGORY_SHEET_NAME_COSTCO,
         "parse_fn": main.parse_price_fields,
     },
     {
         "label": "트레이더스",
         "retailer_key": "traders",
         "raw_sheet_name": main.TRADERS_SHEET_NAME,
-        "category_sheet_name": main.CATEGORY_SHEET_NAME_TRADERS,
+        "legacy_category_sheet_name": main.CATEGORY_SHEET_NAME_TRADERS,
+        "monthly_category_sheet_name": main.MONTHLY_CATEGORY_SHEET_NAME_TRADERS,
         "parse_fn": main.parse_traders_fields,
     },
 ]
@@ -70,13 +75,16 @@ RETAILERS = [
 RAW_MIRROR_FIELDS = ["상품코드", "제품명(한국어)", "가격", "제품명(영어)", "중량", "단가"]
 
 
-def find_category_sheet_titles(spreadsheet, base_name):
-    """main.py가 정리본을 촬영월별 탭으로 나누면서(예: "제품군정리(코스트코)"
-    ->  "제품군정리(코스트코)_2026-07"), 한 리테일러의 정리본이 더 이상 탭
-    하나가 아니게 됐다. base_name 자체(월별 분리 이전 데이터가 남아있는 옛
-    탭)와, base_name 뒤에 촬영월이 붙은 탭을 전부 찾아 돌려준다 - 이 스크립트가
-    존재하는 모든 달의 탭을 훑어야 과거 데이터를 놓치지 않는다."""
-    pattern = re.compile(rf"^{re.escape(base_name)}(_\d{{4}}-\d{{2}})?$")
+def find_category_sheet_titles(spreadsheet, legacy_name, monthly_base_name):
+    """main.py가 정리본을 촬영월별 탭으로 나누면서, 한 리테일러의 정리본이
+    더 이상 탭 하나가 아니게 됐다. legacy_name 자체(월별 분리 이전 데이터가
+    남아있는 옛 단일 탭, 예: "제품군정리(코스트코)")와, monthly_base_name
+    뒤에 촬영월이 붙은 탭(예: "정리본(코스트코)_2026-07")을 전부 찾아
+    돌려준다 - 이 스크립트가 존재하는 모든 달의 탭을 훑어야 과거 데이터를
+    놓치지 않는다."""
+    pattern = re.compile(
+        rf"^{re.escape(legacy_name)}$|^{re.escape(monthly_base_name)}_\d{{4}}-\d{{2}}$"
+    )
     return sorted(ws.title for ws in spreadsheet.worksheets() if pattern.match(ws.title))
 
 
@@ -193,7 +201,11 @@ def review_retailer(spreadsheet, label, retailer_key, raw_sheet_name, category_s
                         backfilled_positions += 1
 
                 recomputed = parse_fn(raw_text)
-                recomputed["셀링포인트"] = main.extract_selling_points(raw_text)
+                # 코드 이후로 스캔을 앵커하는 건 "코드 -> 셀링" 순서인 코스트코
+                # 레이아웃에서만 유효하다 - 트레이더스는 순서가 반대라서
+                # (main.build_row_dict 참고) 앵커를 걸면 진짜 셀링 문구를 놓친다.
+                anchor_code = recomputed.get("상품코드", "") if retailer_key != "traders" else ""
+                recomputed["셀링포인트"] = main.extract_selling_points(raw_text, anchor_code)
 
                 filled_fields = []
                 still_missing = []
@@ -296,7 +308,9 @@ def run_once():
 
     results = []
     for r in RETAILERS:
-        titles = find_category_sheet_titles(spreadsheet, r["category_sheet_name"])
+        titles = find_category_sheet_titles(
+            spreadsheet, r["legacy_category_sheet_name"], r["monthly_category_sheet_name"]
+        )
         if not titles:
             print(f"경고: {r['label']} 제품군정리 탭을 찾을 수 없어 건너뜁니다.")
             continue
