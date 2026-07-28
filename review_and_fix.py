@@ -40,6 +40,7 @@
 자체가 완전히 틀렸던 경우)는 여전히 수동 확인이 필요하다.
 """
 import os
+import re
 import sys
 
 import gspread
@@ -69,6 +70,16 @@ RETAILERS = [
 RAW_MIRROR_FIELDS = ["상품코드", "제품명(한국어)", "가격", "제품명(영어)", "중량", "단가"]
 
 
+def find_category_sheet_titles(spreadsheet, base_name):
+    """main.py가 정리본을 촬영월별 탭으로 나누면서(예: "제품군정리(코스트코)"
+    ->  "제품군정리(코스트코)_2026-07"), 한 리테일러의 정리본이 더 이상 탭
+    하나가 아니게 됐다. base_name 자체(월별 분리 이전 데이터가 남아있는 옛
+    탭)와, base_name 뒤에 촬영월이 붙은 탭을 전부 찾아 돌려준다 - 이 스크립트가
+    존재하는 모든 달의 탭을 훑어야 과거 데이터를 놓치지 않는다."""
+    pattern = re.compile(rf"^{re.escape(base_name)}(_\d{{4}}-\d{{2}})?$")
+    return sorted(ws.title for ws in spreadsheet.worksheets() if pattern.match(ws.title))
+
+
 def require_config():
     missing = []
     if not main.SPREADSHEET_ID:
@@ -82,9 +93,8 @@ def require_config():
         sys.exit(1)
 
 
-def review_retailer(spreadsheet, label, retailer_key, raw_sheet_name, category_sheet_name, parse_fn):
+def review_retailer(spreadsheet, label, retailer_key, raw_sheet_name, category_sheet_titles, parse_fn):
     raw_ws = spreadsheet.worksheet(raw_sheet_name)
-    cat_ws = spreadsheet.worksheet(category_sheet_name)
 
     # "정리본위치" 컬럼이 아직 없는 시트(이 기능이 생기기 전부터 있던 RAW
     # 탭)일 수 있으니, 읽기 전에 헤더를 최신 COLUMN_ORDER 기준으로 맞춘다.
@@ -96,6 +106,8 @@ def review_retailer(spreadsheet, label, retailer_key, raw_sheet_name, category_s
     header = raw_values[0]
     idx = {h: i for i, h in enumerate(header)}
     # 같은 이름이 여러 번 나오면 첫 매치를 쓴다 (기존 진단 스크립트와 동일한 규칙).
+    # 정리본이 촬영월별로 여러 탭에 나뉘어 있어도, RAW는 여전히 리테일러당
+    # 하나뿐이라 이 매칭 풀은 모든 탭에 공통으로 쓴다.
     by_name = {}
     by_combined_name = {}
     for i, row in enumerate(raw_values[1:], start=2):
@@ -108,11 +120,8 @@ def review_retailer(spreadsheet, label, retailer_key, raw_sheet_name, category_s
             if combined not in by_combined_name:
                 by_combined_name[combined] = (i, row)
 
-    cat_values = cat_ws.get_all_values()
-    blocks, _ = main._scan_category_blocks(cat_values)
-
     raw_updates = []
-    cat_updates = []
+    cat_update_count = 0
     backfilled_positions = 0
     filled_items = []          # (category, product_name, [채운 필드])
     renamed_items = []         # (category, old_name, new_name)
@@ -120,104 +129,116 @@ def review_retailer(spreadsheet, label, retailer_key, raw_sheet_name, category_s
     still_needs_review = []    # (category, product_name, [여전히 빈 필드])
     unmatched_items = []       # (category, product_name) - RAW에서 못 찾음
 
-    for category, block in blocks.items():
-        field_rows = block["field_rows"]
-        name_row_idx = field_rows["상품명"] - 1
-        name_row = cat_values[name_row_idx] if name_row_idx < len(cat_values) else []
-        n_cols = len(name_row)
+    # 촬영월별로 나뉜 정리본 탭을 한 장씩 훑는다 - 탭마다 열 번호가 별개라
+    # col_letter 계산도 탭 단위로 새로 한다.
+    for category_sheet_name in category_sheet_titles:
+        cat_ws = spreadsheet.worksheet(category_sheet_name)
+        cat_values = cat_ws.get_all_values()
+        blocks, _ = main._scan_category_blocks(cat_values)
+        cat_updates = []
 
-        for col in range(1, n_cols):
-            product_name = name_row[col] if col < len(name_row) else ""
-            if not product_name:
-                continue
+        for category, block in blocks.items():
+            field_rows = block["field_rows"]
+            name_row_idx = field_rows["상품명"] - 1
+            name_row = cat_values[name_row_idx] if name_row_idx < len(cat_values) else []
+            n_cols = len(name_row)
 
-            match = by_name.get(product_name) or by_combined_name.get(product_name)
-            if match is None:
-                unmatched_items.append((category, product_name))
-                continue
-            row_num, row = match
-            raw_text = row[idx["원문텍스트"]] if len(row) > idx["원문텍스트"] else ""
-            lines = [l.strip() for l in raw_text.split("\n") if l.strip()]
+            for col in range(1, n_cols):
+                product_name = name_row[col] if col < len(name_row) else ""
+                if not product_name:
+                    continue
 
-            col_letter = main._col_letter(col + 1)
+                match = by_name.get(product_name) or by_combined_name.get(product_name)
+                if match is None:
+                    unmatched_items.append((category, product_name))
+                    continue
+                row_num, row = match
+                raw_text = row[idx["원문텍스트"]] if len(row) > idx["원문텍스트"] else ""
+                lines = [l.strip() for l in raw_text.split("\n") if l.strip()]
 
-            if main.is_back_label(lines):
-                for lk in main.CATEGORY_FIELD_MAP:
+                col_letter = main._col_letter(col + 1)
+
+                if main.is_back_label(lines):
+                    for lk in main.CATEGORY_FIELD_MAP:
+                        r = field_rows[lk]
+                        current = cat_values[r - 1][col] if col < len(cat_values[r - 1]) else ""
+                        if current:
+                            cat_updates.append({"range": f"{col_letter}{r}", "values": [[""]]})
+                    back_flag_idx = idx.get("뒷면여부")
+                    if back_flag_idx is not None and (len(row) <= back_flag_idx or row[back_flag_idx] != "뒷면"):
+                        raw_updates.append({
+                            "range": f"{main._col_letter(back_flag_idx + 1)}{row_num}",
+                            "values": [["뒷면"]],
+                        })
+                    reclassified_items.append((category, product_name))
+                    continue
+
+                current_raw_name = row[idx["제품명(한국어)"]] if len(row) > idx["제품명(한국어)"] else ""
+                if current_raw_name and current_raw_name != product_name:
+                    name_cell_row = field_rows["상품명"]
+                    cat_updates.append({
+                        "range": f"{col_letter}{name_cell_row}",
+                        "values": [[main._sheet_safe(current_raw_name)]],
+                    })
+                    renamed_items.append((category, product_name, current_raw_name))
+
+                position_idx = idx.get("정리본위치")
+                if position_idx is not None:
+                    current_position = row[position_idx] if len(row) > position_idx else ""
+                    if not current_position:
+                        raw_updates.append({
+                            "range": f"{main._col_letter(position_idx + 1)}{row_num}",
+                            "values": [[f"{category_sheet_name}!{col_letter}{block['title_row']}"]],
+                        })
+                        backfilled_positions += 1
+
+                recomputed = parse_fn(raw_text)
+                recomputed["셀링포인트"] = main.extract_selling_points(raw_text)
+
+                filled_fields = []
+                still_missing = []
+                for lk, key in main.CATEGORY_FIELD_MAP.items():
                     r = field_rows[lk]
                     current = cat_values[r - 1][col] if col < len(cat_values[r - 1]) else ""
-                    if current:
-                        cat_updates.append({"range": f"{col_letter}{r}", "values": [[""]]})
-                back_flag_idx = idx.get("뒷면여부")
-                if back_flag_idx is not None and (len(row) <= back_flag_idx or row[back_flag_idx] != "뒷면"):
-                    raw_updates.append({
-                        "range": f"{main._col_letter(back_flag_idx + 1)}{row_num}",
-                        "values": [["뒷면"]],
-                    })
-                reclassified_items.append((category, product_name))
-                continue
+                    if current.strip():
+                        continue
+                    new_val = str(recomputed.get(key, "")).strip()
+                    if new_val:
+                        cat_updates.append({"range": f"{col_letter}{r}", "values": [[main._sheet_safe(new_val)]]})
+                        filled_fields.append(lk)
+                    else:
+                        still_missing.append(lk)
 
-            current_raw_name = row[idx["제품명(한국어)"]] if len(row) > idx["제품명(한국어)"] else ""
-            if current_raw_name and current_raw_name != product_name:
-                name_cell_row = field_rows["상품명"]
-                cat_updates.append({
-                    "range": f"{col_letter}{name_cell_row}",
-                    "values": [[main._sheet_safe(current_raw_name)]],
-                })
-                renamed_items.append((category, product_name, current_raw_name))
+                for key in RAW_MIRROR_FIELDS:
+                    if key not in idx:
+                        continue
+                    new_val = str(recomputed.get(key, "")).strip()
+                    current = row[idx[key]] if len(row) > idx[key] else ""
+                    if new_val and new_val != current:
+                        raw_updates.append({
+                            "range": f"{main._col_letter(idx[key] + 1)}{row_num}",
+                            "values": [[main._sheet_safe(new_val)]],
+                        })
 
-            position_idx = idx.get("정리본위치")
-            if position_idx is not None:
-                current_position = row[position_idx] if len(row) > position_idx else ""
-                if not current_position:
-                    raw_updates.append({
-                        "range": f"{main._col_letter(position_idx + 1)}{row_num}",
-                        "values": [[f"{col_letter}{block['title_row']}"]],
-                    })
-                    backfilled_positions += 1
+                if filled_fields:
+                    filled_items.append((category, product_name, filled_fields))
+                if still_missing:
+                    still_needs_review.append((category, product_name, still_missing))
 
-            recomputed = parse_fn(raw_text)
-            recomputed["셀링포인트"] = main.extract_selling_points(raw_text)
-
-            filled_fields = []
-            still_missing = []
-            for lk, key in main.CATEGORY_FIELD_MAP.items():
-                r = field_rows[lk]
-                current = cat_values[r - 1][col] if col < len(cat_values[r - 1]) else ""
-                if current.strip():
-                    continue
-                new_val = str(recomputed.get(key, "")).strip()
-                if new_val:
-                    cat_updates.append({"range": f"{col_letter}{r}", "values": [[main._sheet_safe(new_val)]]})
-                    filled_fields.append(lk)
-                else:
-                    still_missing.append(lk)
-
-            for key in RAW_MIRROR_FIELDS:
-                if key not in idx:
-                    continue
-                new_val = str(recomputed.get(key, "")).strip()
-                current = row[idx[key]] if len(row) > idx[key] else ""
-                if new_val and new_val != current:
-                    raw_updates.append({
-                        "range": f"{main._col_letter(idx[key] + 1)}{row_num}",
-                        "values": [[main._sheet_safe(new_val)]],
-                    })
-
-            if filled_fields:
-                filled_items.append((category, product_name, filled_fields))
-            if still_missing:
-                still_needs_review.append((category, product_name, still_missing))
+        if not DRY_RUN and cat_updates:
+            cat_ws.batch_update(cat_updates, value_input_option="USER_ENTERED")
+        cat_update_count += len(cat_updates)
 
     sourcing_filled = None  # None = 실행 안 함(DRY RUN), 정수 = 실제로 채운 칸 수
     if not DRY_RUN:
         if raw_updates:
             raw_ws.batch_update(raw_updates, value_input_option="USER_ENTERED")
-        if cat_updates:
-            cat_ws.batch_update(cat_updates, value_input_option="USER_ENTERED")
         # 정리본위치를 방금 다 써넣은 뒤에 호출해야, 이번에 새로 채운 위치의
         # 뒷면도 바로 소급 반영된다. main.py의 run_once()와 똑같은 함수를
-        # 그대로 재사용한다 - 새 사진 없이도 전체 이력을 다시 훑는다.
-        sourcing_filled = main.sync_back_sourcing(raw_ws, cat_ws, retailer_key)
+        # 그대로 재사용한다 - 새 사진 없이도 전체 이력을 다시 훑는다. 정리본이
+        # 촬영월별 탭으로 나뉘어 있으므로, 탭 제목으로 필요한 탭을 그때그때
+        # 여는 resolver를 넘긴다.
+        sourcing_filled = main.sync_back_sourcing(raw_ws, retailer_key, spreadsheet.worksheet)
 
     return {
         "label": label,
@@ -227,7 +248,7 @@ def review_retailer(spreadsheet, label, retailer_key, raw_sheet_name, category_s
         "still_needs_review": still_needs_review,
         "unmatched_items": unmatched_items,
         "raw_update_count": len(raw_updates),
-        "cat_update_count": len(cat_updates),
+        "cat_update_count": cat_update_count,
         "backfilled_positions": backfilled_positions,
         "sourcing_filled": sourcing_filled,
     }
@@ -273,17 +294,20 @@ def run_once():
     gc = gspread.authorize(creds)
     spreadsheet = gc.open_by_key(main.SPREADSHEET_ID)
 
-    results = [
-        review_retailer(
+    results = []
+    for r in RETAILERS:
+        titles = find_category_sheet_titles(spreadsheet, r["category_sheet_name"])
+        if not titles:
+            print(f"경고: {r['label']} 제품군정리 탭을 찾을 수 없어 건너뜁니다.")
+            continue
+        results.append(review_retailer(
             spreadsheet,
             r["label"],
             r["retailer_key"],
             r["raw_sheet_name"],
-            r["category_sheet_name"],
+            titles,
             r["parse_fn"],
-        )
-        for r in RETAILERS
-    ]
+        ))
 
     report = format_report(results)
     print(report)
