@@ -1147,8 +1147,20 @@ def extract_selling_points(text: str, product_code: str = "") -> str:
 # 다음부터 노이즈(가격/단가/코드/정형문구 등)가 나오거나 한글이 없는 줄이
 # 나오기 전까지 이어지는 줄들을 통째로 한 문장으로 합친다.
 def _find_unmarked_description(lines: list) -> str:
+    # "THE LAUGHING COW"처럼 브랜드명이 코드 바로 다음 줄에 대문자 2단어
+    # 이상으로 찍히는 경우가 있어서(_parse_fields_from_lines의 english_idx
+    # 판별과 같은 함정), 한글 줄을 하나도 못 봤으면 대문자 줄을 진짜 영문
+    # 제품명으로 인정하지 않는다 - 그러지 않으면 브랜드명 줄을 english_idx로
+    # 잘못 채택해서, 그 바로 다음에 오는 진짜 영문 제품명 줄(예: "BELCUBE
+    # PLAIN 250GX2")에서 한글이 없다는 이유로 스캔이 너무 일찍 끝나버리고,
+    # 정작 그 뒤에 이어지는 진짜 셀링 문구는 하나도 못 줍는다.
     english_idx = None
+    seen_korean_line = False
     for i, line in enumerate(lines):
+        if re.search(r"[가-힣]", line):
+            seen_korean_line = True
+        if not seen_korean_line:
+            continue
         if (
             re.fullmatch(r"[A-Z0-9 .,'&×\-]{4,}", line)
             and re.search(r"[A-Z]{2,}", line)
