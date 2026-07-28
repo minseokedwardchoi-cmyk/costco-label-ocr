@@ -1904,7 +1904,20 @@ def parse_traders_fields(text: str) -> dict:
     # 예전처럼 0번째 줄을 억지로 제품명으로 쓰면 "Global Product"나 "11,400"
     # 같은 걸 제품명으로 잘못 채택하게 된다. 한글 줄이 하나도 없으면 제품명은
     # 그냥 빈 채로 남긴다(실제로 못 읽은 것이므로).
-    korean_name_idx = next((i for i, l in enumerate(lines) if re.search(r"[가-힣]", l)), None)
+    # 첫 한글 줄이라고 다 제품명은 아니다 - "√ 탁월한 세척력*"/"- 스머커스
+    # 딸기, 오렌지, 블루베리맛..." 같은 불릿 셀링포인트나 "신세계포인트" 같은
+    # 정형 프로모션 문구가 진짜 제품명 줄보다 먼저 나오는 경우가 실사진에서
+    # 확인됐다(트레이더스는 카드 위쪽에 셀링/프로모션 문구가 먼저 오는 레이아웃이
+    # 있음). 불릿 문자로 시작하거나 알려진 프로모션 문구인 한글 줄은 건너뛰고,
+    # 그 다음 한글 줄을 제품명으로 삼는다.
+    def _is_traders_name_candidate(line: str) -> bool:
+        if not re.search(r"[가-힣]", line):
+            return False
+        if line[:1] in "-–—−•·▶*√":
+            return False
+        return not any(sub in line for sub in _SELLING_POINT_EXCLUDE_SUBSTRINGS)
+
+    korean_name_idx = next((i for i, l in enumerate(lines) if _is_traders_name_candidate(l)), None)
     if korean_name_idx is not None:
         result["제품명(한국어)"] = lines[korean_name_idx]
 
@@ -1979,6 +1992,16 @@ def parse_traders_fields(text: str) -> dict:
             result["중량"] = trailing_combo
     if not result["중량"]:
         result["중량"] = _find_composition_spec(lines)
+
+    # 뒷면 사진 매칭 없이도 카드 자체에 "원산지:"가 찍혀 있으면 바로
+    # 병입원산지로 채택한다 - _parse_fields_from_lines()(코스트코)와 같은
+    # 근거(README 7절 참고).
+    m = _ORIGIN_LABEL_PATTERN.search(text)
+    if m:
+        raw_value = (m.group(1) or m.group(2) or "").strip()
+        mapped = _COUNTRY_EN_TO_KO.get(raw_value.upper()) if m.group(2) else raw_value
+        if mapped and len(mapped) >= 2:
+            result["병입원산지"] = "국내" if mapped in ("대한민국", "한국") else mapped
 
     return result
 
