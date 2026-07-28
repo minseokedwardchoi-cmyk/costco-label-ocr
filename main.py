@@ -1560,13 +1560,23 @@ def extract_origin(text: str) -> str:
     return ""
 
 
-def determine_sourcing(product_name: str, retailer: str, back_text: str) -> tuple:
+def determine_sourcing(product_name: str, retailer: str, back_text: str, front_text: str = "") -> tuple:
     """(소싱형태, 병입원산지)를 함께 돌려준다. product_name은 상품카드에서
-    읽은 제품명(뒷면이 아님), back_text는 매칭된 뒷면 사진(들)의 원문텍스트."""
+    읽은 제품명(뒷면이 아님), back_text는 매칭된 뒷면 사진(들)의 원문텍스트,
+    front_text는 상품카드 자체의 원문텍스트("직수입" 인증 문구 판별용)."""
     origin = extract_origin(back_text)
 
     if _PB_NAME_PATTERN.search(product_name or ""):
         return "PB", origin
+
+    # 코스트코 자체 가격표에 "-직수입 오리지널 제품"처럼 "직수입" 문구가
+    # 불릿으로 직접 찍혀 있는 경우가 실사진(도리토스 나초칩)에서 확인됐다 -
+    # 이건 뒷면의 제조사/수입사 라벨을 해석해서 추론하는 게 아니라 코스트코가
+    # 스스로 매긴 소싱 인증이라, 뒷면 사진 매칭 여부와 무관하게 그대로
+    # 신뢰한다(뒷면이 아예 없는 카드도 이 값만으로 채워질 수 있다 -
+    # sync_back_sourcing 참고).
+    if "직수입" in (front_text or ""):
+        return "직수입", origin
 
     fields = parse_sourcing_fields(back_text)
     importer_chain = _chain_of(fields["importer_value"])
@@ -2514,7 +2524,20 @@ def sync_back_sourcing(sheet, retailer: str, resolve_category_sheet) -> int:
             continue
         back_ids = matches.get(card["file_id"], [])
         back_text = "\n".join(by_id[bid]["text"] for bid in back_ids if bid in by_id)
-        if not back_text:
+        front_text = card["text"]
+        # 뒷면 매칭이 없어도 카드 자체에 판단 근거(PB 문구, "직수입" 인증
+        # 문구)가 있으면 계속 진행한다 - determine_sourcing()이 그 경우를
+        # 처리한다(이전에는 뒷면이 없으면 무조건 건너뛰어서, 뒷면 사진이
+        # 없는 PB/직수입 카드가 뒷면 없이는 영영 소싱형태를 못 받았다).
+        # 뒷면도 없고 카드 자체에도 근거가 없으면 계산해봐야 항상 빈
+        # 소싱형태 + "국내"(원산지 정보 전무 시의 기본값)만 나오는데, 이건
+        # 실제로는 "모른다"일 뿐 "국내산으로 확인됨"이 아니므로 여기서
+        # 건너뛴다.
+        if (
+            not back_text
+            and not _PB_NAME_PATTERN.search(card["product_name"] or "")
+            and "직수입" not in front_text
+        ):
             continue
         if "!" in card["position"]:
             title, cell_ref = card["position"].split("!", 1)
@@ -2524,7 +2547,7 @@ def sync_back_sourcing(sheet, retailer: str, resolve_category_sheet) -> int:
         if not m:
             continue
         col, title_row = m.group(1), int(m.group(2))
-        sourcing, origin = determine_sourcing(card["product_name"], retailer, back_text)
+        sourcing, origin = determine_sourcing(card["product_name"], retailer, back_text, front_text)
         sourcing_row = title_row + CATEGORY_ROW_LABELS.index("소싱형태") + 1
         origin_row = title_row + CATEGORY_ROW_LABELS.index("병입원산지") + 1
         candidates_by_title.setdefault(title, []).append((f"{col}{sourcing_row}", sourcing))
