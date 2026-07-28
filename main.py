@@ -2391,6 +2391,29 @@ def _col_letter(col: int) -> str:
     return letters
 
 
+# Google Sheets API의 values:batchGet/batchUpdate는 한 번에 보낼 수 있는 범위
+# 개수에 제한이 있다 - 실측으로 228개 범위는 항상 400(Bad Request)으로
+# 실패하고 150개는 성공함을 확인했다(정리본(트레이더스)_2026-01, 카드 114개
+# x 소싱형태/병입원산지 2칸 = 228개 범위 요청 시 매번 실패해서 트레이더스
+# 소싱형태/병입원산지가 단 하나도 안 채워지는 문제로 이어졌다). 카드/행이
+# 계속 쌓이는 시트(정리본, RAW 앞뒤매칭/정리본위치 등)는 언젠가 이 상한을
+# 넘을 수 있으므로, batch_get/batch_update를 쓰는 모든 곳에서 이 크기로
+# 나눠 보낸다.
+_SHEETS_BATCH_CHUNK_SIZE = 100
+
+
+def _batch_get_chunked(sheet, ranges: list):
+    result = []
+    for i in range(0, len(ranges), _SHEETS_BATCH_CHUNK_SIZE):
+        result.extend(sheet.batch_get(ranges[i:i + _SHEETS_BATCH_CHUNK_SIZE]))
+    return result
+
+
+def _batch_update_chunked(sheet, updates: list, **kwargs):
+    for i in range(0, len(updates), _SHEETS_BATCH_CHUNK_SIZE):
+        sheet.batch_update(updates[i:i + _SHEETS_BATCH_CHUNK_SIZE], **kwargs)
+
+
 # USER_ENTERED로 쓰는 값이 "+"/"-"/"="/"@"로 시작하면 구글 시트가 그 셀을
 # 수식으로 해석하려다 실패해서 "#ERROR!"로 뜬다(실사진에서 확인됨 - OCR로
 # 뽑은 제품명이 우연히 "+1 정밀 트리머"처럼 "+"로 시작한 경우). 앞에 작은따옴표
@@ -2501,7 +2524,7 @@ def update_category_sheet(sheet, row_dicts: list):
             sheet.resize(cols=max_col_used + 10)
         if max_row_used > sheet.row_count:
             sheet.resize(rows=max_row_used + 20)
-        sheet.batch_update(updates, value_input_option="USER_ENTERED")
+        _batch_update_chunked(sheet, updates, value_input_option="USER_ENTERED")
 
     return positions
 
@@ -2599,7 +2622,7 @@ def resync_card_back_matches(sheet):
         if new_value and new_value != columns["매칭파일ID"][i]:
             updates.append({"range": f"{match_col_letter}{i + 2}", "values": [[_sheet_safe(new_value)]]})
     if updates:
-        sheet.batch_update(updates, value_input_option="USER_ENTERED")
+        _batch_update_chunked(sheet, updates, value_input_option="USER_ENTERED")
     return len(updates)
 
 
@@ -2617,7 +2640,7 @@ def _write_category_positions(sheet, positions: dict):
         if file_id in positions:
             updates.append({"range": f"{pos_col_letter}{i + 2}", "values": [[positions[file_id]]]})
     if updates:
-        sheet.batch_update(updates, value_input_option="USER_ENTERED")
+        _batch_update_chunked(sheet, updates, value_input_option="USER_ENTERED")
 
 
 def sync_back_sourcing(sheet, retailer: str, resolve_category_sheet) -> int:
@@ -2713,14 +2736,14 @@ def sync_back_sourcing(sheet, retailer: str, resolve_category_sheet) -> int:
         if not candidates:
             continue
         category_sheet = resolve_category_sheet(title)
-        current = category_sheet.batch_get([cell for cell, _ in candidates])
+        current = _batch_get_chunked(category_sheet, [cell for cell, _ in candidates])
         updates = []
         for (cell, value), grid in zip(candidates, current):
             existing = grid[0][0] if grid and grid[0] else ""
             if not existing:
                 updates.append({"range": cell, "values": [[value]]})
         if updates:
-            category_sheet.batch_update(updates, value_input_option="USER_ENTERED")
+            _batch_update_chunked(category_sheet, updates, value_input_option="USER_ENTERED")
         total_updates += len(updates)
     return total_updates
 
