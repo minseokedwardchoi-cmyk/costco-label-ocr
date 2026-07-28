@@ -1134,7 +1134,7 @@ def extract_selling_points(text: str, product_code: str = "") -> str:
     lines = [l.strip() for l in text.split("\n") if l.strip()]
     if product_code:
         for i, line in enumerate(lines):
-            if _normalize_bare_code(line) == product_code:
+            if _normalize_bare_code(line, allow_five_digit=True) == product_code:
                 lines = lines[i + 1:]
                 break
     for markers in _BULLET_MARKER_TIERS:
@@ -1207,7 +1207,7 @@ def _name_cleanliness(name: str) -> float:
     return 1 - (junk / len(tokens))
 
 
-def _normalize_bare_code(line: str) -> str:
+def _normalize_bare_code(line: str, allow_five_digit: bool = False) -> str:
     """OCR이 코드 숫자 중간에 공백을 잘못 끼워넣는 경우가 실제로 있다
     ("196 987" - 진짜 코드는 "196987"). 이러면 원래 fullmatch(r"\\d{4,8}")가
     실패해서 코드 자체를 못 찾고, 그 뒤로 코드가 없는 것처럼 처리되어 배경
@@ -1217,11 +1217,18 @@ def _normalize_bare_code(line: str) -> str:
     (하한을 6자리로 둔 이유: 실제 운영 데이터의 모든 코스트코 상품코드는
     6~7자리였고, 유일한 5자리 "코드"는 사진에 같이 찍힌 스펙 플래카드의
     "50 000"(진짜 상품카드가 아닌 배경 물체)가 잘못 코드로 인식된
-    경우였다 - 5자리 이하는 애초에 진짜 상품코드일 가능성이 없다.)"""
+    경우였다 - 5자리 이하는 애초에 진짜 상품코드일 가능성이 없다.)
+    청과류는 진짜 상품코드가 5자리인 경우가 실사진에서 확인됐다("30669"
+    델몬떼 바나나 등). allow_five_digit=True를 넘기면 5자리도 인정하는데,
+    호출부에서 "카드의 맨 첫 줄"일 때만 이 플래그를 켠다 - 진짜 상품코드는
+    항상 카드 맨 위에 오고, 위에서 설명한 배경 잡음 오탐 사례는 첫 줄이
+    아니었으므로 이렇게 위치를 제한하면 6자리 하한을 둔 원래 취지를 그대로
+    지키면서 5자리 코드만 추가로 구제할 수 있다."""
     if line.count(" ") > 1:
         return ""
     compact = line.replace(" ", "")
-    return compact if re.fullmatch(r"\d{6,8}", compact) else ""
+    min_digits = 5 if allow_five_digit else 6
+    return compact if re.fullmatch(rf"\d{{{min_digits},8}}", compact) else ""
 
 
 # 사람들이 Drive 폴더에 상품카드(가격표) 사진뿐 아니라 제품 뒷면(영양정보/
@@ -1579,7 +1586,10 @@ def parse_price_fields(text: str) -> dict:
     그 다음 경계까지 넓힌다 - 그래야 뒤에 이어지는 진짜 정가를 놓치지 않는다.
     """
     lines = [l.strip() for l in text.split("\n") if l.strip()]
-    code_indices = [i for i, l in enumerate(lines) if _normalize_bare_code(l)]
+    code_indices = [
+        i for i, l in enumerate(lines)
+        if _normalize_bare_code(l, allow_five_digit=(i == 0))
+    ]
 
     if len(code_indices) <= 1:
         return _parse_fields_from_lines(lines)
@@ -1618,7 +1628,7 @@ def _parse_fields_from_lines(lines: list) -> dict:
 
     code_idx = None
     for i, line in enumerate(lines):
-        normalized_code = _normalize_bare_code(line)
+        normalized_code = _normalize_bare_code(line, allow_five_digit=(i == 0))
         if normalized_code:
             result["상품코드"] = normalized_code
             code_idx = i
@@ -1753,6 +1763,13 @@ def _parse_fields_from_lines(lines: list) -> dict:
     end = min(boundary_candidates) if boundary_candidates else len(lines)
     korean_lines = lines[start:end]
 
+    # 무게/영문명 경계보다 먼저 "원산지 : 노르웨이산"/"돈육원산지 : 미국"처럼
+    # 원산지 표기가 한글 제품명 구간 안쪽에 끼는 카드가 있다(수산/청과/축산
+    # 실사진에서 확인됨 - 식품/비식품은 보통 원산지 표기가 이 구간보다 뒤,
+    # 셀링포인트 자리에 나와서 지금까지는 안 걸렸다). 이 값은 위에서 이미
+    # 병입원산지로 따로 뽑았으므로, 제품명에 그대로 안 섞이게 건너뛴다.
+    korean_lines = [l for l in korean_lines if not _is_origin_label_line(l)]
+
     # 사진에 다른 상품(배경 진열대의 다른 포장 박스 등)이 같이 찍히면, 그
     # 포장에 적힌 작은 글자 파편이 "HEE"/"CON"처럼 뜻 없는 짧은 대문자 낱말
     # 줄로 OCR되어 코드 바로 다음, 진짜 브랜드명 줄(예: "ARLA") 앞에 끼어드는
@@ -1790,20 +1807,28 @@ def _parse_fields_from_lines(lines: list) -> dict:
     # 그대로 단위로 쓰면 둘 다 커버된다.
     danga_price = ""
     danga_price_line_idx = None  # 가격 탐색에서 이 줄은 다시 쓰지 않도록 인덱스로 기억
-    if danga_idx is not None:
+    # 축산 카드는 "KG당단가"라는 고정 문구(실제 값 없음)가 진짜 단가 구간
+    # ("단가 / 100G" + 가격)보다 먼저 나온다. danga_idx(위, "단가"가 처음
+    # 나오는 위치 - 한글 제품명 경계로는 이 위치가 맞아서 그대로 둔다)를
+    # 그대로 쓰면 "KG당단가" 줄부터 3줄 안에서 가격을 찾다가 실패한다.
+    # "단가"가 포함된 줄이 여러 개면 순서대로 시도해서 실제로 가격이 있는
+    # 구간을 찾는다 - "단가"가 한 번만 나오는 기존 카드는 첫 시도에서 바로
+    # 끝나므로(아래 for문이 한 번만 돌고 break) 결과가 예전과 동일하다.
+    for candidate_idx in (i for i, line in enumerate(lines) if "단가" in line):
         # OCR이 "/" 구분자를 모양이 비슷한 다른 문자로 잘못 읽는 경우가 실제로
         # 있다 - 세로줄 모양의 "ㅣ"(한글 자모, "단가 ㅣ 개")와 "!"(느낌표,
         # "단가 ! 장") 둘 다 확인됐다. 셋 다 받아준다.
-        unit_match = re.search(r"단가\s*[/ㅣ!]\s*(\S+)", lines[danga_idx])
+        unit_match = re.search(r"단가\s*[/ㅣ!]\s*(\S+)", lines[candidate_idx])
         unit = unit_match.group(1) if unit_match else ""
-        for offset, line in enumerate(lines[danga_idx:danga_idx + 3]):
+        for offset, line in enumerate(lines[candidate_idx:candidate_idx + 3]):
             m = re.search(r"[\d,]{2,}\s*원", line)
             if m:
                 danga_price = m.group(0)
-                danga_price_line_idx = danga_idx + offset
+                danga_price_line_idx = candidate_idx + offset
                 break
         if danga_price:
             result["단가"] = f"{danga_price}/{unit}" if unit else danga_price
+            break
     if not result["단가"]:
         # "단가"라는 글자 자체가 없어도 "100g당 1,211원"처럼 단위당 가격이
         # 그대로 찍혀있는 경우가 있다.
