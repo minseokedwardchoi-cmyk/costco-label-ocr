@@ -2135,10 +2135,20 @@ def parse_traders_fields(text: str) -> dict:
     # 확인됐다(트레이더스는 카드 위쪽에 셀링/프로모션 문구가 먼저 오는 레이아웃이
     # 있음). 불릿 문자로 시작하거나 알려진 프로모션 문구인 한글 줄은 건너뛰고,
     # 그 다음 한글 줄을 제품명으로 삼는다.
+    # 배경의 다른 상품 가격표에서 새어 들어온 문장 조각("...보상 받을 수
+    # 있습니다.", "...깨끗이 씻어내 줍니다." 같은 소비자분쟁해결기준/사용법
+    # 문구의 뒷부분만 찍힘)이 한글을 포함하고 불릿도 아니라서 위 두 조건을
+    # 통과해 제품명으로 잘못 채택되는 경우가 실사진(네이처 그래놀라)에서
+    # 확인됐다. 진짜 제품명은 명사(구)라 이런 종결어미로 끝나는 일이 없으므로,
+    # "-습니다"/"-니다"로 끝나는 줄은 문장 조각으로 보고 제외한다.
+    _SENTENCE_ENDING_RE = re.compile(r"(?:습니다|니다)\.?$")
+
     def _is_traders_name_candidate(line: str) -> bool:
         if not re.search(r"[가-힣]", line):
             return False
         if line[:1] in "-–—−•·▶*√":
+            return False
+        if _SENTENCE_ENDING_RE.search(line):
             return False
         return not any(sub in line for sub in _SELLING_POINT_EXCLUDE_SUBSTRINGS)
 
