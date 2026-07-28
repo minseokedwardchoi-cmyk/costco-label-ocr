@@ -481,6 +481,33 @@ def _defer_offcolumn_price_tokens(positioned):
     return main, deferred
 
 
+# 제품 뒷면 한글표시사항은 "라벨" 칸(제품명/식품유형/제조사/수입/판매업소/
+# 원재료명/내용량/원산지/보관방법 등)과 "값" 칸이 나란히 놓인 표 형태가
+# 많다. 이 표는 라벨 칸이 좁고 값 칸과 뚜렷한 간격을 두고 떨어져 있어서,
+# 위 2단(좌/우) 재배열 로직이 이걸 "셀링포인트가 좌/우로 나뉜 카드"로 착각해
+# "라벨 전부 -> 값 전부" 순서로 통째로 재배열해버리는 사고가 실사진(HUGHSON
+# 아몬드/NOEL 하몽/BIFFI 버섯소스)에서 확인됐다. 원래 순서(라벨1,값1,라벨2,
+# 값2,...)가 이미 올바른 읽기 순서인 표에 이 재배열을 적용하면 "수입"
+# 라벨이 그 값("(주)코스트코 코리아")과 완전히 떨어진 곳으로 밀려나서,
+# determine_sourcing()이 둘을 짝지어 읽지 못해 "직수입" 판정을 놓친다.
+# 그래서 후보 줄들 중 이런 표시사항 라벨 낱말로 시작하는 줄이 여럿이면
+# 이 카드는 표 형태로 보고 재배열 자체를 건너뛴다.
+_BACK_LABEL_FIELD_WORDS = (
+    "제품명", "식품유형", "제조사", "제조원", "제조업체", "수입원", "수입업소",
+    "수입판매업소", "수입", "판매업소", "판매원", "원재료명", "내용량", "원산지",
+    "제조국", "소비기한", "유통기한", "보관방법", "조리방법", "반품", "교환장소",
+    "포장재질", "영양정보", "품목보고번호",
+)
+
+
+def _looks_like_field_label_table(entries) -> bool:
+    label_like = sum(
+        1 for e in entries
+        if any(e["text"].strip().startswith(w) for w in _BACK_LABEL_FIELD_WORDS)
+    )
+    return label_like >= 3
+
+
 def _reorder_two_column_block(entries):
     """셀링포인트(특징) 문구가 카드 하단에 좌/우 2단으로 나란히 배치된
     레이아웃이 실사진에서 확인됐다(예: 왼쪽 "샌드위치, 피자토핑, ... 사용
@@ -541,6 +568,9 @@ def _reorder_segment_if_two_column(segment):
     """_reorder_two_column_block()이 가격 줄로 나눈 한 구간 안에서, 그
     구간 자체의 폭을 기준으로 2단 구조를 판단해 재배열한다."""
     if len(segment) < 4:
+        return segment
+
+    if _looks_like_field_label_table(segment):
         return segment
 
     min_left = min(e["left_x"] for e in segment)
