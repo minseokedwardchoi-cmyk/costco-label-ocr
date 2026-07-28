@@ -473,6 +473,76 @@ def _defer_offcolumn_price_tokens(positioned):
     return main, deferred
 
 
+def _reorder_two_column_block(entries):
+    """셀링포인트(특징) 문구가 카드 하단에 좌/우 2단으로 나란히 배치된
+    레이아웃이 실사진에서 확인됐다(예: 왼쪽 "샌드위치, 피자토핑, ... 사용
+    가능합니다.", 오른쪽 "라이트와인, 과일과도 어울림. ..." 처럼 서로 다른
+    두 문장이 나란히 놓임). y좌표만으로 정렬하면(위 함수들이 처리하는
+    "가격 숫자 하나가 끼어드는" 경우와 달리) 두 단의 줄이 위에서부터 통째로
+    번갈아 섞여 두 문장이 뒤죽박죽 하나로 합쳐진다("왼쪽줄1, 오른쪽줄1,
+    왼쪽줄2, 오른쪽줄2, ..." 순서로 나와서 셀링포인트 파싱이 엉뚱한 문구를
+    만들어냄). 카드 폭 전체를 쓰는 줄(코드/제품명/가격처럼)은 원래부터 한
+    줄 전체를 차지하므로 이 문제와 무관해서 그대로 두고, 폭이 좁아 한쪽에만
+    있는 줄들만 좌/우로 클러스터링해서 "왼쪽 단을 위→아래로 다 읽은 뒤
+    오른쪽 단을 위→아래로" 순서로 재배열한다. 순수 숫자 가격 줄은
+    _defer_offcolumn_price_tokens()가 이미 별도로 다루는 영역이라 여기서는
+    후보에서 제외해 서로 간섭하지 않게 한다.
+
+    뚜렷한 2단 구조(폭 15% 이상 벌어진 간격, 양쪽 모두 2줄 이상)가 안 보이면
+    원래 순서를 그대로 돌려준다 - 대부분의 카드는 이 함수가 사실상 아무것도
+    바꾸지 않는 단일 컬럼 레이아웃이다."""
+    if len(entries) < 4:
+        return entries
+
+    min_left = min(e["left_x"] for e in entries)
+    max_right = max(e["right_x"] for e in entries)
+    total_width = max_right - min_left
+    if total_width <= 0:
+        return entries
+
+    narrow = [
+        e for e in entries
+        if (e["right_x"] - e["left_x"]) < total_width * 0.6
+        and not _PRICE_TOKEN_RE.match(e["text"].strip())
+    ]
+    if len(narrow) < 4:
+        return entries
+
+    xs = sorted(e["left_x"] for e in narrow)
+    gaps = [(xs[i + 1] - xs[i], i) for i in range(len(xs) - 1)]
+    biggest_gap, split_i = max(gaps)
+    if biggest_gap < total_width * 0.15:
+        return entries  # 뚜렷한 2단 구분이 없음 - 원래 순서 유지
+    boundary_x = (xs[split_i] + xs[split_i + 1]) / 2
+
+    left_ids = {id(e) for e in narrow if e["left_x"] < boundary_x}
+    right_ids = {id(e) for e in narrow if e["left_x"] >= boundary_x}
+    if len(left_ids) < 2 or len(right_ids) < 2:
+        return entries
+
+    # 연속으로 이어지는 좌/우 후보 구간만 "왼쪽 전부 -> 오른쪽 전부"로
+    # 재배열한다 - 그 사이에 전체 폭 줄(가격 등)이 끼어 구간이 끊기면 거기서
+    # 새 구간으로 다시 시작해서, 서로 다른 2단 블록이 뒤섞이지 않게 한다.
+    result = []
+    i = 0
+    while i < len(entries):
+        e = entries[i]
+        if id(e) in left_ids or id(e) in right_ids:
+            j = i
+            block = []
+            while j < len(entries) and (id(entries[j]) in left_ids or id(entries[j]) in right_ids):
+                block.append(entries[j])
+                j += 1
+            left_block = [x for x in block if id(x) in left_ids]
+            right_block = [x for x in block if id(x) in right_ids]
+            result.extend(left_block + right_block)
+            i = j
+        else:
+            result.append(e)
+            i += 1
+    return result
+
+
 # ---- 사진 한 장에 여러 물체(다른 상품 박스, 배경의 다른 가격표 등)가 같이
 # 찍혔을 때, 진짜 대상 상품카드가 아닌 것들을 걸러내기 위한 레이아웃 분석 ----
 # 같은 상품카드 안의 줄들은 세로 간격이 좁고 배경색도 일정하다. 다른 물체로
@@ -681,6 +751,7 @@ def _extract_text_and_confidence(result, image_bytes=None):
         except Exception as e:
             print(f"  경고: 레이아웃(배경색/간격) 분석 실패, 필터링 없이 진행: {e}")
 
+    positioned = _reorder_two_column_block(positioned)
     main_lines, deferred_lines = _defer_offcolumn_price_tokens(positioned)
     full_text = "\n".join(e["text"] for e in main_lines + deferred_lines + unpositioned)
     return full_text, confidences
@@ -1189,13 +1260,26 @@ _PB_NAME_PATTERN = re.compile(
 _ENTITY_SUFFIX = r"(?:원|자|처|업자|업체|업소|회사|사)"
 # 실사진에서 확인된 "수입" 라벨 표기가 다양하다: "수입업소"(가장 흔함, "판매"
 # 없이 바로 업소), "수입판매원"/"수입 판매원"(수입과 접미사 사이에 "판매"가
-# 낀 경우 - P&G/LG생활건강 라벨에 흔함), "수입 및 판매업소", "수입판매책임업자"
-# 등. "수입" 바로 뒤에 접미사가 오는 경우만 인정하면 이런 변형들을 다 놓친다.
-# "및"/가운뎃점/"판매"/"책임" 같은 흔한 연결어가 중간에 끼어도 인정하되,
-# "공식 수입 업체인" 같은 마케팅 문장(진짜 라벨이 아님)까지 걸리지 않도록
-# 연결어 목록은 실제 라벨에서 확인된 것들로만 한정한다.
+# 낀 경우 - P&G/LG생활건강 라벨에 흔함), "수입 및 판매업소", "수입판매책임업자",
+# 그리고 코스트코 자체 라벨에 흔한 접미사 없는 "수입"(바로 뒤에 "(주)..."나
+# ":"가 옴) 등. "수입" 바로 뒤에 접미사가 오는 경우만 인정하면 이런 변형들을
+# 다 놓친다. "및"/가운뎃점/"판매"/"책임" 같은 흔한 연결어가 중간에 끼어도
+# 인정하되, "공식 수입 업체인" 같은 마케팅 문장(진짜 라벨이 아님)까지 걸리지
+# 않도록 연결어 목록은 실제 라벨에서 확인된 것들로만 한정한다.
+#
+# 접미사 없는 "수입"까지 받아주면서 생긴 새 함정: "반품 및 교환장소: 구입처
+# 및 수입판매업소"처럼 식품 표시 고시 문구에 관용적으로 들어가는 문장에도
+# "수입판매업소"라는 글자가 그대로 나온다 - 이건 라벨이 아니라 그 갈피에 낀
+# 서술어라서, 진짜 "수입" 라벨(대개 그 문장보다 앞쪽에 있음)보다 이 가짜
+# 매치가 먼저 잡히면 안 된다. "및" 바로 뒤에 오는 "수입"은 이런 서술 문장의
+# 일부일 뿐 필드 라벨이 아니므로 부정형 후방탐색으로 제외한다(실제 라벨
+# 변형 중 "수입" 앞에 "및"이 붙는 경우는 없음 - "수입 및 판매업소"처럼 "및"은
+# 항상 "수입" 뒤에 온다).
 _IMPORTER_LABEL_PATTERN = re.compile(
-    rf"수입\s*(?:및\s*)?(?:[·・]\s*)?(?:판매\s*)?(?:책임\s*)?(?:{_ENTITY_SUFFIX}|판매업소)"
+    rf"(?<!및)(?<!및\s)수입\s*(?:"
+    rf"(?:및\s*)?(?:[·・]\s*)?(?:판매\s*)?(?:책임\s*)?(?:{_ENTITY_SUFFIX}|판매업소)"
+    rf"|(?=[:：(（])"
+    rf")"
 )
 _MANUFACTURER_LABEL_PATTERN = re.compile(rf"(?:화장품)?제조\s*{_ENTITY_SUFFIX}")
 # 라벨 뒤에 붙은 값을 어디까지 읽을지 정하는 경계 - 다음 항목 라벨(제조/판매/
