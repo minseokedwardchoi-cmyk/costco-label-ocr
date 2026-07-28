@@ -99,6 +99,10 @@ AZURE_VISION_KEY = os.environ.get("AZURE_VISION_KEY")
 
 # Azure F0(무료 티어) 제한: 분당 20건. 여유를 두고 18건/분으로 제한.
 AZURE_MAX_CALLS_PER_MINUTE = int(os.environ.get("AZURE_MAX_CALLS_PER_MINUTE", "18"))
+
+# Azure Read API v3.2가 받아주는 최대 파일 크기(4MB)에 여유를 둔 값.
+_AZURE_MAX_IMAGE_BYTES = 4 * 1024 * 1024
+_AZURE_SAFE_IMAGE_BYTES = int(_AZURE_MAX_IMAGE_BYTES * 0.9)
 CONCURRENT_WORKERS = int(os.environ.get("CONCURRENT_WORKERS", "4"))
 CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", "0.65"))
 LOW_CONFIDENCE_WORD_RATIO = float(os.environ.get("LOW_CONFIDENCE_WORD_RATIO", "0.15"))
@@ -319,12 +323,40 @@ def normalize_image_for_ocr(image_bytes: bytes) -> bytes:
        뒤(그래야 아래에서 새로 저장할 때 이중으로 안 돌아간다) 보낸다.
 
     HEIC든 JPEG/PNG든 상관없이 항상 거친다 - 방향이 이미 정상인 사진은
-    exif_transpose()가 그대로 돌려주므로 아무 변화가 없다."""
+    exif_transpose()가 그대로 돌려주므로 아무 변화가 없다.
+
+    3) Azure Read API v3.2는 4MB가 넘는 이미지를 그냥 거부한다(400). 최신
+       스마트폰의 원본 해상도 사진(4284x5712급)은 92% 품질로 재인코딩해도
+       4MB를 훌쩍 넘는 경우가 실사진(2026-01-01 트레이더스 업로드분 다수)에서
+       확인됐다 - 이런 사진은 Azure 호출이 재시도까지 다 실패하고 '실패'
+       목록에만 조용히 남아서 시트에도 안 쓰이고 '처리완료' 폴더로도 안
+       옮겨진다. 사용자 입장에서는 사진이 통째로 안 읽히고 폴더에 그대로
+       남아있는 것처럼 보인다(실제로 그런 상태다). 화질을 단계적으로 낮춰서
+       상한 아래로 맞추고, 그래도 안 되면 마지막 수단으로 가로/세로를
+       줄인다 - 글자 인식에는 압축 품질보다 해상도가 더 중요해서, 해상도
+       축소는 화질 저하보다 뒤에 시도한다."""
     image = Image.open(io.BytesIO(image_bytes))
     image = ImageOps.exif_transpose(image)
+    rgb = image.convert("RGB")
+
     out = io.BytesIO()
-    image.convert("RGB").save(out, format="JPEG", quality=92)
-    return out.getvalue()
+    rgb.save(out, format="JPEG", quality=92)
+    encoded = out.getvalue()
+
+    for quality in (85, 75, 65):
+        if len(encoded) <= _AZURE_SAFE_IMAGE_BYTES:
+            break
+        out = io.BytesIO()
+        rgb.save(out, format="JPEG", quality=quality)
+        encoded = out.getvalue()
+
+    while len(encoded) > _AZURE_SAFE_IMAGE_BYTES and min(rgb.size) > 1000:
+        rgb = rgb.resize((int(rgb.width * 0.85), int(rgb.height * 0.85)), Image.LANCZOS)
+        out = io.BytesIO()
+        rgb.save(out, format="JPEG", quality=75)
+        encoded = out.getvalue()
+
+    return encoded
 
 
 # EXIF DateTimeOriginal(0x9003)은 최상위 IFD가 아니라 "Exif" 서브 IFD(0x8769)
