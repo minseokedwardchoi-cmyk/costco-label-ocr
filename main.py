@@ -73,11 +73,19 @@ TRADERS_SHEET_NAME = os.environ.get("TRADERS_SHEET_NAME", "트레이더스")
 CATEGORY_SHEET_NAME_COSTCO = os.environ.get("CATEGORY_SHEET_NAME_COSTCO", "제품군정리(코스트코)")
 CATEGORY_SHEET_NAME_TRADERS = os.environ.get("CATEGORY_SHEET_NAME_TRADERS", "제품군정리(트레이더스)")
 
-# 정리본은 이제 촬영월별로 시트를 나눈다("제품군정리(코스트코)_2026-07"처럼
-# 위 이름 뒤에 월을 붙인 제목을 씀 - run_once의 get_category_sheet 참고).
 # 월별 분리 이전에 이미 기록된 "정리본위치" 값(시트제목 없이 "C15"만 있음)은
-# 그 시절 유일했던 시트 이름으로 찾아야 하므로 sync_back_sourcing()에서 쓴다.
+# 그 시절 유일했던 시트 이름(위 CATEGORY_SHEET_NAME_*)으로 찾아야 하므로
+# sync_back_sourcing()에서 쓴다 - 그 시절 데이터가 남아있는 옛 탭 이름일
+# 뿐이고, 지금 새로 만드는 월별 탭 이름과는 별개다(아래 참고).
 _LEGACY_CATEGORY_SHEET_TITLE = {"costco": CATEGORY_SHEET_NAME_COSTCO, "traders": CATEGORY_SHEET_NAME_TRADERS}
+
+# 정리본은 촬영월별로 시트를 나눈다("정리본(코스트코)_2026-07"처럼 이 이름
+# 뒤에 월을 붙인 제목을 씀 - run_once의 category_sheet_title 참고). 위
+# CATEGORY_SHEET_NAME_*(옛 "제품군정리(...)" 단일 시트, 월별 분리 이전
+# 데이터 전용)과는 별개의 이름을 쓴다 - 그래야 기존 데이터를 안 건드리고
+# 새 탭만 원하는 이름 규칙으로 만들 수 있다.
+MONTHLY_CATEGORY_SHEET_NAME_COSTCO = os.environ.get("MONTHLY_CATEGORY_SHEET_NAME_COSTCO", "정리본(코스트코)")
+MONTHLY_CATEGORY_SHEET_NAME_TRADERS = os.environ.get("MONTHLY_CATEGORY_SHEET_NAME_TRADERS", "정리본(트레이더스)")
 
 # 자사 상품 카탈로그(MCH1/MC/상품명) 기반 제품군 분류용. 거래처/공급사 이름까지
 # 들어있는 사외비 데이터라 이 공개 저장소에는 절대 커밋하지 않고, 서비스
@@ -2300,7 +2308,13 @@ def update_category_sheet(sheet, row_dicts: list):
 sheet_lock = threading.Lock()  # gspread 동시 append 충돌 방지
 
 
-def build_row_dict(file_id, filename, fields, raw_text, uploader, is_back, capture_time, image_hash):
+def build_row_dict(file_id, filename, fields, raw_text, uploader, is_back, capture_time, image_hash, retailer):
+    # 상품코드 이후부터만 스캔하는 앵커(배경 상품의 "•" 표준 문구 오채택 방지,
+    # extract_selling_points 참고)는 "코드 -> ... -> 셀링" 순서인 코스트코
+    # 레이아웃에서만 유효하다. 트레이더스는 반대로 "셀링 -> ... -> 코드"
+    # 순서라("누텔라 스프레드" 카드처럼 셀링 문구가 바코드/코드보다 먼저 나옴)
+    # 코드로 앵커하면 진짜 셀링 문구가 스캔 범위 밖으로 밀려 못 잡힌다.
+    anchor_code = fields.get("상품코드", "") if retailer != "traders" else ""
     row_dict = {
         "파일ID": file_id,
         "파일명": filename,
@@ -2308,7 +2322,7 @@ def build_row_dict(file_id, filename, fields, raw_text, uploader, is_back, captu
         "원문텍스트": raw_text,
         # RAW 시트 컬럼(COLUMN_ORDER)엔 없는 값이라 원본 로그에는 안 보이고,
         # 제품군정리(카테고리) 시트의 "셀링" 행에만 쓰인다.
-        "셀링포인트": extract_selling_points(raw_text, fields.get("상품코드", "")),
+        "셀링포인트": extract_selling_points(raw_text, anchor_code),
         "업로더": uploader,
         "뒷면여부": "뒷면" if is_back else "",
         "촬영시각": capture_time.strftime("%Y-%m-%d %H:%M:%S") if capture_time else "",
@@ -2620,7 +2634,7 @@ def process_one_file(creds, sheets, file_info, archive_folder_id, retailer, sour
     if not is_back and (not fields.get("가격") or not fields.get("제품명(한국어)")):
         low_confidence = True
 
-    row_dict = build_row_dict(file_id, name, fields, text, uploader, is_back, capture_time, image_hash)
+    row_dict = build_row_dict(file_id, name, fields, text, uploader, is_back, capture_time, image_hash, retailer)
     append_rows_to_sheet(sheet, [row_dict])
 
     # 시트 기록이 끝난 뒤에 사진을 '처리완료' 폴더로 옮긴다. 이동이 실패해도
@@ -2672,7 +2686,10 @@ def run_once():
     category_sheet_cache = {}  # 시트 제목 -> Worksheet 객체 (매 실행마다 한 번씩만 열기)
 
     def category_sheet_title(retailer, month_key):
-        base_name = CATEGORY_SHEET_NAME_COSTCO if retailer == "costco" else CATEGORY_SHEET_NAME_TRADERS
+        base_name = (
+            MONTHLY_CATEGORY_SHEET_NAME_COSTCO if retailer == "costco"
+            else MONTHLY_CATEGORY_SHEET_NAME_TRADERS
+        )
         return f"{base_name}_{month_key}"
 
     def get_category_sheet(title):
