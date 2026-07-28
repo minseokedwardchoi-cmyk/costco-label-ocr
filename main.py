@@ -527,6 +527,16 @@ def _reorder_two_column_block(entries):
     return result
 
 
+# 좌/우 재배열 지점에 심어두는 표시. "왼쪽 단을 전부 읽은 뒤 오른쪽 단"으로
+# 줄 순서 자체는 바로잡아도, 그 경계 정보가 그대로 사라지면 텍스트만 보는
+# 이후 단계(extract_selling_points)는 왼쪽 단의 마지막 불릿과 오른쪽 단의
+# 불릿 없는 이어지는 문장을 구분 못 하고 하나로 붙여버린다(실사진 확인:
+# "*샌드위치나 토스트용으로 적합"(왼쪽 단 마지막 불릿) 바로 뒤에 "개봉 후
+# 부패, 변질 될..."(오른쪽 단, 불릿 없음)이 와서 같은 항목으로 합쳐짐).
+# 실제 OCR 텍스트에 나올 리 없는 문자열이라 안전하게 구분자로 쓸 수 있다.
+_COLUMN_BREAK_MARKER = "\x00COLUMN_BREAK\x00"
+
+
 def _reorder_segment_if_two_column(segment):
     """_reorder_two_column_block()이 가격 줄로 나눈 한 구간 안에서, 그
     구간 자체의 폭을 기준으로 2단 구조를 판단해 재배열한다."""
@@ -570,7 +580,18 @@ def _reorder_segment_if_two_column(segment):
                 m += 1
             left_block = [x for x in block if id(x) in left_ids]
             right_block = [x for x in block if id(x) in right_ids]
-            result.extend(left_block + right_block)
+            result.extend(left_block)
+            if left_block and right_block:
+                # 왼쪽 단 마지막 줄과 오른쪽 단 첫 줄 사이에 경계 표시를
+                # 심어서, 순서만 바로잡고 경계 정보 자체는 잃어버리는 걸
+                # 막는다 (아래 _COLUMN_BREAK_MARKER 설명 참고).
+                anchor = left_block[-1]
+                result.append({
+                    "top_y": anchor["top_y"], "bottom_y": anchor["bottom_y"],
+                    "left_x": anchor["left_x"], "right_x": anchor["right_x"],
+                    "text": _COLUMN_BREAK_MARKER,
+                })
+            result.extend(right_block)
             k = m
         else:
             result.append(e)
@@ -1164,14 +1185,38 @@ def extract_selling_points(text: str, product_code: str = "") -> str:
             if _normalize_bare_code(line, allow_five_digit=True) == product_code:
                 lines = lines[i + 1:]
                 break
-    for markers in _BULLET_MARKER_TIERS:
-        points = _extract_selling_points_with_markers(lines, markers)
-        if points:
-            return "- " + points[0] + "".join(f"\n - {p}" for p in points[1:])
-    fallback = _find_unmarked_description(lines)
-    if fallback:
-        return "- " + fallback
-    return ""
+
+    # _COLUMN_BREAK_MARKER가 있으면 그 지점에서 줄 목록을 나눠 각 구간을
+    # 독립적으로 처리한다 - 왼쪽 단의 마지막 항목과 오른쪽 단의 첫 내용이
+    # 서로 다른 구간에 속한다는 걸 알아야, 둘을 하나의 항목으로 잘못
+    # 이어붙이지 않는다. 마커가 없는 사진(대다수)은 구간이 하나뿐이라
+    # 기존 동작과 동일하다.
+    segments = [[]]
+    for line in lines:
+        if line == _COLUMN_BREAK_MARKER:
+            segments.append([])
+        else:
+            segments[-1].append(line)
+
+    all_points = []
+    for seg_idx, seg_lines in enumerate(segments):
+        seg_points = []
+        for markers in _BULLET_MARKER_TIERS:
+            seg_points = _extract_selling_points_with_markers(seg_lines, markers)
+            if seg_points:
+                break
+        if not seg_points:
+            fallback = (
+                _find_unmarked_description(seg_lines) if seg_idx == 0
+                else _collect_plain_description(seg_lines)
+            )
+            if fallback:
+                seg_points = [fallback]
+        all_points.extend(seg_points)
+
+    if not all_points:
+        return ""
+    return "- " + all_points[0] + "".join(f"\n - {p}" for p in all_points[1:])
 
 
 # 베이커리류 카드는 셀링포인트에 "-"/"▶" 같은 불릿 표시가 아예 없이, 영문
@@ -1217,6 +1262,28 @@ def _find_unmarked_description(lines: list) -> str:
         # 이어지는 경우가 실사진(벨지오이오조 모짜렐라)에서 확인됐다.
         # "100g당 1,211원"처럼 실제 숫자 값이 있는 단가 표기는 예외 - 그건
         # 진짜 값이 있는 줄이라 노이즈로 처리해 문장을 끊는 게 맞다.
+        if _is_origin_label_line(line):
+            continue
+        if "단가" in line and not UNIT_PRICE_PATTERN.search(line):
+            continue
+        if _PRICE_TOKEN_RE.match(line.strip()):
+            continue
+        if _is_skippable_interleaved_noise(line) or _is_selling_point_noise(line):
+            break
+        desc_lines.append(line)
+    return " ".join(desc_lines).strip()
+
+
+def _collect_plain_description(lines: list) -> str:
+    """_COLUMN_BREAK_MARKER로 나뉜, 첫 구간이 아닌 구간(2단 카드의 오른쪽
+    단 등)에는 이미 영문 제품명이 앞 구간에서 소비돼서 없는 경우가 많다.
+    영문 제품명 줄을 찾는 게 목적이 아니라 구간 자체가 이미 "왼쪽 단과는
+    분리된 하나의 덩어리"라는 게 마커로 보장되므로, _find_unmarked_description과
+    같은 노이즈 판정만 그대로 쓰고 구간 맨 앞부터 바로 수집한다."""
+    desc_lines = []
+    for line in lines:
+        if not re.search(r"[가-힣]", line):
+            break
         if _is_origin_label_line(line):
             continue
         if "단가" in line and not UNIT_PRICE_PATTERN.search(line):
