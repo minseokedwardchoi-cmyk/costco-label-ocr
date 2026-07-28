@@ -1039,6 +1039,15 @@ def _is_skippable_interleaved_noise(line: str) -> bool:
     return bool(_SIZE_TABLE_LINE_RE.match(line))
 
 
+def _is_origin_label_line(line: str) -> bool:
+    """상품카드(뒷면이 아니라 앞면) 자체에 "원산지 : 영국"처럼 원산지 표기가
+    셀링포인트 문구 자리에 별도 줄로 나오는 경우가 실사진에서 확인됐다. 이
+    값은 이제 _parse_fields_from_lines()가 병입원산지로 따로 뽑으므로,
+    셀링포인트 추출에는 안 섞이게 건너뛴다(끝내는 게 아니라 건너뛰는 이유:
+    이 줄 바로 다음에 진짜 셀링 문구가 이어지는 카드가 실사진에서 확인됨)."""
+    return bool(_ORIGIN_LABEL_PATTERN.search(line))
+
+
 # 대부분은 "-"/"•"/"·"로 시작하지만, 카드에 따라 "▶"(섹션 제목으로도 쓰이지만
 # "-" 불릿이 아예 없는 카드에서는 그 자체가 유일한 불릿 표시인 경우도 있다)나
 # "*"만 쓰는 경우도 실사진에서 확인됐다(에어프라이어, 청바지 카드 등). 다만
@@ -1082,7 +1091,7 @@ def _extract_selling_points_with_markers(lines, markers):
             break
         if current is None:
             continue
-        if _is_skippable_interleaved_noise(line):
+        if _is_skippable_interleaved_noise(line) or _is_origin_label_line(line):
             continue
         if _is_selling_point_noise(line):
             points.append(current.strip())
@@ -1154,6 +1163,8 @@ def _find_unmarked_description(lines: list) -> str:
     for line in lines[english_idx + 1:]:
         if not re.search(r"[가-힣]", line):
             break
+        if _is_origin_label_line(line):
+            continue
         if _is_skippable_interleaved_noise(line) or _is_selling_point_noise(line):
             break
         desc_lines.append(line)
@@ -1210,6 +1221,14 @@ def _normalize_bare_code(line: str) -> str:
 # 기업 표기 자체가 없으므로 조건 2에서 걸러져 오분류를 막아준다.
 _BACK_LABEL_MANUFACTURER_PATTERN = re.compile(
     r"(?:제조|판매|수입|유통|공급)(?:원|자|처|업자|업체|업소|회사|사)"
+    # 수입 완제품 중엔 뒷면이 한글 표기 없이 영문 라벨만 있는 경우도 있다
+    # (예: 영국산 클로티드크림 - "Manufacturer:"/"Imported By:"만 있고 한글
+    # 법정 표기가 아예 없음). 한글 라벨과 같은 역할을 하는 영문 표기
+    # ("Manufactured/Imported/Distributed by", "Manufacturer"/"Importer"/
+    # "Distributor")도 같이 인정한다.
+    r"|\b(?:manufactured|imported|distributed|packed|packaged)\s+by\b"
+    r"|\b(?:manufacturer|importer|distributor)\b",
+    re.IGNORECASE,
 )
 
 
@@ -1294,14 +1313,24 @@ _IMPORTER_LABEL_PATTERN = re.compile(
     rf"(?:및\s*)?(?:[·・]\s*)?(?:판매\s*)?(?:책임\s*)?(?:{_ENTITY_SUFFIX}|판매업소)"
     rf"|(?=[:：(（])"
     rf")"
+    # 한글 라벨이 아예 없이 영문 라벨만 있는 뒷면(수입 완제품에 흔함)을 위한
+    # 영문 표기 - "Imported By:"/"Importer:"/"Distributed by"/"Distributor".
+    rf"|\bimported\s+by\b|\bimporter\b|\bdistributed\s+by\b|\bdistributor\b",
+    re.IGNORECASE,
 )
-_MANUFACTURER_LABEL_PATTERN = re.compile(rf"(?:화장품)?제조\s*{_ENTITY_SUFFIX}")
+_MANUFACTURER_LABEL_PATTERN = re.compile(
+    rf"(?:화장품)?제조\s*{_ENTITY_SUFFIX}"
+    rf"|\bmanufactured\s+by\b|\bmanufacturer\b",
+    re.IGNORECASE,
+)
 # 라벨 뒤에 붙은 값을 어디까지 읽을지 정하는 경계 - 다음 항목 라벨(제조/판매/
 # 수입/유통/공급 계열, 원산지/제조국)이 나오거나, 줄바꿈/불릿/대괄호가 나오면
 # 거기서 값을 끊는다. 같은 줄에 라벨 여러 개가 붙어 나오는 경우(뒷면 라벨은
 # 항목이 다닥다닥 붙어 있는 경우가 많다)를 대비한 것.
 _FIELD_BOUNDARY_PATTERN = re.compile(
-    r"[\[\n•▪]|" + _BACK_LABEL_MANUFACTURER_PATTERN.pattern + r"|원산지|제조국"
+    r"[\[\n•▪]|" + _BACK_LABEL_MANUFACTURER_PATTERN.pattern
+    + r"|원산지|제조국|place\s+of\s+origin|country\s+of\s+origin",
+    re.IGNORECASE,
 )
 
 # "제조국"만 찾으면 "제조국명"(더 흔한 표기)의 "제조국"까지만 매치되고 바로
@@ -1309,7 +1338,15 @@ _FIELD_BOUNDARY_PATTERN = re.compile(
 # 베트남" -> "명"). 알파벳 순서상 "제조국명"을 "제조국"보다 먼저 두어(둘 다
 # 매치 가능한 위치에서 더 긴 쪽이 우선 시도되도록) 이 라벨도 통째로 먼저
 # 소비하게 한다.
-_ORIGIN_LABEL_PATTERN = re.compile(r"(?:원산지|제조국명|제조국)\s*[\]:：]*\s*([가-힣]{1,10})")
+_ORIGIN_LABEL_PATTERN = re.compile(
+    r"(?:원산지|제조국명|제조국)\s*[\]:：]*\s*([가-힣]{1,10})"
+    # 한글 라벨 없이 영문 라벨만 있는 뒷면(수입 완제품에 흔함)을 위한 영문
+    # 표기 - "Place of origin:"/"Country of origin:". 값은 한글이 아니라
+    # 영문(국가명)이라 별도 그룹으로 잡고, extract_origin()에서
+    # _COUNTRY_EN_TO_KO로 한글화한다.
+    r"|(?:place\s+of\s+origin|country\s+of\s+origin)\s*[\]:：]*\s*([A-Za-z][A-Za-z .]{1,30})",
+    re.IGNORECASE,
+)
 _MADE_IN_PATTERN = re.compile(r"made\s+in\s+([A-Za-z]+)", re.IGNORECASE)
 
 _COUNTRY_NAMES_KO = (
@@ -1338,6 +1375,11 @@ _COUNTRY_EN_TO_KO = {
     "PORTUGAL": "포르투갈", "AUSTRIA": "오스트리아", "IRELAND": "아일랜드",
     "ISRAEL": "이스라엘", "EGYPT": "이집트", "SINGAPORE": "싱가포르",
     "PERU": "페루", "ECUADOR": "에콰도르", "CROATIA": "크로아티아",
+    # 한글 라벨 없이 영문 라벨만 있는 뒷면에서 나라 이름이 축약형("UK") 대신
+    # 정식 명칭 그대로 적히는 경우("United Kingdom" 등)를 위한 보강.
+    "UNITED KINGDOM": "영국", "UNITED STATES": "미국",
+    "UNITED STATES OF AMERICA": "미국", "NEW ZEALAND": "뉴질랜드",
+    "SOUTH KOREA": "대한민국", "REPUBLIC OF KOREA": "대한민국",
 }
 
 _COSTCO_CHAIN_KEYWORDS = ("코스트코",)
@@ -1401,17 +1443,27 @@ def _country_in(text: str) -> str:
 
 def extract_origin(text: str) -> str:
     """뒷면 텍스트에서 병입원산지(제조국)를 뽑는다. 우선순위: ① "원산지:"/
-    "제조국:" 같은 명시적 라벨(값이 한글) -> ② 제조자/제조원 라벨 바로 뒤
-    주소에서 국가명을 찾음(라벨은 있는데 값이 영문 회사명+주소로만 끝나는
-    경우가 실사진에서 많이 확인됨 - "Colgate Sanxiao co., Ltd... China.",
-    "Johnson & Johnson (Thailand) Limited...BANGKOK, THAILAND") -> ③ "Made
-    in X" -> ④ 그 외엔 텍스트 전체에서 국가명을 찾는다. 아무 것도 못 찾으면
-    빈 문자열(수기 확인 필요)을 돌려준다."""
+    "제조국:"/"Place of origin:" 같은 명시적 라벨(값이 한글 또는 영문) -> ②
+    제조자/제조원 라벨 바로 뒤 주소에서 국가명을 찾음(라벨은 있는데 값이 영문
+    회사명+주소로만 끝나는 경우가 실사진에서 많이 확인됨 - "Colgate Sanxiao
+    co., Ltd... China.", "Johnson & Johnson (Thailand) Limited...BANGKOK,
+    THAILAND") -> ③ "Made in X" -> ④ 그 외엔 텍스트 전체에서 국가명을 찾는다.
+    아무 것도 못 찾으면 빈 문자열(수기 확인 필요)을 돌려준다."""
     m = _ORIGIN_LABEL_PATTERN.search(text)
     if m:
-        value = m.group(1)
+        # 그룹1은 한글 라벨("원산지:"/"제조국:")의 값, 그룹2는 영문 라벨
+        # ("Place of origin:")의 값이다 - 한 번에 매치되는 쪽은 항상 하나뿐.
+        value = m.group(1) or m.group(2)
         if value in ("대한민국", "한국"):
             return "국내"
+        if m.group(2):
+            # 영문 값은 알려진 국가명 사전으로 한글화한다 - 모르는 영문
+            # 국가명이면(사전에 없는 나라) 값을 신뢰하지 않고 아래 다른
+            # 방식으로 계속 찾는다(한글 값과 달리 임의의 영문 문자열을
+            # 그대로 "원산지"로 쓰면 회사명 등이 섞여 들어올 위험이 크다).
+            mapped = _COUNTRY_EN_TO_KO.get(value.strip().upper())
+            if mapped:
+                return "국내" if mapped == "대한민국" else mapped
         # 실제 국가명은 항상 2글자 이상이다 - 1글자만 캡처됐으면(줄바꿈 등으로
         # 값이 중간에 잘린 경우, 예: "[원산지] 태"만 잡히고 "국"이 다음
         # 줄로 넘어간 경우) 이 라벨 매치를 신뢰하지 않고 아래 다른 방식으로
@@ -1419,7 +1471,7 @@ def extract_origin(text: str) -> str:
         # 실제 라벨 값이면 그대로 믿는다 - 목록은 라벨이 아예 없을 때 쓰는
         # 폴백 전용이라, 여기서 목록에 없다고 버리면 라벨이 명확히 있는
         # 값을 오히려 못 믿게 되는 역효과가 난다.
-        if len(value) >= 2:
+        elif len(value) >= 2:
             return value
 
     # "원산지"/"제조국" 라벨 자체가 없거나 값이 한글이 아니어서(예: "[국외
@@ -1564,8 +1616,35 @@ def _parse_fields_from_lines(lines: list) -> dict:
         # "100g당 1,211원"처럼 단위당가격 표기도 "100g"으로 시작해서 이 조건에
         # 걸리므로, UNIT_PRICE_PATTERN에 매칭되는 줄은 애초에 중량 후보에서 뺀다.
         if m and not line[:m.start()].strip() and not UNIT_PRICE_PATTERN.search(line):
-            result["중량"] = line
+            weight_value = line
+            # "170G원산지영국"처럼 원산지가 중량 줄 끝에 그대로 붙어 나오는
+            # 경우가 실사진에서 확인됐다 - 원산지는 아래에서 따로 뽑으므로,
+            # 중량 값엔 그 앞부분("170G")만 남긴다.
+            origin_in_weight = _ORIGIN_LABEL_PATTERN.search(line)
+            if origin_in_weight:
+                weight_value = line[:origin_in_weight.start()].strip()
+            result["중량"] = weight_value
             weight_idx = i
+            break
+
+    # 뒷면 사진이 매칭되지 않아도, 상품카드 자체에 "원산지:"/"원산지OO"가 직접
+    # 찍혀 있는 경우가 실사진에서 확인됐다("170G원산지영국"처럼 중량 줄
+    # 끝에 붙거나, "원산지 : 영국"처럼 셀링포인트 자리에 별도 줄로 나옴).
+    # 이럴 땐 뒷면 매칭을 기다릴 필요 없이 이 값을 바로 병입원산지로 채택한다
+    # (determine_sourcing()의 뒷면 기반 병입원산지 추정과 별개 경로 - 이미
+    # 채워진 칸은 sync_back_sourcing()이 덮어쓰지 않으므로 서로 충돌하지
+    # 않는다). extract_selling_points()도 이 줄을 셀링포인트로 잘못 삼키지
+    # 않도록 별도로 건너뛴다(_is_origin_label_line 참고).
+    for i, line in enumerate(lines):
+        if code_idx is not None and i <= code_idx:
+            continue
+        m = _ORIGIN_LABEL_PATTERN.search(line)
+        if not m:
+            continue
+        raw_value = (m.group(1) or m.group(2) or "").strip()
+        mapped = _COUNTRY_EN_TO_KO.get(raw_value.upper()) if m.group(2) else raw_value
+        if mapped and len(mapped) >= 2:
+            result["병입원산지"] = "국내" if mapped in ("대한민국", "한국") else mapped
             break
 
     danga_idx = next((i for i, line in enumerate(lines) if "단가" in line), None)
@@ -1931,11 +2010,12 @@ UNCATEGORIZED_LABEL = "미분류"
 # 제품군 블록 하나는 "제목 행" + 아래 11개 항목 행으로 구성된다. 상품은 이
 # 항목들을 세로로 채운 열 하나로 표현되고(카드형), 같은 제품군의 상품들이
 # 옆으로(B, C, D...) 나란히 쌓인다. OCR 상품카드에는 이 중 상품명/규격·단량/
-# 판매가/단위단가/셀링만 있으므로 CATEGORY_FIELD_MAP에 있는 행만 채우고
-# 나머지(사진/소싱형태/매출(연)/매총율/산도/병입원산지)는 빈 칸으로 남긴다 -
-# 수기로 채우거나 다른 소스에서 나중에 채워 넣을 몫이다. 상품코드/파일ID/
-# 원문텍스트는 여기 안 넣는다 - 이 시트는 사람이 보기 좋은 정리본이고, 그
-# 추적용 정보는 원본(RAW) 시트에 이미 행마다 남아있다.
+# 판매가/단위단가/병입원산지(카드 자체에 원산지가 찍혀 있을 때만)/셀링만
+# 있으므로 CATEGORY_FIELD_MAP에 있는 행만 채우고 나머지(사진/소싱형태/
+# 매출(연)/매총율/산도)는 빈 칸으로 남긴다 - 수기로 채우거나 다른 소스에서
+# 나중에 채워 넣을 몫이다. 상품코드/파일ID/원문텍스트는 여기 안 넣는다 -
+# 이 시트는 사람이 보기 좋은 정리본이고, 그 추적용 정보는 원본(RAW) 시트에
+# 이미 행마다 남아있다.
 CATEGORY_ROW_LABELS = [
     "사진", "상품명", "소싱형태", "매출(연)", "규격/단량", "판매가",
     "단위단가", "매총율", "산도", "병입원산지", "셀링",
@@ -1945,6 +2025,12 @@ CATEGORY_FIELD_MAP = {
     "규격/단량": "중량",
     "판매가": "가격",
     "단위단가": "단가",
+    # 뒷면 사진이 매칭돼야만 채워지던 값과 달리, 카드 자체에 원산지가 직접
+    # 찍혀 있을 때만 _parse_fields_from_lines()가 채운다 - 못 찾으면 빈
+    # 문자열이라 이 칸은 그대로 비워두고, sync_back_sourcing()이 나중에
+    # 뒷면 매칭으로 채울 수 있게 남겨둔다(이미 채워진 칸은 덮어쓰지 않으므로
+    # 서로 충돌하지 않는다).
+    "병입원산지": "병입원산지",
     "셀링": "셀링포인트",
 }
 
