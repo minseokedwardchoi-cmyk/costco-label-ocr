@@ -1628,11 +1628,18 @@ def _country_in(text: str) -> str:
     여러 개 있으면 가장 뒤에 나오는 것을 우선한다 - 주소는 보통 끝에
     국가명을 적으므로("...신시내티, 오하이오주, 미국"), 앞쪽에 우연히 섞인
     지명/사명보다 뒤쪽 값이 실제 원산지일 가능성이 높다. 하나도 없으면
-    빈 문자열."""
+    빈 문자열.
+
+    "미국산"/"캐나다산"처럼 국가명 바로 뒤에 "산"이 붙은 표기는 원재료
+    하나하나의 개별 원산지 표시(식품표시 관행상 "원재료명(OO산)" 형태로
+    나열됨)일 뿐, 상품 전체의 병입원산지가 아니다. 실사진(그래놀라 뒷면 -
+    "롤드오트(캐나다산), 볶음해바라기씨(미국산)"이 있는데 정작 제조원은
+    국내(충북 제천)였던 사례)으로 확인된 오탐이라 이런 표기는 후보에서
+    제외한다."""
     candidates = []
     for c in _COUNTRY_NAMES_KO:
         pos = text.rfind(c)
-        if pos != -1:
+        if pos != -1 and text[pos + len(c):pos + len(c) + 1] != "산":
             candidates.append((pos, c))
     for en, ko in _COUNTRY_EN_TO_KO.items():
         for em in re.finditer(rf"\b{en}\b", text, re.IGNORECASE):
