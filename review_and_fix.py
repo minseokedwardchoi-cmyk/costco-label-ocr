@@ -75,6 +75,25 @@ RETAILERS = [
 RAW_MIRROR_FIELDS = ["상품코드", "제품명(한국어)", "가격", "제품명(영어)", "중량", "단가"]
 
 
+def _resolve_or_create_category_sheet(spreadsheet, title):
+    """sync_back_sourcing()이 "정리본위치"에 적힌 탭을 열 때 쓴다. 정상적인
+    경우엔 항상 이미 존재하는 탭이지만, 어떤 이유로든(예: 생성 도중 API
+    오류로 RAW에는 위치가 기록됐는데 탭 자체는 못 만들어진 경우) 그 탭이
+    없으면 자동화가 죽는 대신 빈 탭을 새로 만들고 경고를 남긴다 - 그 탭에
+    있었어야 할 원래 데이터(상품명/가격 등)는 이미 유실된 상태이므로, 이
+    경고가 뜨면 해당 카드들을 수동으로 확인해야 한다."""
+    try:
+        return spreadsheet.worksheet(title)
+    except gspread.exceptions.WorksheetNotFound:
+        print(f"경고: 정리본 탭 '{title}'을 찾을 수 없어 새로 만듭니다 - "
+              "이 탭을 참조하던 카드들의 원래 데이터(상품명/가격 등)가 "
+              "유실됐을 수 있으니 확인해주세요.")
+        # 유실되기 전 탭은 상품이 많이 쌓여 열이 26개보다 훨씬 넓었을 가능성이
+        # 높다(정리본위치가 26열 밖을 가리키는 경우가 실제로 있었다) - 되살린
+        # 직후 또 grid limits 오류로 죽지 않도록 넉넉하게 만든다.
+        return spreadsheet.add_worksheet(title=title, rows=1000, cols=100)
+
+
 def find_category_sheet_titles(spreadsheet, legacy_name, monthly_base_name):
     """main.py가 정리본을 촬영월별 탭으로 나누면서, 한 리테일러의 정리본이
     더 이상 탭 하나가 아니게 됐다. legacy_name 자체(월별 분리 이전 데이터가
@@ -250,7 +269,9 @@ def review_retailer(spreadsheet, label, retailer_key, raw_sheet_name, category_s
         # 그대로 재사용한다 - 새 사진 없이도 전체 이력을 다시 훑는다. 정리본이
         # 촬영월별 탭으로 나뉘어 있으므로, 탭 제목으로 필요한 탭을 그때그때
         # 여는 resolver를 넘긴다.
-        sourcing_filled = main.sync_back_sourcing(raw_ws, retailer_key, spreadsheet.worksheet)
+        sourcing_filled = main.sync_back_sourcing(
+            raw_ws, retailer_key, lambda title: _resolve_or_create_category_sheet(spreadsheet, title)
+        )
 
     return {
         "label": label,
