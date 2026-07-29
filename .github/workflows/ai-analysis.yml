@@ -19,11 +19,12 @@ on:
         required: true
         default: true
         type: boolean
-  schedule:
-    # 매달 1일 00:10 UTC(한국시간 09:10)에 두 리테일러 모두 자동 실행.
-    # 이번 달 정리본이 아직 없거나 비교할 두 달치가 안 쌓였으면 스크립트가
-    # 조용히 건너뛰고 끝나므로, 스케줄이 매달 도는 것 자체는 안전하다.
-    - cron: "10 0 1 * *"
+  workflow_run:
+    # "코스트코 라벨 OCR 실행" 워크플로우(코스트코/트레이더스, 상품카드/뒷면 라벨 전체)가
+    # 끝나면 자동으로 이어서 실행. 이 워크플로우 하나가 두 리테일러를 모두 처리하므로
+    # 아래에서도 두 리테일러를 모두 돈다. OCR이 실패/취소된 실행이면 건너뛴다(잡 단계에서 체크).
+    workflows: ["코스트코 라벨 OCR 실행 (대시보드 트리거 / 수동 실행)"]
+    types: [completed]
 
 concurrency:
   group: ai-analysis
@@ -31,14 +32,17 @@ concurrency:
 
 jobs:
   ai-analysis:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       matrix:
-        retailer: ${{ github.event_name == 'schedule' && fromJSON('["costco", "traders"]') || fromJSON(format('["{0}"]', github.event.inputs.retailer)) }}
+        retailer: ${{ github.event_name == 'workflow_run' && fromJSON('["costco", "traders"]') || fromJSON(format('["{0}"]', github.event.inputs.retailer)) }}
       fail-fast: false
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.ref }}
 
       - uses: actions/setup-python@v5
         with:
@@ -47,7 +51,7 @@ jobs:
       - run: pip install -r requirements.txt
 
       - name: 미분류 상품 AI 분류 제안
-        if: github.event_name == 'schedule' || github.event.inputs.run_classify == 'true'
+        if: github.event_name == 'workflow_run' || github.event.inputs.run_classify == 'true'
         run: python classify_unclassified.py --retailer "${{ matrix.retailer }}"
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
@@ -55,7 +59,7 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 
       - name: 월간 SKU 비교 + AI 종합 해석
-        if: github.event_name == 'schedule' || github.event.inputs.run_comparison == 'true'
+        if: github.event_name == 'workflow_run' || github.event.inputs.run_comparison == 'true'
         run: python monthly_comparison.py --retailer "${{ matrix.retailer }}"
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
