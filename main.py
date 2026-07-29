@@ -99,6 +99,10 @@ AZURE_VISION_KEY = os.environ.get("AZURE_VISION_KEY")
 
 # Azure F0(무료 티어) 제한: 분당 20건. 여유를 두고 18건/분으로 제한.
 AZURE_MAX_CALLS_PER_MINUTE = int(os.environ.get("AZURE_MAX_CALLS_PER_MINUTE", "18"))
+
+# Azure Read API v3.2가 받아주는 최대 파일 크기(4MB)에 여유를 둔 값.
+_AZURE_MAX_IMAGE_BYTES = 4 * 1024 * 1024
+_AZURE_SAFE_IMAGE_BYTES = int(_AZURE_MAX_IMAGE_BYTES * 0.9)
 CONCURRENT_WORKERS = int(os.environ.get("CONCURRENT_WORKERS", "4"))
 CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", "0.65"))
 LOW_CONFIDENCE_WORD_RATIO = float(os.environ.get("LOW_CONFIDENCE_WORD_RATIO", "0.15"))
@@ -130,7 +134,7 @@ PRICE_FIELDS = CORE_PRICE_FIELDS + OPTIONAL_PRICE_FIELDS
 # 뒷면 사진(소싱형태/병입원산지)을 나중에 그 칸에 소급 반영할 수 있게 해준다.
 COLUMN_ORDER = (
     ["파일ID", "파일명", "처리일시", "원문텍스트"] + PRICE_FIELDS
-    + ["업로더", "뒷면여부", "촬영시각", "사진해시", "매칭파일ID", "정리본위치"]
+    + ["업로더", "촬영시각", "사진해시", "뒷면여부", "매칭파일ID", "매칭파일명", "정리본위치"]
 )
 
 
@@ -190,9 +194,18 @@ def get_credentials():
     )
 
 
+# RAW 시트(코스트코/트레이더스)는 헤더가 두 줄이다: 1행은 "상품카드"/
+# "제품 뒷면"처럼 관련 컬럼을 묶어 보여주는 그룹 라벨(병합 셀), 2행이
+# COLUMN_ORDER 순서 그대로의 실제 컬럼명이다. MD가 시트를 훑어볼 때 어느
+# 컬럼이 상품카드 내용이고 어느 컬럼이 뒷면 관련 내용인지 한눈에 보이게
+# 하려고 도입했다. 실제 데이터는 3행부터 시작한다 - 아래 모든 col_values
+# 슬라이싱/행 번호 계산이 이 두 줄을 기준으로 한다.
+RAW_HEADER_ROW_COUNT = 2
+
+
 def load_processed_ids(sheet):
     """구글 시트의 '파일ID' 열(1번 컬럼)에 이미 기록된 값들을 처리 완료 목록으로 삼는다."""
-    ids = sheet.col_values(1)[1:]  # 헤더 제외
+    ids = sheet.col_values(1)[RAW_HEADER_ROW_COUNT:]  # 헤더 2줄 제외
     return set(ids)
 
 
@@ -212,7 +225,7 @@ def load_same_day_hashes(sheet):
     날짜가 다르면 해시가 같아도(예: 우연히 똑같이 나온 사진) 걸리지 않는다 -
     시기별로 SKU 이력을 새로 쌓으려는 목적과 어긋나지 않게 하기 위함이다."""
     idx = {name: COLUMN_ORDER.index(name) for name in ("파일ID", "촬영시각", "사진해시")}
-    columns = {name: sheet.col_values(i + 1)[1:] for name, i in idx.items()}  # 헤더 제외
+    columns = {name: sheet.col_values(i + 1)[RAW_HEADER_ROW_COUNT:] for name, i in idx.items()}  # 헤더 2줄 제외
     row_count = len(columns["파일ID"])
     for name in columns:
         if len(columns[name]) < row_count:
@@ -319,12 +332,40 @@ def normalize_image_for_ocr(image_bytes: bytes) -> bytes:
        뒤(그래야 아래에서 새로 저장할 때 이중으로 안 돌아간다) 보낸다.
 
     HEIC든 JPEG/PNG든 상관없이 항상 거친다 - 방향이 이미 정상인 사진은
-    exif_transpose()가 그대로 돌려주므로 아무 변화가 없다."""
+    exif_transpose()가 그대로 돌려주므로 아무 변화가 없다.
+
+    3) Azure Read API v3.2는 4MB가 넘는 이미지를 그냥 거부한다(400). 최신
+       스마트폰의 원본 해상도 사진(4284x5712급)은 92% 품질로 재인코딩해도
+       4MB를 훌쩍 넘는 경우가 실사진(2026-01-01 트레이더스 업로드분 다수)에서
+       확인됐다 - 이런 사진은 Azure 호출이 재시도까지 다 실패하고 '실패'
+       목록에만 조용히 남아서 시트에도 안 쓰이고 '처리완료' 폴더로도 안
+       옮겨진다. 사용자 입장에서는 사진이 통째로 안 읽히고 폴더에 그대로
+       남아있는 것처럼 보인다(실제로 그런 상태다). 화질을 단계적으로 낮춰서
+       상한 아래로 맞추고, 그래도 안 되면 마지막 수단으로 가로/세로를
+       줄인다 - 글자 인식에는 압축 품질보다 해상도가 더 중요해서, 해상도
+       축소는 화질 저하보다 뒤에 시도한다."""
     image = Image.open(io.BytesIO(image_bytes))
     image = ImageOps.exif_transpose(image)
+    rgb = image.convert("RGB")
+
     out = io.BytesIO()
-    image.convert("RGB").save(out, format="JPEG", quality=92)
-    return out.getvalue()
+    rgb.save(out, format="JPEG", quality=92)
+    encoded = out.getvalue()
+
+    for quality in (85, 75, 65):
+        if len(encoded) <= _AZURE_SAFE_IMAGE_BYTES:
+            break
+        out = io.BytesIO()
+        rgb.save(out, format="JPEG", quality=quality)
+        encoded = out.getvalue()
+
+    while len(encoded) > _AZURE_SAFE_IMAGE_BYTES and min(rgb.size) > 1000:
+        rgb = rgb.resize((int(rgb.width * 0.85), int(rgb.height * 0.85)), Image.LANCZOS)
+        out = io.BytesIO()
+        rgb.save(out, format="JPEG", quality=75)
+        encoded = out.getvalue()
+
+    return encoded
 
 
 # EXIF DateTimeOriginal(0x9003)은 최상위 IFD가 아니라 "Exif" 서브 IFD(0x8769)
@@ -481,6 +522,33 @@ def _defer_offcolumn_price_tokens(positioned):
     return main, deferred
 
 
+# 제품 뒷면 한글표시사항은 "라벨" 칸(제품명/식품유형/제조사/수입/판매업소/
+# 원재료명/내용량/원산지/보관방법 등)과 "값" 칸이 나란히 놓인 표 형태가
+# 많다. 이 표는 라벨 칸이 좁고 값 칸과 뚜렷한 간격을 두고 떨어져 있어서,
+# 위 2단(좌/우) 재배열 로직이 이걸 "셀링포인트가 좌/우로 나뉜 카드"로 착각해
+# "라벨 전부 -> 값 전부" 순서로 통째로 재배열해버리는 사고가 실사진(HUGHSON
+# 아몬드/NOEL 하몽/BIFFI 버섯소스)에서 확인됐다. 원래 순서(라벨1,값1,라벨2,
+# 값2,...)가 이미 올바른 읽기 순서인 표에 이 재배열을 적용하면 "수입"
+# 라벨이 그 값("(주)코스트코 코리아")과 완전히 떨어진 곳으로 밀려나서,
+# determine_sourcing()이 둘을 짝지어 읽지 못해 "직수입" 판정을 놓친다.
+# 그래서 후보 줄들 중 이런 표시사항 라벨 낱말로 시작하는 줄이 여럿이면
+# 이 카드는 표 형태로 보고 재배열 자체를 건너뛴다.
+_BACK_LABEL_FIELD_WORDS = (
+    "제품명", "식품유형", "제조사", "제조원", "제조업체", "수입원", "수입업소",
+    "수입판매업소", "수입", "판매업소", "판매원", "원재료명", "내용량", "원산지",
+    "제조국", "소비기한", "유통기한", "보관방법", "조리방법", "반품", "교환장소",
+    "포장재질", "영양정보", "품목보고번호",
+)
+
+
+def _looks_like_field_label_table(entries) -> bool:
+    label_like = sum(
+        1 for e in entries
+        if any(e["text"].strip().startswith(w) for w in _BACK_LABEL_FIELD_WORDS)
+    )
+    return label_like >= 3
+
+
 def _reorder_two_column_block(entries):
     """셀링포인트(특징) 문구가 카드 하단에 좌/우 2단으로 나란히 배치된
     레이아웃이 실사진에서 확인됐다(예: 왼쪽 "샌드위치, 피자토핑, ... 사용
@@ -489,65 +557,116 @@ def _reorder_two_column_block(entries):
     "가격 숫자 하나가 끼어드는" 경우와 달리) 두 단의 줄이 위에서부터 통째로
     번갈아 섞여 두 문장이 뒤죽박죽 하나로 합쳐진다("왼쪽줄1, 오른쪽줄1,
     왼쪽줄2, 오른쪽줄2, ..." 순서로 나와서 셀링포인트 파싱이 엉뚱한 문구를
-    만들어냄). 카드 폭 전체를 쓰는 줄(코드/제품명/가격처럼)은 원래부터 한
-    줄 전체를 차지하므로 이 문제와 무관해서 그대로 두고, 폭이 좁아 한쪽에만
-    있는 줄들만 좌/우로 클러스터링해서 "왼쪽 단을 위→아래로 다 읽은 뒤
-    오른쪽 단을 위→아래로" 순서로 재배열한다. 순수 숫자 가격 줄은
-    _defer_offcolumn_price_tokens()가 이미 별도로 다루는 영역이라 여기서는
-    후보에서 제외해 서로 간섭하지 않게 한다.
+    만들어냄).
 
-    뚜렷한 2단 구조(폭 15% 이상 벌어진 간격, 양쪽 모두 2줄 이상)가 안 보이면
-    원래 순서를 그대로 돌려준다 - 대부분의 카드는 이 함수가 사실상 아무것도
-    바꾸지 않는 단일 컬럼 레이아웃이다."""
+    실사진(BelGioioso 모짜렐라)으로 확인해보니, 사진에 배경 물체(옆에 붙어
+    있는 같은 상품의 박스 더미 등)가 가격표와 거의 붙어서 같이 찍히면
+    _cluster_lines_by_layout()의 간격/색상 분리가 항상 성공하는 건 아니라
+    그 배경 텍스트까지 같은 목록에 섞여 들어온다. 이때 "카드 폭"을 사진
+    전체(entries 전부)의 min/max로 계산하면, 배경 물체의 훨씬 넓게 퍼진
+    텍스트가 폭 기준을 왜곡해서(예: 실제로는 크게 벌어진 2단 간격이 부풀려진
+    "전체 폭"의 15%에 못 미치는 것처럼 보임) 진짜 2단 카드조차 인식하지
+    못하는 문제가 있었다. 그래서 순수 숫자 가격 줄(_PRICE_TOKEN_RE)을
+    경계로 사진을 여러 구간으로 나누고, 각 구간의 폭은 그 구간 자체의
+    줄들로만 계산한다 - 실제 카드 내용(코드~단가 안내)과 그 뒤에 이어지는
+    배경 물체 텍스트가 보통 가격 줄 하나 이상을 사이에 두고 떨어져 있어서,
+    이렇게 구간을 나누면 배경 물체의 폭이 실제 카드 구간의 폭 계산을 더 이상
+    왜곡하지 않는다.
+
+    각 구간 안에서는, 폭이 좁아 한쪽에만 있는 줄들만 좌/우로 클러스터링해서
+    "왼쪽 단을 위→아래로 다 읽은 뒤 오른쪽 단을 위→아래로" 순서로 재배열한다.
+    뚜렷한 2단 구조(그 구간 폭의 15% 이상 벌어진 간격, 양쪽 모두 2줄 이상)가
+    안 보이면 그 구간은 원래 순서를 그대로 유지한다 - 대부분의 카드는 이
+    함수가 사실상 아무것도 바꾸지 않는 단일 컬럼 레이아웃이다."""
     if len(entries) < 4:
         return entries
 
-    min_left = min(e["left_x"] for e in entries)
-    max_right = max(e["right_x"] for e in entries)
-    total_width = max_right - min_left
-    if total_width <= 0:
-        return entries
+    result = []
+    i = 0
+    n = len(entries)
+    while i < n:
+        j = i
+        while j < n and not _PRICE_TOKEN_RE.match(entries[j]["text"].strip()):
+            j += 1
+        result.extend(_reorder_segment_if_two_column(entries[i:j]))
+        if j < n:
+            result.append(entries[j])  # 가격 줄 자체는 그대로 이어붙인다
+        i = j + 1
+    return result
 
-    narrow = [
-        e for e in entries
-        if (e["right_x"] - e["left_x"]) < total_width * 0.6
-        and not _PRICE_TOKEN_RE.match(e["text"].strip())
-    ]
+
+# 좌/우 재배열 지점에 심어두는 표시. "왼쪽 단을 전부 읽은 뒤 오른쪽 단"으로
+# 줄 순서 자체는 바로잡아도, 그 경계 정보가 그대로 사라지면 텍스트만 보는
+# 이후 단계(extract_selling_points)는 왼쪽 단의 마지막 불릿과 오른쪽 단의
+# 불릿 없는 이어지는 문장을 구분 못 하고 하나로 붙여버린다(실사진 확인:
+# "*샌드위치나 토스트용으로 적합"(왼쪽 단 마지막 불릿) 바로 뒤에 "개봉 후
+# 부패, 변질 될..."(오른쪽 단, 불릿 없음)이 와서 같은 항목으로 합쳐짐).
+# 실제 OCR 텍스트에 나올 리 없는 문자열이라 안전하게 구분자로 쓸 수 있다.
+_COLUMN_BREAK_MARKER = "\x00COLUMN_BREAK\x00"
+
+
+def _reorder_segment_if_two_column(segment):
+    """_reorder_two_column_block()이 가격 줄로 나눈 한 구간 안에서, 그
+    구간 자체의 폭을 기준으로 2단 구조를 판단해 재배열한다."""
+    if len(segment) < 4:
+        return segment
+
+    if _looks_like_field_label_table(segment):
+        return segment
+
+    min_left = min(e["left_x"] for e in segment)
+    max_right = max(e["right_x"] for e in segment)
+    width = max_right - min_left
+    if width <= 0:
+        return segment
+
+    narrow = [e for e in segment if (e["right_x"] - e["left_x"]) < width * 0.6]
     if len(narrow) < 4:
-        return entries
+        return segment
 
     xs = sorted(e["left_x"] for e in narrow)
     gaps = [(xs[i + 1] - xs[i], i) for i in range(len(xs) - 1)]
     biggest_gap, split_i = max(gaps)
-    if biggest_gap < total_width * 0.15:
-        return entries  # 뚜렷한 2단 구분이 없음 - 원래 순서 유지
+    if biggest_gap < width * 0.15:
+        return segment  # 뚜렷한 2단 구분이 없음 - 원래 순서 유지
     boundary_x = (xs[split_i] + xs[split_i + 1]) / 2
 
     left_ids = {id(e) for e in narrow if e["left_x"] < boundary_x}
     right_ids = {id(e) for e in narrow if e["left_x"] >= boundary_x}
     if len(left_ids) < 2 or len(right_ids) < 2:
-        return entries
+        return segment
 
-    # 연속으로 이어지는 좌/우 후보 구간만 "왼쪽 전부 -> 오른쪽 전부"로
-    # 재배열한다 - 그 사이에 전체 폭 줄(가격 등)이 끼어 구간이 끊기면 거기서
-    # 새 구간으로 다시 시작해서, 서로 다른 2단 블록이 뒤섞이지 않게 한다.
+    # 연속으로 이어지는 좌/우 후보만 "왼쪽 전부 -> 오른쪽 전부"로 재배열한다 -
+    # 그 사이에 이 구간 폭 전체를 쓰는 줄이 끼면 거기서 새 구간으로 다시
+    # 시작해서, 서로 다른 2단 블록이 뒤섞이지 않게 한다.
     result = []
-    i = 0
-    while i < len(entries):
-        e = entries[i]
+    k = 0
+    while k < len(segment):
+        e = segment[k]
         if id(e) in left_ids or id(e) in right_ids:
-            j = i
+            m = k
             block = []
-            while j < len(entries) and (id(entries[j]) in left_ids or id(entries[j]) in right_ids):
-                block.append(entries[j])
-                j += 1
+            while m < len(segment) and (id(segment[m]) in left_ids or id(segment[m]) in right_ids):
+                block.append(segment[m])
+                m += 1
             left_block = [x for x in block if id(x) in left_ids]
             right_block = [x for x in block if id(x) in right_ids]
-            result.extend(left_block + right_block)
-            i = j
+            result.extend(left_block)
+            if left_block and right_block:
+                # 왼쪽 단 마지막 줄과 오른쪽 단 첫 줄 사이에 경계 표시를
+                # 심어서, 순서만 바로잡고 경계 정보 자체는 잃어버리는 걸
+                # 막는다 (아래 _COLUMN_BREAK_MARKER 설명 참고).
+                anchor = left_block[-1]
+                result.append({
+                    "top_y": anchor["top_y"], "bottom_y": anchor["bottom_y"],
+                    "left_x": anchor["left_x"], "right_x": anchor["right_x"],
+                    "text": _COLUMN_BREAK_MARKER,
+                })
+            result.extend(right_block)
+            k = m
         else:
             result.append(e)
-            i += 1
+            k += 1
     return result
 
 
@@ -1137,14 +1256,38 @@ def extract_selling_points(text: str, product_code: str = "") -> str:
             if _normalize_bare_code(line, allow_five_digit=True) == product_code:
                 lines = lines[i + 1:]
                 break
-    for markers in _BULLET_MARKER_TIERS:
-        points = _extract_selling_points_with_markers(lines, markers)
-        if points:
-            return "- " + points[0] + "".join(f"\n - {p}" for p in points[1:])
-    fallback = _find_unmarked_description(lines)
-    if fallback:
-        return "- " + fallback
-    return ""
+
+    # _COLUMN_BREAK_MARKER가 있으면 그 지점에서 줄 목록을 나눠 각 구간을
+    # 독립적으로 처리한다 - 왼쪽 단의 마지막 항목과 오른쪽 단의 첫 내용이
+    # 서로 다른 구간에 속한다는 걸 알아야, 둘을 하나의 항목으로 잘못
+    # 이어붙이지 않는다. 마커가 없는 사진(대다수)은 구간이 하나뿐이라
+    # 기존 동작과 동일하다.
+    segments = [[]]
+    for line in lines:
+        if line == _COLUMN_BREAK_MARKER:
+            segments.append([])
+        else:
+            segments[-1].append(line)
+
+    all_points = []
+    for seg_idx, seg_lines in enumerate(segments):
+        seg_points = []
+        for markers in _BULLET_MARKER_TIERS:
+            seg_points = _extract_selling_points_with_markers(seg_lines, markers)
+            if seg_points:
+                break
+        if not seg_points:
+            fallback = (
+                _find_unmarked_description(seg_lines) if seg_idx == 0
+                else _collect_plain_description(seg_lines)
+            )
+            if fallback:
+                seg_points = [fallback]
+        all_points.extend(seg_points)
+
+    if not all_points:
+        return ""
+    return "- " + all_points[0] + "".join(f"\n - {p}" for p in all_points[1:])
 
 
 # 베이커리류 카드는 셀링포인트에 "-"/"▶" 같은 불릿 표시가 아예 없이, 영문
@@ -1183,7 +1326,40 @@ def _find_unmarked_description(lines: list) -> str:
     for line in lines[english_idx + 1:]:
         if not re.search(r"[가-힣]", line):
             break
+        # "단가 / 10G"처럼 단가 라벨만 있는 줄과, 그 라벨과 짝을 이루는 순수
+        # 가격 숫자 줄("196원")은 그 자체로 셀링포인트 내용이 아니지만, 이런
+        # 줄 하나 때문에 문장 수집을 완전히 끝내버리면 안 된다 - 2단
+        # 레이아웃 카드에서 이 줄 뒤에 또 다른(오른쪽 단) 셀링 문구가
+        # 이어지는 경우가 실사진(벨지오이오조 모짜렐라)에서 확인됐다.
+        # "100g당 1,211원"처럼 실제 숫자 값이 있는 단가 표기는 예외 - 그건
+        # 진짜 값이 있는 줄이라 노이즈로 처리해 문장을 끊는 게 맞다.
         if _is_origin_label_line(line):
+            continue
+        if "단가" in line and not UNIT_PRICE_PATTERN.search(line):
+            continue
+        if _PRICE_TOKEN_RE.match(line.strip()):
+            continue
+        if _is_skippable_interleaved_noise(line) or _is_selling_point_noise(line):
+            break
+        desc_lines.append(line)
+    return " ".join(desc_lines).strip()
+
+
+def _collect_plain_description(lines: list) -> str:
+    """_COLUMN_BREAK_MARKER로 나뉜, 첫 구간이 아닌 구간(2단 카드의 오른쪽
+    단 등)에는 이미 영문 제품명이 앞 구간에서 소비돼서 없는 경우가 많다.
+    영문 제품명 줄을 찾는 게 목적이 아니라 구간 자체가 이미 "왼쪽 단과는
+    분리된 하나의 덩어리"라는 게 마커로 보장되므로, _find_unmarked_description과
+    같은 노이즈 판정만 그대로 쓰고 구간 맨 앞부터 바로 수집한다."""
+    desc_lines = []
+    for line in lines:
+        if not re.search(r"[가-힣]", line):
+            break
+        if _is_origin_label_line(line):
+            continue
+        if "단가" in line and not UNIT_PRICE_PATTERN.search(line):
+            continue
+        if _PRICE_TOKEN_RE.match(line.strip()):
             continue
         if _is_skippable_interleaved_noise(line) or _is_selling_point_noise(line):
             break
@@ -1247,7 +1423,7 @@ def _normalize_bare_code(line: str, allow_five_digit: bool = False) -> str:
 # 가격 줄만 어쩌다 놓쳐도(이번 세션에서 실제로 있었던 문제), 그 카드엔
 # 기업 표기 자체가 없으므로 조건 2에서 걸러져 오분류를 막아준다.
 _BACK_LABEL_MANUFACTURER_PATTERN = re.compile(
-    r"(?:제조|판매|수입|유통|공급)(?:원|자|처|업자|업체|업소|회사|사)"
+    r"(?:제조|판매|수입|유통|공급)\s*(?:원|자|처|업자|업체|업소|회사|사)"
     # 수입 완제품 중엔 뒷면이 한글 표기 없이 영문 라벨만 있는 경우도 있다
     # (예: 영국산 클로티드크림 - "Manufacturer:"/"Imported By:"만 있고 한글
     # 법정 표기가 아예 없음). 한글 라벨과 같은 역할을 하는 영문 표기
@@ -1340,6 +1516,14 @@ _IMPORTER_LABEL_PATTERN = re.compile(
     rf"(?:및\s*)?(?:[·・]\s*)?(?:판매\s*)?(?:책임\s*)?(?:{_ENTITY_SUFFIX}|판매업소)"
     rf"|(?=[:：(（])"
     rf")"
+    # 화장품류(샴푸/로션/바디워시 등) 뒷면은 "수입"이라는 글자 자체가 아예
+    # 없이, 화장품법상 국내 유통 책임 주체를 뜻하는 "(화장품)책임판매업자"
+    # 라벨만 있는 경우가 실사진(팬틴/츠바키/헤드앤숄더/비판톨 등)에서 다수
+    # 확인됐다. 이 라벨은 사실상 식품 라벨의 "수입원"과 같은 역할(외국
+    # 제조사와 국내 유통을 이어주는 주체)을 하므로, 뒷면에 제조원까지 같이
+    # 있으면 determine_sourcing()의 "제조사+수입사 둘 다 있으면 벤더구매"
+    # 판정에 그대로 활용한다.
+    rf"|(?:화장품\s*)?책임\s*판매\s*업자"
     # 한글 라벨이 아예 없이 영문 라벨만 있는 뒷면(수입 완제품에 흔함)을 위한
     # 영문 표기 - "Imported By:"/"Importer:"/"Distributed by"/"Distributor".
     rf"|\bimported\s+by\b|\bimporter\b|\bdistributed\s+by\b|\bdistributor\b",
@@ -1453,11 +1637,18 @@ def _country_in(text: str) -> str:
     여러 개 있으면 가장 뒤에 나오는 것을 우선한다 - 주소는 보통 끝에
     국가명을 적으므로("...신시내티, 오하이오주, 미국"), 앞쪽에 우연히 섞인
     지명/사명보다 뒤쪽 값이 실제 원산지일 가능성이 높다. 하나도 없으면
-    빈 문자열."""
+    빈 문자열.
+
+    "미국산"/"캐나다산"처럼 국가명 바로 뒤에 "산"이 붙은 표기는 원재료
+    하나하나의 개별 원산지 표시(식품표시 관행상 "원재료명(OO산)" 형태로
+    나열됨)일 뿐, 상품 전체의 병입원산지가 아니다. 실사진(그래놀라 뒷면 -
+    "롤드오트(캐나다산), 볶음해바라기씨(미국산)"이 있는데 정작 제조원은
+    국내(충북 제천)였던 사례)으로 확인된 오탐이라 이런 표기는 후보에서
+    제외한다."""
     candidates = []
     for c in _COUNTRY_NAMES_KO:
         pos = text.rfind(c)
-        if pos != -1:
+        if pos != -1 and text[pos + len(c):pos + len(c) + 1] != "산":
             candidates.append((pos, c))
     for en, ko in _COUNTRY_EN_TO_KO.items():
         for em in re.finditer(rf"\b{en}\b", text, re.IGNORECASE):
@@ -1529,13 +1720,23 @@ def extract_origin(text: str) -> str:
     return ""
 
 
-def determine_sourcing(product_name: str, retailer: str, back_text: str) -> tuple:
+def determine_sourcing(product_name: str, retailer: str, back_text: str, front_text: str = "") -> tuple:
     """(소싱형태, 병입원산지)를 함께 돌려준다. product_name은 상품카드에서
-    읽은 제품명(뒷면이 아님), back_text는 매칭된 뒷면 사진(들)의 원문텍스트."""
+    읽은 제품명(뒷면이 아님), back_text는 매칭된 뒷면 사진(들)의 원문텍스트,
+    front_text는 상품카드 자체의 원문텍스트("직수입" 인증 문구 판별용)."""
     origin = extract_origin(back_text)
 
     if _PB_NAME_PATTERN.search(product_name or ""):
         return "PB", origin
+
+    # 코스트코 자체 가격표에 "-직수입 오리지널 제품"처럼 "직수입" 문구가
+    # 불릿으로 직접 찍혀 있는 경우가 실사진(도리토스 나초칩)에서 확인됐다 -
+    # 이건 뒷면의 제조사/수입사 라벨을 해석해서 추론하는 게 아니라 코스트코가
+    # 스스로 매긴 소싱 인증이라, 뒷면 사진 매칭 여부와 무관하게 그대로
+    # 신뢰한다(뒷면이 아예 없는 카드도 이 값만으로 채워질 수 있다 -
+    # sync_back_sourcing 참고).
+    if "직수입" in (front_text or ""):
+        return "직수입", origin
 
     fields = parse_sourcing_fields(back_text)
     importer_chain = _chain_of(fields["importer_value"])
@@ -1943,10 +2144,20 @@ def parse_traders_fields(text: str) -> dict:
     # 확인됐다(트레이더스는 카드 위쪽에 셀링/프로모션 문구가 먼저 오는 레이아웃이
     # 있음). 불릿 문자로 시작하거나 알려진 프로모션 문구인 한글 줄은 건너뛰고,
     # 그 다음 한글 줄을 제품명으로 삼는다.
+    # 배경의 다른 상품 가격표에서 새어 들어온 문장 조각("...보상 받을 수
+    # 있습니다.", "...깨끗이 씻어내 줍니다." 같은 소비자분쟁해결기준/사용법
+    # 문구의 뒷부분만 찍힘)이 한글을 포함하고 불릿도 아니라서 위 두 조건을
+    # 통과해 제품명으로 잘못 채택되는 경우가 실사진(네이처 그래놀라)에서
+    # 확인됐다. 진짜 제품명은 명사(구)라 이런 종결어미로 끝나는 일이 없으므로,
+    # "-습니다"/"-니다"로 끝나는 줄은 문장 조각으로 보고 제외한다.
+    _SENTENCE_ENDING_RE = re.compile(r"(?:습니다|니다)\.?$")
+
     def _is_traders_name_candidate(line: str) -> bool:
         if not re.search(r"[가-힣]", line):
             return False
         if line[:1] in "-–—−•·▶*√":
+            return False
+        if _SENTENCE_ENDING_RE.search(line):
             return False
         return not any(sub in line for sub in _SELLING_POINT_EXCLUDE_SUBSTRINGS)
 
@@ -2214,6 +2425,29 @@ def _col_letter(col: int) -> str:
     return letters
 
 
+# Google Sheets API의 values:batchGet/batchUpdate는 한 번에 보낼 수 있는 범위
+# 개수에 제한이 있다 - 실측으로 228개 범위는 항상 400(Bad Request)으로
+# 실패하고 150개는 성공함을 확인했다(정리본(트레이더스)_2026-01, 카드 114개
+# x 소싱형태/병입원산지 2칸 = 228개 범위 요청 시 매번 실패해서 트레이더스
+# 소싱형태/병입원산지가 단 하나도 안 채워지는 문제로 이어졌다). 카드/행이
+# 계속 쌓이는 시트(정리본, RAW 앞뒤매칭/정리본위치 등)는 언젠가 이 상한을
+# 넘을 수 있으므로, batch_get/batch_update를 쓰는 모든 곳에서 이 크기로
+# 나눠 보낸다.
+_SHEETS_BATCH_CHUNK_SIZE = 100
+
+
+def _batch_get_chunked(sheet, ranges: list):
+    result = []
+    for i in range(0, len(ranges), _SHEETS_BATCH_CHUNK_SIZE):
+        result.extend(sheet.batch_get(ranges[i:i + _SHEETS_BATCH_CHUNK_SIZE]))
+    return result
+
+
+def _batch_update_chunked(sheet, updates: list, **kwargs):
+    for i in range(0, len(updates), _SHEETS_BATCH_CHUNK_SIZE):
+        sheet.batch_update(updates[i:i + _SHEETS_BATCH_CHUNK_SIZE], **kwargs)
+
+
 # USER_ENTERED로 쓰는 값이 "+"/"-"/"="/"@"로 시작하면 구글 시트가 그 셀을
 # 수식으로 해석하려다 실패해서 "#ERROR!"로 뜬다(실사진에서 확인됨 - OCR로
 # 뽑은 제품명이 우연히 "+1 정밀 트리머"처럼 "+"로 시작한 경우). 앞에 작은따옴표
@@ -2324,7 +2558,7 @@ def update_category_sheet(sheet, row_dicts: list):
             sheet.resize(cols=max_col_used + 10)
         if max_row_used > sheet.row_count:
             sheet.resize(rows=max_row_used + 20)
-        sheet.batch_update(updates, value_input_option="USER_ENTERED")
+        _batch_update_chunked(sheet, updates, value_input_option="USER_ENTERED")
 
     return positions
 
@@ -2357,6 +2591,7 @@ def build_row_dict(file_id, filename, fields, raw_text, uploader, is_back, captu
         # 이 시점엔 아직 시트에 쌓인 다른 사진들과 비교해보기 전이라 매칭을
         # 모른다 - resync_card_back_matches()가 별도로 채운다.
         "매칭파일ID": "",
+        "매칭파일명": "",
         # 카드가 제품군정리 시트에 기록될 때(update_category_sheet) 채워진다.
         # 뒷면 사진 자체는 이 값이 끝까지 빈 칸으로 남는다.
         "정리본위치": "",
@@ -2382,9 +2617,19 @@ def resync_card_back_matches(sheet):
 
     다만 이 컬럼들(업로더/뒷면여부/촬영시각)이 생기기 전에 이미 처리된
     과거 행은 촬영시각이 비어있어 매칭 대상이 될 수 없다 - 새로 배포된
-    이후 처리되는 사진부터 소급 매칭이 적용된다."""
-    idx = {name: COLUMN_ORDER.index(name) for name in ("파일ID", "업로더", "뒷면여부", "촬영시각", "매칭파일ID")}
-    columns = {name: sheet.col_values(i + 1)[1:] for name, i in idx.items()}  # 헤더 제외
+    이후 처리되는 사진부터 소급 매칭이 적용된다.
+
+    "매칭파일ID"(구글 드라이브 파일ID)만으로는 MD가 매칭이 잘못됐는지
+    확인하려 할 때 그 뒷면 사진을 구글 드라이브에서 찾기 불편하다 -
+    파일ID로는 드라이브 검색이 안 되고 URL로 직접 열어야 한다. 파일명
+    ("20260101_000231.jpg" 등)은 드라이브 검색창에 그대로 붙여넣으면
+    바로 찾아지므로, "매칭파일명"에 같은 순서로 같이 남겨서 RAW 시트만
+    보고도 앞뒤 사진을 빠르게 대조할 수 있게 한다."""
+    idx = {
+        name: COLUMN_ORDER.index(name)
+        for name in ("파일ID", "파일명", "업로더", "뒷면여부", "촬영시각", "매칭파일ID", "매칭파일명")
+    }
+    columns = {name: sheet.col_values(i + 1)[RAW_HEADER_ROW_COUNT:] for name, i in idx.items()}  # 헤더 2줄 제외
     row_count = len(columns["파일ID"])
     for name in columns:
         # gspread의 col_values()는 그 열의 마지막 값이 있는 행까지만 돌려주므로,
@@ -2392,6 +2637,10 @@ def resync_card_back_matches(sheet):
         # 있다 - 파일ID 기준 행 수에 맞춰 빈 문자열로 채워 인덱스를 맞춘다.
         if len(columns[name]) < row_count:
             columns[name] += [""] * (row_count - len(columns[name]))
+
+    filename_by_id = {
+        fid: fname for fid, fname in zip(columns["파일ID"], columns["파일명"]) if fid
+    }
 
     entries = []
     for i in range(row_count):
@@ -2413,16 +2662,22 @@ def resync_card_back_matches(sheet):
         })
 
     matches = match_card_back_pairs(entries)
-    match_col_letter = _col_letter(idx["매칭파일ID"] + 1)
+    match_id_col_letter = _col_letter(idx["매칭파일ID"] + 1)
+    match_name_col_letter = _col_letter(idx["매칭파일명"] + 1)
     updates = []
     for i, file_id in enumerate(columns["파일ID"]):
         if not file_id:
             continue
-        new_value = ", ".join(matches.get(file_id, []))
+        row_num = i + RAW_HEADER_ROW_COUNT + 1
+        matched_ids = matches.get(file_id, [])
+        new_value = ", ".join(matched_ids)
         if new_value and new_value != columns["매칭파일ID"][i]:
-            updates.append({"range": f"{match_col_letter}{i + 2}", "values": [[_sheet_safe(new_value)]]})
+            updates.append({"range": f"{match_id_col_letter}{row_num}", "values": [[_sheet_safe(new_value)]]})
+        new_name_value = ", ".join(filename_by_id.get(mid, mid) for mid in matched_ids)
+        if new_name_value and new_name_value != columns["매칭파일명"][i]:
+            updates.append({"range": f"{match_name_col_letter}{row_num}", "values": [[_sheet_safe(new_name_value)]]})
     if updates:
-        sheet.batch_update(updates, value_input_option="USER_ENTERED")
+        _batch_update_chunked(sheet, updates, value_input_option="USER_ENTERED")
     return len(updates)
 
 
@@ -2434,13 +2689,14 @@ def _write_category_positions(sheet, positions: dict):
         return
     file_id_col = COLUMN_ORDER.index("파일ID") + 1
     pos_col_letter = _col_letter(COLUMN_ORDER.index("정리본위치") + 1)
-    file_ids = sheet.col_values(file_id_col)[1:]  # 헤더 제외
+    file_ids = sheet.col_values(file_id_col)[RAW_HEADER_ROW_COUNT:]  # 헤더 2줄 제외
     updates = []
     for i, file_id in enumerate(file_ids):
         if file_id in positions:
-            updates.append({"range": f"{pos_col_letter}{i + 2}", "values": [[positions[file_id]]]})
+            row_num = i + RAW_HEADER_ROW_COUNT + 1
+            updates.append({"range": f"{pos_col_letter}{row_num}", "values": [[positions[file_id]]]})
     if updates:
-        sheet.batch_update(updates, value_input_option="USER_ENTERED")
+        _batch_update_chunked(sheet, updates, value_input_option="USER_ENTERED")
 
 
 def sync_back_sourcing(sheet, retailer: str, resolve_category_sheet) -> int:
@@ -2465,7 +2721,7 @@ def sync_back_sourcing(sheet, retailer: str, resolve_category_sheet) -> int:
         name: COLUMN_ORDER.index(name)
         for name in ("파일ID", "업로더", "뒷면여부", "촬영시각", "원문텍스트", "제품명(한국어)", "정리본위치")
     }
-    columns = {name: sheet.col_values(i + 1)[1:] for name, i in idx.items()}
+    columns = {name: sheet.col_values(i + 1)[RAW_HEADER_ROW_COUNT:] for name, i in idx.items()}
     row_count = len(columns["파일ID"])
     for name in columns:
         if len(columns[name]) < row_count:
@@ -2501,7 +2757,20 @@ def sync_back_sourcing(sheet, retailer: str, resolve_category_sheet) -> int:
             continue
         back_ids = matches.get(card["file_id"], [])
         back_text = "\n".join(by_id[bid]["text"] for bid in back_ids if bid in by_id)
-        if not back_text:
+        front_text = card["text"]
+        # 뒷면 매칭이 없어도 카드 자체에 판단 근거(PB 문구, "직수입" 인증
+        # 문구)가 있으면 계속 진행한다 - determine_sourcing()이 그 경우를
+        # 처리한다(이전에는 뒷면이 없으면 무조건 건너뛰어서, 뒷면 사진이
+        # 없는 PB/직수입 카드가 뒷면 없이는 영영 소싱형태를 못 받았다).
+        # 뒷면도 없고 카드 자체에도 근거가 없으면 계산해봐야 항상 빈
+        # 소싱형태 + "국내"(원산지 정보 전무 시의 기본값)만 나오는데, 이건
+        # 실제로는 "모른다"일 뿐 "국내산으로 확인됨"이 아니므로 여기서
+        # 건너뛴다.
+        if (
+            not back_text
+            and not _PB_NAME_PATTERN.search(card["product_name"] or "")
+            and "직수입" not in front_text
+        ):
             continue
         if "!" in card["position"]:
             title, cell_ref = card["position"].split("!", 1)
@@ -2511,7 +2780,7 @@ def sync_back_sourcing(sheet, retailer: str, resolve_category_sheet) -> int:
         if not m:
             continue
         col, title_row = m.group(1), int(m.group(2))
-        sourcing, origin = determine_sourcing(card["product_name"], retailer, back_text)
+        sourcing, origin = determine_sourcing(card["product_name"], retailer, back_text, front_text)
         sourcing_row = title_row + CATEGORY_ROW_LABELS.index("소싱형태") + 1
         origin_row = title_row + CATEGORY_ROW_LABELS.index("병입원산지") + 1
         candidates_by_title.setdefault(title, []).append((f"{col}{sourcing_row}", sourcing))
@@ -2523,14 +2792,14 @@ def sync_back_sourcing(sheet, retailer: str, resolve_category_sheet) -> int:
         if not candidates:
             continue
         category_sheet = resolve_category_sheet(title)
-        current = category_sheet.batch_get([cell for cell, _ in candidates])
+        current = _batch_get_chunked(category_sheet, [cell for cell, _ in candidates])
         updates = []
         for (cell, value), grid in zip(candidates, current):
             existing = grid[0][0] if grid and grid[0] else ""
             if not existing:
                 updates.append({"range": cell, "values": [[value]]})
         if updates:
-            category_sheet.batch_update(updates, value_input_option="USER_ENTERED")
+            _batch_update_chunked(category_sheet, updates, value_input_option="USER_ENTERED")
         total_updates += len(updates)
     return total_updates
 
@@ -2563,10 +2832,58 @@ def _find_missing_columns(existing, column_order):
     return missing
 
 
+# RAW 시트 1행(그룹 라벨)에 표시할 묶음 - "상품카드"는 사진/원문 식별 정보부터
+# 가격표에서 뽑은 값까지, "제품 뒷면"은 뒷면 판별/매칭 관련 컬럼까지. 완전히
+# 새 시트를 만들 때만 쓰인다(기존 시트의 그룹 라벨은 사람이 관리하는 영역이라
+# 컬럼이 추가되는 경우에도 자동으로 다시 그리지 않는다 - 아래 ensure_header 참고).
+_GROUP_HEADER_SPECS = [
+    ("상품카드", "파일ID", "단가"),
+    ("제품 뒷면", "뒷면여부", "매칭파일명"),
+]
+
+
+def _apply_default_group_header(sheet):
+    sheet_id = sheet.id
+    requests = []
+    for label, start_name, end_name in _GROUP_HEADER_SPECS:
+        start_idx = COLUMN_ORDER.index(start_name)
+        end_idx = COLUMN_ORDER.index(end_name) + 1  # 배타적 끝 인덱스
+        cell_range = {
+            "sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1,
+            "startColumnIndex": start_idx, "endColumnIndex": end_idx,
+        }
+        requests.append({"mergeCells": {"range": cell_range, "mergeType": "MERGE_ALL"}})
+        requests.append({
+            "updateCells": {
+                "range": cell_range,
+                "rows": [{"values": [{
+                    "userEnteredValue": {"stringValue": label},
+                    "userEnteredFormat": {"horizontalAlignment": "CENTER", "textFormat": {"bold": True}},
+                }]}],
+                "fields": "userEnteredValue,userEnteredFormat(horizontalAlignment,textFormat)",
+            }
+        })
+    requests.append({
+        "updateSheetProperties": {
+            "properties": {"sheetId": sheet_id, "gridProperties": {"frozenRowCount": RAW_HEADER_ROW_COUNT}},
+            "fields": "gridProperties.frozenRowCount",
+        }
+    })
+    sheet.spreadsheet.batch_update({"requests": requests})
+
+
 def ensure_header(sheet):
-    existing = sheet.row_values(1)
+    """RAW 시트는 헤더가 두 줄이다: 1행은 "상품카드"/"제품 뒷면"처럼 관련
+    컬럼을 묶어 보여주는 그룹 라벨(병합 셀), 2행이 COLUMN_ORDER 그대로의
+    실제 컬럼명이다(RAW_HEADER_ROW_COUNT 참고). 완전히 새 시트일 때만 그룹
+    라벨까지 같이 만들고, 기존 시트에 컬럼만 추가되는 경우엔 2행만 맞추고
+    1행(그룹 라벨)은 건드리지 않는다 - 병합 범위를 자동으로 다시 그리다가
+    사람이 이미 조정해둔 배치를 망가뜨릴 수 있어서다."""
+    existing = sheet.row_values(RAW_HEADER_ROW_COUNT)
     if not existing:
+        sheet.append_row([""] * len(COLUMN_ORDER), value_input_option="USER_ENTERED")
         sheet.append_row(COLUMN_ORDER, value_input_option="USER_ENTERED")
+        _apply_default_group_header(sheet)
         return
     if existing == COLUMN_ORDER:
         return
@@ -2580,13 +2897,14 @@ def ensure_header(sheet):
         for col_idx, _name in sorted(missing, key=lambda x: -x[0]):
             if col_idx < len(existing):
                 sheet.insert_cols([[]], col=col_idx + 1)
-        sheet.update(values=[COLUMN_ORDER], range_name="A1")
+        sheet.update(values=[COLUMN_ORDER], range_name=f"A{RAW_HEADER_ROW_COUNT}")
         added = [name for _, name in missing]
-        print(f"시트 헤더에 새 컬럼 {len(added)}개를 추가했습니다: {', '.join(added)}")
+        print(f"시트 헤더에 새 컬럼 {len(added)}개를 추가했습니다: {', '.join(added)}. "
+              "1행 그룹 라벨(상품카드/제품 뒷면) 병합 범위가 이 컬럼과 어긋나지 않는지 확인해주세요.")
     else:
         # 컬럼 순서가 바뀌었거나 삭제된 경우 - 자동으로 지우면 기존 데이터가 밀릴 수
         # 있으므로 건드리지 않는다. 헤더 행을 수동으로 맞춰주세요.
-        print("경고: 시트 1행 헤더가 COLUMN_ORDER와 다릅니다. 데이터 보호를 위해 자동으로 지우지 않았으니, "
+        print(f"경고: 시트 {RAW_HEADER_ROW_COUNT}행 헤더가 COLUMN_ORDER와 다릅니다. 데이터 보호를 위해 자동으로 지우지 않았으니, "
               "헤더 행을 아래 순서로 직접 맞춰주세요:")
         print("  " + " | ".join(COLUMN_ORDER))
 
