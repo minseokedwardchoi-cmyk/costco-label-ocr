@@ -475,3 +475,60 @@ DRY_RUN=true python review_and_fix.py   # 무엇을 고칠지만 로그로 확�
 있습니다(연동 방법은 `DASHBOARD_INTEGRATION.md` 참고 - 같은 `workflow_dispatch`
 패턴입니다). 신규 사진 OCR과 같은 스프레드시트를 다루므로, 두 워크플로는
 같은 concurrency 그룹을 공유해서 동시에 돌지 않습니다.
+
+## 11. AI 분류 제안 / 월간 SKU 비교 (Gemini, 선택 기능)
+
+`GEMINI_API_KEY`를 설정하면 두 가지 AI 보조 기능을 쓸 수 있습니다. 둘 다
+**선택 기능**이라 키가 없으면 조용히 건너뛰고 끝나며, OCR 파이프라인
+자체(`main.py`)와는 완전히 분리되어 있어 이 기능에 문제가 생겨도 신규 사진
+처리에는 영향이 없습니다.
+
+**공통 필요 시크릿:** `SPREADSHEET_ID`, `GOOGLE_SERVICE_ACCOUNT_JSON`(이미
+등록되어 있는 것 그대로 재사용), `GEMINI_API_KEY`(신규 - [Google AI
+Studio](https://aistudio.google.com/apikey)에서 무료로 발급, 카드 등록 불필요).
+
+### 11-1. 미분류 상품 AI 분류 제안 (`classify_unclassified.py`)
+
+카탈로그 매칭(`MC_CATALOG_SPREADSHEET_ID`) + `CATEGORY_KEYWORDS`(main.py 수동
+목록)로 못 잡아서 "미분류" 블록에 쌓인 상품들을 Gemini에게 보여주고 제품군을
+제안받습니다. **원본 정리본 시트는 건드리지 않고**, `AI분류제안_<원본탭이름>`이라는
+새 탭에 상품명·제안 제품군·확신도·사유를 적어두기만 합니다 - 제품군 블록을
+실제로 옮기는 건 되돌리기 번거로운 작업이라 자동으로 하지 않고, 사람이 검토
+후 필요하면 `CATEGORY_KEYWORDS`나 자사 카탈로그 시트에 직접 반영하는 방식을
+권장합니다(그렇게 채워나갈수록 다음 달부터는 미분류 비중이 줄어듭니다).
+
+```bash
+python classify_unclassified.py --retailer costco   # 그 리테일러의 가장 최근 정리본 탭 자동 감지
+python classify_unclassified.py --sheet "정리본(코스트코)_2026-07"   # 특정 탭 지정
+```
+
+### 11-2. 월간 SKU 비교 + AI 종합 해석 (`monthly_comparison.py`)
+
+정리본 탭이 2개월치 이상 쌓이면, 이전 달과 이번 달을 비교해서 전체 SKU
+증감·대분류(식품/비식품)·중분류·소싱형태·가격 변화를 계산하고, 그 숫자를
+Gemini에 보내 종합 해석 문단을 받아옵니다. **숫자 계산은 전부 파이썬 코드가
+결정적으로 수행하고, Gemini는 그 숫자를 해석하는 글쓰기만 담당**합니다(AI가
+직접 숫자를 세거나 계산하지 않으므로 계산 오류나 매번 다른 숫자가 나올
+걱정이 없습니다). 결과는 `AI분석_<이전탭>_vs_<이번탭>` 새 탭에 기록되고,
+원본 정리본 탭은 건드리지 않습니다.
+
+이 비교는 상품코드 없이 상품명 텍스트 유사도로 동일 SKU를 찾는 방식이라
+(`product_matching.py`), 브랜드 한글/영문 중복 표기나 OCR 오타 때문에 다른
+문자열이 된 동일 상품을 놓칠 수 있습니다. 새로운 패턴을 발견하면
+`product_matching.py`의 `BRAND_ALIAS_PAIRS`/`SPELLING_FIX_PAIRS`/
+`MANUAL_CANONICAL_ALIASES`에 추가해 정확도를 계속 높여나가야 합니다. 또한
+이 데이터는 매대 전수조사가 아니라 그때그때 촬영한 사진 기록이므로, "제외/신규"
+수치는 실제 단종/신규 도입이 아니라 촬영 커버리지 차이를 반영할 수 있다는 점을
+해석 시 항상 감안해야 합니다(Gemini 프롬프트에도 이 유의사항을 포함해뒀습니다).
+
+```bash
+python monthly_comparison.py --retailer costco   # 가장 최근 2개월 탭 자동 감지
+python monthly_comparison.py --retailer costco --prev "정리본(코스트코)_2026-06" --curr "정리본(코스트코)_2026-07"
+```
+
+### 11-3. 자동 실행
+
+`.github/workflows/ai-analysis.yml`이 매달 1일(KST 09:10)에 코스트코/트레이더스
+둘 다 자동으로 돌립니다(이번 달 정리본이 없거나 비교할 두 달치가 안 쌓였으면
+스크립트가 조용히 건너뛰므로 매달 도는 것 자체는 안전합니다). Actions 탭에서
+수동 실행도 가능하고, 두 기능(분류 제안/월간 비교)을 따로 켜고 끌 수 있습니다.

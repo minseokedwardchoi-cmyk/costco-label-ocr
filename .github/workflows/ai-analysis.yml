@@ -1,0 +1,63 @@
+name: AI 분류 제안 / 월간 SKU 비교 (Gemini)
+
+on:
+  workflow_dispatch:  # Actions 탭에서 수동 실행. 대시보드에 별도 버튼을 연동할 수도 있음.
+    inputs:
+      retailer:
+        description: "대상 리테일러"
+        required: true
+        default: "costco"
+        type: choice
+        options: [costco, traders]
+      run_classify:
+        description: "미분류 상품 AI 분류 제안 실행"
+        required: true
+        default: true
+        type: boolean
+      run_comparison:
+        description: "월간 SKU 비교 실행 (최소 2개월치 정리본 탭 필요)"
+        required: true
+        default: true
+        type: boolean
+  schedule:
+    # 매달 1일 00:10 UTC(한국시간 09:10)에 두 리테일러 모두 자동 실행.
+    # 이번 달 정리본이 아직 없거나 비교할 두 달치가 안 쌓였으면 스크립트가
+    # 조용히 건너뛰고 끝나므로, 스케줄이 매달 도는 것 자체는 안전하다.
+    - cron: "10 0 1 * *"
+
+concurrency:
+  group: ai-analysis
+  cancel-in-progress: false
+
+jobs:
+  ai-analysis:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        retailer: ${{ github.event_name == 'schedule' && fromJSON('["costco", "traders"]') || fromJSON(format('["{0}"]', github.event.inputs.retailer)) }}
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install -r requirements.txt
+
+      - name: 미분류 상품 AI 분류 제안
+        if: github.event_name == 'schedule' || github.event.inputs.run_classify == 'true'
+        run: python classify_unclassified.py --retailer "${{ matrix.retailer }}"
+        env:
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+      - name: 월간 SKU 비교 + AI 종합 해석
+        if: github.event_name == 'schedule' || github.event.inputs.run_comparison == 'true'
+        run: python monthly_comparison.py --retailer "${{ matrix.retailer }}"
+        env:
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
